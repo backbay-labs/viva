@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fmt,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use serde_json::{json, Value};
 use tokio::time::timeout;
@@ -25,6 +27,9 @@ use super::constants::{
 const TRUSTED_SOURCE_CONTEXT_FUNCTION: &str = "trusted_source_context";
 const DEFAULT_GEMINI_RETRY_AFTER_MS: u64 = 1_000;
 const MAX_GEMINI_ERROR_BODY_BYTES: usize = 16 * 1024;
+/// The largest single SSE record the incremental decoder will hold. A provider
+/// that never closes a record cannot make the adapter buffer without bound.
+const MAX_GEMINI_SSE_EVENT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThinkingLevel {
@@ -240,10 +245,45 @@ impl GeminiStreamRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The success path's body: bytes as the provider produces them, never a
+/// buffered `String`.
+pub(crate) type GeminiByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, ()>> + Send>>;
+
+/// The decoded provider events, delivered as each SSE record completes.
+pub(crate) type GeminiEventStream =
+    Pin<Box<dyn Stream<Item = Result<GeminiStreamEvent, BrainError>> + Send>>;
+
+/// `ADAPTER-05`: a 2xx body is a stream. Only a non-2xx error body is read into
+/// memory, and only within [`MAX_GEMINI_ERROR_BODY_BYTES`].
+pub(crate) enum GeminiResponseBody {
+    Bounded(String),
+    Stream(GeminiByteStream),
+}
+
+impl GeminiResponseBody {
+    /// The already-read error body, or an empty string for a streaming body.
+    /// Diagnostics only ever inspect bounded error bodies.
+    fn bounded(&self) -> &str {
+        match self {
+            Self::Bounded(body) => body.as_str(),
+            Self::Stream(_) => "",
+        }
+    }
+}
+
+impl fmt::Debug for GeminiResponseBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bounded(_) => formatter.write_str("GeminiResponseBody::Bounded(<redacted>)"),
+            Self::Stream(_) => formatter.write_str("GeminiResponseBody::Stream"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GeminiSseResponse {
     pub(crate) status: u16,
-    pub(crate) body: String,
+    pub(crate) body: GeminiResponseBody,
     pub(crate) retry_after: Option<String>,
     pub(crate) reset_after: Option<String>,
 }
@@ -253,10 +293,62 @@ impl GeminiSseResponse {
     pub(crate) fn ok(body: String) -> Self {
         Self {
             status: 200,
-            body,
+            body: GeminiResponseBody::Stream(Box::pin(futures_util::stream::once(async move {
+                Ok(Bytes::from(body.into_bytes()))
+            }))),
             retry_after: None,
             reset_after: None,
         }
+    }
+}
+
+/// A bounded incremental SSE decoder.
+///
+/// Records end at a blank line; CRLF and LF boundaries are both accepted. An
+/// incomplete record — including an incomplete UTF-8 sequence, which can never
+/// contain a record separator — is preserved across chunk boundaries.
+#[derive(Default)]
+struct GeminiSseDecoder {
+    buffer: Vec<u8>,
+}
+
+impl GeminiSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ()> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_GEMINI_SSE_EVENT_BYTES {
+            return Err(());
+        }
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn next_record(&mut self) -> Option<String> {
+        let (end, separator) = self.record_boundary()?;
+        let record = self.buffer.drain(..end + separator).collect::<Vec<_>>();
+        Some(String::from_utf8_lossy(&record[..end]).into_owned())
+    }
+
+    fn record_boundary(&self) -> Option<(usize, usize)> {
+        for (index, byte) in self.buffer.iter().enumerate() {
+            if *byte != b'\r' && *byte != b'\n' {
+                continue;
+            }
+            if self.buffer[index..].starts_with(b"\r\n\r\n") {
+                return Some((index, 4));
+            }
+            if self.buffer[index..].starts_with(b"\n\n") {
+                return Some((index, 2));
+            }
+        }
+        None
+    }
+
+    /// Whatever a provider left unterminated when the body ended.
+    fn finish(&mut self) -> Option<String> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let record = std::mem::take(&mut self.buffer);
+        Some(String::from_utf8_lossy(&record).into_owned())
     }
 }
 
@@ -274,12 +366,18 @@ pub(crate) async fn stream_gemini_with_client<C>(
 where
     C: GeminiSseClient,
 {
-    stream_gemini_with_client_attempt_events(client, config, request)
+    stream_gemini_attempt_events_collected(client, config, request)
         .await
         .map_err(|failure| failure.error)
 }
 
-pub(crate) async fn stream_gemini_with_client_attempt_events<C>(
+/// Drain the incremental stream into the whole-response shape the pre-streaming
+/// characterization tests were written against.
+///
+/// A failure the provider only reveals part-way through the body arrives here
+/// with the events that preceded it, exactly as an up-front failure used to.
+#[cfg(test)]
+pub(crate) async fn stream_gemini_attempt_events_collected<C>(
     client: &C,
     config: &GeminiConfig,
     request: Value,
@@ -287,8 +385,32 @@ pub(crate) async fn stream_gemini_with_client_attempt_events<C>(
 where
     C: GeminiSseClient,
 {
+    let mut stream = stream_gemini_with_client_attempt_events(client, config, request).await?;
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => events.push(event),
+            Err(error) => return Err(GeminiStreamAttemptFailure { events, error }),
+        }
+    }
+    Ok(events)
+}
+
+/// Stream one Gemini generation, with the bounded primary/fallback policy.
+///
+/// `ADAPTER-05`: the returned stream yields each parsed event as its SSE record
+/// completes. Fallback activations that happened before the successful attempt
+/// are delivered first, so a consumer sees the same order it always did without
+/// the body ever being buffered.
+pub(crate) async fn stream_gemini_with_client_attempt_events<C>(
+    client: &C,
+    config: &GeminiConfig,
+    request: Value,
+) -> Result<GeminiEventStream, GeminiStreamAttemptFailure>
+where
+    C: GeminiSseClient,
+{
     let attempts = gemini_stream_attempts(config);
-    let mut last_rate_limit = None;
     let mut attempt_events = Vec::new();
     let stage_deadline = Instant::now() + config.stage_timeout;
     for (index, attempt_config) in attempts.iter().enumerate() {
@@ -355,7 +477,6 @@ where
                     },
                     failure: brain_provider_failure(&error),
                 });
-                last_rate_limit = Some(error);
                 continue;
             }
             return Err(gemini_attempt_failure(&attempt_events, error));
@@ -372,50 +493,126 @@ where
                 sanitized_gemini_http_status_error(attempt_config, response.status),
             ));
         }
-        if response.body.trim().is_empty() {
-            if index > 0 {
-                return Err(gemini_attempt_failure(
-                    &attempt_events,
-                    gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
-                ));
-            }
-            return Err(gemini_attempt_failure(
-                &attempt_events,
-                gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
-            ));
-        }
-        let mut events = parse_gemini_sse_stream(&response.body);
-        if events.is_empty() {
-            if index > 0 {
-                return Err(gemini_attempt_failure(
-                    &attempt_events,
-                    gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
-                ));
-            }
-            return Err(gemini_attempt_failure(
-                &attempt_events,
-                gemini_empty_stream_stage_failure(attempt_config, started.elapsed()),
-            ));
-        }
-        if !attempt_events.is_empty() {
-            attempt_events.append(&mut events);
-            return Ok(attempt_events);
-        }
-        return Ok(events);
+        // A body that yields no event at all is only knowable at EOF, so the
+        // empty-stream classification lives inside the stream itself.
+        return Ok(gemini_event_stream(GeminiStreamState {
+            prelude: attempt_events.into_iter().collect(),
+            body: match response.body {
+                GeminiResponseBody::Stream(body) => Some(body),
+                GeminiResponseBody::Bounded(_) => None,
+            },
+            decoder: GeminiSseDecoder::default(),
+            pending: VecDeque::new(),
+            produced: false,
+            body_done: false,
+            finished: false,
+            config: attempt_config.clone(),
+            started,
+        }));
     }
+    // Every attempt returns or continues, and the primary attempt always
+    // exists, so the loop cannot fall through with attempts remaining.
     Err(gemini_attempt_failure(
         &attempt_events,
-        last_rate_limit.unwrap_or_else(|| {
-            gemini_stage_failure(
-                config,
-                BrainFailureClass::MalformedStream,
-                BrainFailureStage::Gemini,
-                false,
-                Duration::ZERO,
-                "error_kind=no_configured_model_attempts",
-            )
-        }),
+        gemini_stage_failure(
+            config,
+            BrainFailureClass::MalformedStream,
+            BrainFailureStage::Gemini,
+            false,
+            Duration::ZERO,
+            "error_kind=no_configured_model_attempts",
+        ),
     ))
+}
+
+struct GeminiStreamState {
+    prelude: VecDeque<GeminiStreamEvent>,
+    body: Option<GeminiByteStream>,
+    decoder: GeminiSseDecoder,
+    pending: VecDeque<GeminiStreamEvent>,
+    produced: bool,
+    body_done: bool,
+    finished: bool,
+    config: GeminiConfig,
+    started: Instant,
+}
+
+fn gemini_event_stream(state: GeminiStreamState) -> GeminiEventStream {
+    Box::pin(futures_util::stream::unfold(
+        state,
+        |mut state| async move {
+            loop {
+                if state.finished {
+                    return None;
+                }
+                if let Some(event) = state.prelude.pop_front() {
+                    return Some((Ok(event), state));
+                }
+                if let Some(event) = state.pending.pop_front() {
+                    state.produced = true;
+                    return Some((Ok(event), state));
+                }
+                if state.body_done {
+                    state.finished = true;
+                    if !state.produced {
+                        let failure = gemini_empty_stream_stage_failure(
+                            &state.config,
+                            state.started.elapsed(),
+                        );
+                        return Some((Err(failure), state));
+                    }
+                    return None;
+                }
+                let Some(body) = state.body.as_mut() else {
+                    state.body_done = true;
+                    continue;
+                };
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        if state.decoder.push(&chunk).is_err() {
+                            state.finished = true;
+                            let failure = gemini_stage_failure(
+                                &state.config,
+                                BrainFailureClass::MalformedStream,
+                                BrainFailureStage::Gemini,
+                                false,
+                                state.started.elapsed(),
+                                "error_kind=sse_event_too_large",
+                            );
+                            return Some((Err(failure), state));
+                        }
+                        while let Some(record) = state.decoder.next_record() {
+                            state.pending.extend(parse_gemini_sse_stream(&record));
+                        }
+                    }
+                    Some(Err(())) => {
+                        state.finished = true;
+                        let failure =
+                            gemini_body_read_failure(&state.config, state.started.elapsed());
+                        return Some((Err(failure), state));
+                    }
+                    None => {
+                        state.body = None;
+                        if let Some(record) = state.decoder.finish() {
+                            state.pending.extend(parse_gemini_sse_stream(&record));
+                        }
+                        state.body_done = true;
+                    }
+                }
+            }
+        },
+    ))
+}
+
+fn gemini_body_read_failure(config: &GeminiConfig, latency: Duration) -> BrainError {
+    gemini_stage_failure(
+        config,
+        BrainFailureClass::NetworkDisconnect,
+        BrainFailureStage::Transport,
+        true,
+        latency,
+        "error_kind=response_read_failed",
+    )
 }
 
 fn gemini_attempt_failure(
@@ -514,7 +711,7 @@ fn sanitized_gemini_http_status_error(config: &GeminiConfig, status: u16) -> Bra
         config,
         &GeminiSseResponse {
             status,
-            body: String::new(),
+            body: GeminiResponseBody::Bounded(String::new()),
             retry_after: None,
             reset_after: None,
         },
@@ -526,7 +723,7 @@ pub(crate) async fn stream_gemini_http_with_attempt_events(
     client: &ReqwestGeminiSseClient,
     config: &GeminiConfig,
     request: Value,
-) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
     stream_gemini_with_client_attempt_events(client, config, request).await
 }
 
@@ -575,7 +772,7 @@ impl GeminiSseClient for ReqwestGeminiSseClient {
         let status = response.status().as_u16();
         let retry_after = header_value(response.headers(), RETRY_AFTER.as_str());
         let reset_after = reset_header_value(response.headers());
-        let body = response_text(status, response).await;
+        let body = gemini_response_body(status, response).await;
         gemini_sse_response_from_http_parts(status, retry_after, reset_after, body)
     }
 }
@@ -592,11 +789,20 @@ fn gemini_client_failure(metadata: &'static str) -> BrainError {
     })
 }
 
-async fn response_text(status: u16, response: reqwest::Response) -> Result<String, ()> {
+/// `ADAPTER-05`: a success body becomes a byte stream and is never buffered; a
+/// non-2xx error body stays bounded so its diagnostics can be classified.
+async fn gemini_response_body(
+    status: u16,
+    response: reqwest::Response,
+) -> Result<GeminiResponseBody, ()> {
     if (200..300).contains(&status) {
-        return response.text().await.map_err(|_| ());
+        return Ok(GeminiResponseBody::Stream(Box::pin(
+            response.bytes_stream().map(|chunk| chunk.map_err(|_| ())),
+        )));
     }
-    bounded_response_text(response, MAX_GEMINI_ERROR_BODY_BYTES).await
+    bounded_response_text(response, MAX_GEMINI_ERROR_BODY_BYTES)
+        .await
+        .map(GeminiResponseBody::Bounded)
 }
 
 async fn bounded_response_text(
@@ -619,11 +825,11 @@ fn gemini_sse_response_from_http_parts(
     status: u16,
     retry_after: Option<String>,
     reset_after: Option<String>,
-    body: Result<String, ()>,
+    body: Result<GeminiResponseBody, ()>,
 ) -> Result<GeminiSseResponse, BrainError> {
     let body = match body {
         Ok(body) => body,
-        Err(()) if !(200..300).contains(&status) => String::new(),
+        Err(()) if !(200..300).contains(&status) => GeminiResponseBody::Bounded(String::new()),
         Err(()) => return Err(gemini_client_failure("error_kind=response_read_failed")),
     };
     Ok(GeminiSseResponse {
@@ -756,18 +962,18 @@ fn gemini_stage_failure(
 }
 
 fn gemini_status_metadata(response: &GeminiSseResponse) -> String {
-    let retry_hint = retry_after_hint(response.retry_after.as_deref(), &response.body);
+    let retry_hint = retry_after_hint(response.retry_after.as_deref(), response.body.bounded());
     format!(
         "http_status={} retry_after_ms={} retry_after_source={} body_status={} budget_state=unknown deploy_sha=unknown",
         response.status,
         retry_hint.retry_after_ms,
         retry_hint.source,
-        sanitized_body_status(&response.body),
+        sanitized_body_status(response.body.bounded()),
     )
 }
 
 fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
-    let retry_hint = retry_after_hint(response.retry_after.as_deref(), &response.body);
+    let retry_hint = retry_after_hint(response.retry_after.as_deref(), response.body.bounded());
     let reset_hint = response
         .reset_after
         .as_deref()
@@ -778,7 +984,7 @@ fn gemini_rate_limit_metadata(response: &GeminiSseResponse) -> String {
         reset_hint,
         retry_hint.retry_after_ms,
         retry_hint.source,
-        sanitized_body_status(&response.body),
+        sanitized_body_status(response.body.bounded()),
     )
 }
 
@@ -1385,7 +1591,273 @@ fn viva_system_instruction() -> String {
 }
 
 #[cfg(test)]
+mod streaming_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use serde_json::json;
+    use tokio::time::{timeout, Duration};
+
+    use super::*;
+
+    const SAFE_RESPONSE_RECORD: &str =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"first safe response\"}]}}]}\n\n";
+
+    /// A latch a test can open once. Awaiting it is cancel-safe, so a `select!`
+    /// arm may drop the wait without losing the release.
+    struct Latch {
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl Latch {
+        fn closed() -> Self {
+            Self {
+                permits: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        fn open(&self) {
+            self.permits.add_permits(1);
+        }
+
+        async fn wait(&self) {
+            // The permit is returned when it drops, so the latch stays open.
+            let _permit = self.permits.acquire().await.expect("the latch is alive");
+        }
+    }
+
+    /// A body that yields its chunks, then blocks before EOF until released.
+    fn blocking_body(
+        chunks: Vec<&'static str>,
+        eof: Arc<Latch>,
+        reached_eof: Arc<AtomicBool>,
+    ) -> GeminiByteStream {
+        let state = (
+            chunks
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+            eof,
+            reached_eof,
+            false,
+        );
+        Box::pin(futures_util::stream::unfold(
+            state,
+            |(mut chunks, eof, reached_eof, done)| async move {
+                if done {
+                    return None;
+                }
+                if let Some(chunk) = chunks.pop_front() {
+                    return Some((
+                        Ok(Bytes::from_static(chunk.as_bytes())),
+                        (chunks, eof, reached_eof, false),
+                    ));
+                }
+                eof.wait().await;
+                reached_eof.store(true, Ordering::SeqCst);
+                None
+            },
+        ))
+    }
+
+    struct StreamingBodyClient {
+        body: std::sync::Mutex<Option<GeminiByteStream>>,
+    }
+
+    #[async_trait]
+    impl GeminiSseClient for StreamingBodyClient {
+        async fn stream(
+            &self,
+            _request: GeminiStreamRequest,
+        ) -> Result<GeminiSseResponse, BrainError> {
+            Ok(GeminiSseResponse {
+                status: 200,
+                body: GeminiResponseBody::Stream(
+                    self.body
+                        .lock()
+                        .expect("body lock poisoned")
+                        .take()
+                        .expect("the client is used once"),
+                ),
+                retry_after: None,
+                reset_after: None,
+            })
+        }
+    }
+
+    fn streaming_config() -> GeminiConfig {
+        GeminiConfig {
+            api_key: "gemini-test-key".to_owned(),
+            ..GeminiConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_sse_emits_first_event_before_http_body_eof() {
+        let eof = Arc::new(Latch::closed());
+        let reached_eof = Arc::new(AtomicBool::new(false));
+        let client = StreamingBodyClient {
+            body: std::sync::Mutex::new(Some(blocking_body(
+                vec![SAFE_RESPONSE_RECORD],
+                Arc::clone(&eof),
+                Arc::clone(&reached_eof),
+            ))),
+        };
+
+        let mut stream =
+            stream_gemini_with_client_attempt_events(&client, &streaming_config(), json!({}))
+                .await
+                .expect("the response streams");
+        let first = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("the first event must arrive while the body is still open")
+            .expect("the stream yields an event")
+            .expect("the event parses");
+
+        assert!(
+            !reached_eof.load(Ordering::SeqCst),
+            "the body must still be open when the first event is delivered"
+        );
+        assert!(
+            matches!(&first, GeminiStreamEvent::ModelPart { text: Some(text), .. } if text == "first safe response"),
+            "{first:?}"
+        );
+
+        eof.open();
+        assert!(timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("the stream ends after EOF")
+            .is_none());
+        assert!(reached_eof.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn split_sse_records_are_reassembled_without_buffering_the_body() {
+        // One record, delivered one byte at a time across arbitrary boundaries.
+        let chunks = SAFE_RESPONSE_RECORD
+            .as_bytes()
+            .iter()
+            .map(|byte| {
+                let owned: &'static str = Box::leak(
+                    String::from_utf8(vec![*byte])
+                        .expect("ASCII")
+                        .into_boxed_str(),
+                );
+                owned
+            })
+            .collect::<Vec<_>>();
+        let eof = Arc::new(Latch::closed());
+        eof.open();
+        let client = StreamingBodyClient {
+            body: std::sync::Mutex::new(Some(blocking_body(
+                chunks,
+                eof,
+                Arc::new(AtomicBool::new(false)),
+            ))),
+        };
+
+        let stream =
+            stream_gemini_with_client_attempt_events(&client, &streaming_config(), json!({}))
+                .await
+                .expect("the response streams");
+        let events = timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
+            .await
+            .expect("the split record is reassembled")
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every event parses");
+
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(&events[0], GeminiStreamEvent::ModelPart { text: Some(text), .. } if text == "first safe response"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_invalid_sse_json_is_one_typed_malformed_stream_failure() {
+        // The provider's raw body is hostile and split across chunk boundaries.
+        let eof = Arc::new(Latch::closed());
+        eof.open();
+        let client = StreamingBodyClient {
+            body: std::sync::Mutex::new(Some(blocking_body(
+                vec![
+                    "data: {\"candidates\": [{\"content\": \"leaked-prompt-marker",
+                    "-and-transcript\"",
+                    "\n\n",
+                ],
+                eof,
+                Arc::new(AtomicBool::new(false)),
+            ))),
+        };
+
+        let stream =
+            stream_gemini_with_client_attempt_events(&client, &streaming_config(), json!({}))
+                .await
+                .expect("the response streams");
+        let events = timeout(Duration::from_secs(2), stream.collect::<Vec<_>>())
+            .await
+            .expect("the malformed record is decided without buffering the body");
+
+        let rendered = format!("{events:?}");
+        assert!(
+            !rendered.contains("leaked-prompt-marker-and-transcript"),
+            "no raw body text may survive a malformed stream: {rendered}"
+        );
+        let errors = events
+            .iter()
+            .filter(|event| matches!(event, Ok(GeminiStreamEvent::Error(_))) || event.is_err())
+            .count();
+        assert_eq!(
+            errors, 1,
+            "exactly one typed malformed-stream failure: {events:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// One scripted provider response, as data.
+    ///
+    /// `ADAPTER-05` made a 2xx body a stream, which is neither `Clone` nor
+    /// `Sync`; a scripted client therefore stores the parts and builds a fresh
+    /// response for every call.
+    #[derive(Clone)]
+    struct RecordedResponse {
+        status: u16,
+        body: String,
+        retry_after: Option<String>,
+        reset_after: Option<String>,
+    }
+
+    impl RecordedResponse {
+        fn ok(body: String) -> Self {
+            Self {
+                status: 200,
+                body,
+                retry_after: None,
+                reset_after: None,
+            }
+        }
+
+        fn build(&self) -> GeminiSseResponse {
+            let body = self.body.clone();
+            GeminiSseResponse {
+                status: self.status,
+                body: if (200..300).contains(&self.status) {
+                    GeminiResponseBody::Stream(Box::pin(futures_util::stream::once(async move {
+                        Ok(bytes::Bytes::from(body.into_bytes()))
+                    })))
+                } else {
+                    GeminiResponseBody::Bounded(body)
+                },
+                retry_after: self.retry_after.clone(),
+                reset_after: self.reset_after.clone(),
+            }
+        }
+    }
+
     use agent_domain::TerminalSessionReason;
 
     /// A scripted transport fault carrying the classification a real transport
@@ -1665,7 +2137,7 @@ data: [DONE]
         ] {
             let client = RecordingGeminiSseClient {
                 capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-                response: RecordingGeminiResponse::Response(GeminiSseResponse {
+                response: RecordingGeminiResponse::Response(RecordedResponse {
                     status,
                     body: format!(r#"{{"error":{{"message":"{unsafe_marker}"}}}}"#),
                     retry_after: None,
@@ -1706,7 +2178,7 @@ data: [DONE]
         let unsafe_marker = "UNSAFE_STATUS_MARKER";
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 503,
                 body: format!(r#"{{"error":{{"message":"{unsafe_marker}"}}}}"#),
                 retry_after: None,
@@ -1768,7 +2240,7 @@ data: [DONE]
         let raw_body = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"UNSAFE_429_BODY_MARKER"}}"#;
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: raw_body.to_owned(),
                 retry_after: Some("7".to_owned()),
@@ -1816,7 +2288,7 @@ data: [DONE]
     async fn streaming_transport_429_without_valid_retry_after_uses_sanitized_default() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body:
                     r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"UNSAFE_DEFAULT_BODY_MARKER"}}"#
@@ -1849,7 +2321,7 @@ data: [DONE]
     async fn streaming_transport_429_uses_sanitized_retry_info_body_when_header_missing() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30s"}]}}"#
                     .to_owned(),
@@ -1901,7 +2373,7 @@ data: [DONE]
                 .expect("serve local Gemini test response");
         });
 
-        let error = stream_gemini_http_with_attempt_events(
+        let error = stream_gemini_attempt_events_collected(
             &ReqwestGeminiSseClient::shared(),
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
@@ -1959,7 +2431,7 @@ data: [DONE]
                 .expect("serve local Gemini oversized-body test response");
         });
 
-        let error = stream_gemini_http_with_attempt_events(
+        let error = stream_gemini_attempt_events_collected(
             &ReqwestGeminiSseClient::shared(),
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
@@ -1993,7 +2465,7 @@ data: [DONE]
     async fn streaming_transport_429_parses_fractional_retry_info_body_delay() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.500s"}]}}"#
                     .to_owned(),
@@ -2044,7 +2516,7 @@ data: [DONE]
     async fn streaming_transport_429_uses_sanitized_retry_text_body_when_header_missing() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"fixture retry in 2 minutes"}}"#
                     .to_owned(),
@@ -2087,7 +2559,7 @@ data: [DONE]
     async fn streaming_transport_429_omits_non_time_reset_hint() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                 retry_after: Some("3".to_owned()),
@@ -2115,7 +2587,7 @@ data: [DONE]
     async fn streaming_transport_429_accepts_relative_ratelimit_reset_hint() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                 retry_after: Some("3".to_owned()),
@@ -2188,7 +2660,7 @@ data: [DONE]
                 response.reset_after.as_deref(),
                 Some("2030-01-01T00:00:00Z")
             );
-            assert_eq!(response.body, "");
+            assert_eq!(response.body.bounded(), "");
         }
     }
 
@@ -2210,14 +2682,14 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"raw primary body"}}"#
                         .to_owned(),
                     retry_after: Some("3".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse::ok(
+                RecordedResponse::ok(
                     r#"data: {"candidates":[{"content":{"parts":[{"text":"fallback feedback"}]}}]}"#
                         .to_owned(),
                 ),
@@ -2287,13 +2759,13 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("3".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse::ok(
+                RecordedResponse::ok(
                     r#"data: {"candidates":[{"content":{"parts":[{"text":"fixture-fallback-ok"}]}}]}"#
                         .to_owned(),
                 ),
@@ -2340,13 +2812,13 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("2".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse::ok(
+                RecordedResponse::ok(
                     r#"data: {"candidates":[{"content":{"parts":[{"text":"fixture-fallback-ok"}]}}]}"#
                         .to_owned(),
                 ),
@@ -2382,7 +2854,7 @@ data: [DONE]
             responses: Arc::new(Mutex::new(vec![
                 (
                     Duration::from_millis(40),
-                    GeminiSseResponse {
+                    RecordedResponse {
                         status: 429,
                         body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                         retry_after: Some("1".to_owned()),
@@ -2391,7 +2863,7 @@ data: [DONE]
                 ),
                 (
                     Duration::from_millis(40),
-                    GeminiSseResponse::ok(
+                    RecordedResponse::ok(
                         r#"data: {"candidates":[{"content":{"parts":[{"text":"fixture-late"}]}}]}"#
                             .to_owned(),
                     ),
@@ -2434,13 +2906,13 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("1".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 503,
                     body: r#"{"error":{"status":"UNAVAILABLE"}}"#.to_owned(),
                     retry_after: Some("5".to_owned()),
@@ -2483,13 +2955,13 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("1".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 503,
                     body: r#"{"error":{"status":"UNAVAILABLE"}}"#.to_owned(),
                     retry_after: Some("5".to_owned()),
@@ -2498,7 +2970,7 @@ data: [DONE]
             ])),
         };
 
-        let failure = stream_gemini_with_client_attempt_events(
+        let failure = stream_gemini_attempt_events_collected(
             &client,
             &GeminiConfig {
                 api_key: "gemini-test-key".to_owned(),
@@ -2537,17 +3009,17 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("1".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse::ok("   ".to_owned()),
+                RecordedResponse::ok("   ".to_owned()),
             ])),
         };
 
-        let failure = stream_gemini_with_client_attempt_events(
+        let failure = stream_gemini_attempt_events_collected(
             &client,
             &GeminiConfig {
                 api_key: "gemini-test-key".to_owned(),
@@ -2584,17 +3056,17 @@ data: [DONE]
         let client = SequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                GeminiSseResponse {
+                RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("1".to_owned()),
                     reset_after: None,
                 },
-                GeminiSseResponse::ok("data: [DONE]\n\n".to_owned()),
+                RecordedResponse::ok("data: [DONE]\n\n".to_owned()),
             ])),
         };
 
-        let failure = stream_gemini_with_client_attempt_events(
+        let failure = stream_gemini_attempt_events_collected(
             &client,
             &GeminiConfig {
                 api_key: "gemini-test-key".to_owned(),
@@ -2632,7 +3104,7 @@ data: [DONE]
             responses: Arc::new(Mutex::new(vec![
                 (
                     Duration::from_millis(1),
-                    GeminiSseResponse {
+                    RecordedResponse {
                         status: 429,
                         body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                         retry_after: Some("1".to_owned()),
@@ -2641,7 +3113,7 @@ data: [DONE]
                 ),
                 (
                     Duration::from_millis(100),
-                    GeminiSseResponse::ok(
+                    RecordedResponse::ok(
                         r#"data: {"candidates":[{"content":{"parts":[{"text":"fixture-late"}]}}]}"#
                             .to_owned(),
                     ),
@@ -2682,7 +3154,7 @@ data: [DONE]
             delay: Duration::from_millis(5),
         };
 
-        let failure = stream_gemini_with_client_attempt_events(
+        let failure = stream_gemini_attempt_events_collected(
             &client,
             &GeminiConfig {
                 api_key: "gemini-test-key".to_owned(),
@@ -2722,7 +3194,7 @@ data: [DONE]
         let client = FallibleSequencedGeminiSseClient {
             captures: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![
-                Ok(GeminiSseResponse {
+                Ok(RecordedResponse {
                     status: 429,
                     body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                     retry_after: Some("1".to_owned()),
@@ -2760,7 +3232,7 @@ data: [DONE]
     async fn streaming_transport_503_redacts_unclassified_status_and_body() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 503,
                 body: r#"{"error":{"message":"UNSAFE_503_BODY_MARKER"}}"#.to_owned(),
                 retry_after: Some("5".to_owned()),
@@ -2794,7 +3266,7 @@ data: [DONE]
     async fn streaming_transport_404_preserves_protocol_status_and_redacts_body() {
         let client = RecordingGeminiSseClient {
             capture: Arc::new(Mutex::new(GeminiRequestCapture::default())),
-            response: RecordingGeminiResponse::Response(GeminiSseResponse {
+            response: RecordingGeminiResponse::Response(RecordedResponse {
                 status: 404,
                 body: r#"{"error":{"message":"UNSAFE_404_BODY_MARKER"}}"#.to_owned(),
                 retry_after: None,
@@ -2855,12 +3327,12 @@ data: [DONE]
 
     struct SequencedGeminiSseClient {
         captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
-        responses: Arc<Mutex<Vec<GeminiSseResponse>>>,
+        responses: Arc<Mutex<Vec<RecordedResponse>>>,
     }
 
     struct DelayedSequencedGeminiSseClient {
         captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
-        responses: Arc<Mutex<Vec<(Duration, GeminiSseResponse)>>>,
+        responses: Arc<Mutex<Vec<(Duration, RecordedResponse)>>>,
     }
 
     struct BlockingRateLimitGeminiSseClient {
@@ -2870,7 +3342,7 @@ data: [DONE]
 
     struct FallibleSequencedGeminiSseClient {
         captures: Arc<Mutex<Vec<GeminiRequestCapture>>>,
-        responses: Arc<Mutex<Vec<Result<GeminiSseResponse, BrainError>>>>,
+        responses: Arc<Mutex<Vec<Result<RecordedResponse, BrainError>>>>,
     }
 
     struct DelayedGeminiSseClient;
@@ -2878,7 +3350,7 @@ data: [DONE]
     #[derive(Clone)]
     enum RecordingGeminiResponse {
         Body(String),
-        Response(GeminiSseResponse),
+        Response(RecordedResponse),
         Error(#[allow(dead_code)] String),
     }
 
@@ -2894,8 +3366,10 @@ data: [DONE]
             capture.body = Some(request.body);
             drop(capture);
             match &self.response {
-                RecordingGeminiResponse::Body(body) => Ok(GeminiSseResponse::ok(body.clone())),
-                RecordingGeminiResponse::Response(response) => Ok(response.clone()),
+                RecordingGeminiResponse::Body(body) => {
+                    Ok(RecordedResponse::ok(body.clone()).build())
+                }
+                RecordingGeminiResponse::Response(response) => Ok(response.build()),
                 RecordingGeminiResponse::Error(_) => Err(fixture_transport_failure()),
             }
         }
@@ -2919,7 +3393,8 @@ data: [DONE]
                 .responses
                 .lock()
                 .expect("responses lock poisoned")
-                .remove(0))
+                .remove(0)
+                .build())
         }
     }
 
@@ -2941,6 +3416,7 @@ data: [DONE]
                 .lock()
                 .expect("responses lock poisoned")
                 .remove(0)
+                .map(|response| response.build())
         }
     }
 
@@ -2959,12 +3435,13 @@ data: [DONE]
                     body: Some(request.body),
                 });
             std::thread::sleep(self.delay);
-            Ok(GeminiSseResponse {
+            Ok(RecordedResponse {
                 status: 429,
                 body: r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}"#.to_owned(),
                 retry_after: Some("1".to_owned()),
                 reset_after: None,
-            })
+            }
+            .build())
         }
     }
 
@@ -2988,7 +3465,7 @@ data: [DONE]
                 .expect("responses lock poisoned")
                 .remove(0);
             tokio::time::sleep(delay).await;
-            Ok(response)
+            Ok(response.build())
         }
     }
 
@@ -2999,9 +3476,10 @@ data: [DONE]
             _request: GeminiStreamRequest,
         ) -> Result<GeminiSseResponse, BrainError> {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(GeminiSseResponse::ok(
+            Ok(RecordedResponse::ok(
                 r#"data: {"candidates":[{"content":{"parts":[{"text":"too late"}]}}]}"#.to_owned(),
-            ))
+            )
+            .build())
         }
     }
 }
@@ -3078,7 +3556,7 @@ impl AnswerEvaluator for GeminiAnswerEvaluator {
             return Err(EvaluationError::Unavailable);
         }
         parse_gemini_evaluation_decision(
-            &gemini_stream_model_text(&response.body),
+            &gemini_evaluation_model_text(response.body).await?,
             &request.question.rubric,
         )
     }
@@ -3092,6 +3570,41 @@ fn gemini_evaluation_request_body(request: &EvaluationRequest) -> Value {
         "contents": [{ "role": "user", "parts": [{ "text": payload.to_string() }] }],
         "generationConfig": { "responseMimeType": "application/json" },
     })
+}
+
+/// The evaluator's answer is one bounded JSON object, not speech, so its text
+/// is collected — within an explicit bound — rather than spoken incrementally.
+async fn gemini_evaluation_model_text(body: GeminiResponseBody) -> Result<String, EvaluationError> {
+    let mut text = String::new();
+    match body {
+        GeminiResponseBody::Bounded(bounded) => {
+            push_bounded_model_text(&mut text, &gemini_stream_model_text(&bounded))?;
+        }
+        GeminiResponseBody::Stream(mut stream) => {
+            let mut decoder = GeminiSseDecoder::default();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|()| EvaluationError::Unavailable)?;
+                decoder
+                    .push(&chunk)
+                    .map_err(|()| EvaluationError::MalformedResponse)?;
+                while let Some(record) = decoder.next_record() {
+                    push_bounded_model_text(&mut text, &gemini_stream_model_text(&record))?;
+                }
+            }
+            if let Some(record) = decoder.finish() {
+                push_bounded_model_text(&mut text, &gemini_stream_model_text(&record))?;
+            }
+        }
+    }
+    Ok(text)
+}
+
+fn push_bounded_model_text(text: &mut String, part: &str) -> Result<(), EvaluationError> {
+    if text.len().saturating_add(part.len()) > MAX_GEMINI_SSE_EVENT_BYTES {
+        return Err(EvaluationError::MalformedResponse);
+    }
+    text.push_str(part);
+    Ok(())
 }
 
 fn gemini_stream_model_text(body: &str) -> String {

@@ -2,7 +2,7 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -26,12 +26,14 @@ use tokio::time::timeout;
 
 use crate::synthetic::{fixture_response_text, synthetic_fixture_answer_evaluator};
 
+use futures_util::StreamExt;
+
 use super::llm::{
     stream_gemini_http_with_attempt_events, GeminiAnswerEvaluator, GeminiConversation,
-    GeminiStreamAttemptFailure, ReqwestGeminiSseClient,
+    GeminiEventStream, GeminiStreamAttemptFailure, ReqwestGeminiSseClient,
 };
 use super::stt::transcribe_ink_websocket;
-use super::tts::SonicSessionVoice;
+use super::tts::{SonicSessionVoice, SpeechFrameSink};
 use super::{
     answer_evaluation_from_outcome, audio_frame_bytes, brain_failure, duration_ms,
     emit_provider_failure, failure_with_latency, gemini_request, learning_event_projection,
@@ -69,8 +71,11 @@ pub(crate) enum EvaluatorProvenance {
 /// only thing downstream code may turn into a learner fact.
 #[derive(Debug)]
 pub(crate) struct GeminiTurnResult {
+    /// Only the final-pass, post-outcome text — the words actually spoken.
     response_text: String,
     turn_outcome: Option<TurnOutcome>,
+    /// Whether a speech context was opened for this response.
+    speech_opened: bool,
 }
 
 #[derive(Clone)]
@@ -346,6 +351,7 @@ where
                         input: runner_input,
                         phases: phases.clone(),
                         announce_question,
+                        speech_opened: Arc::new(AtomicBool::new(false)),
                         cancelled: CancellationToken::new(),
                         completed: Arc::new(AtomicBool::new(false)),
                     },
@@ -436,6 +442,7 @@ where
         events.push(phases.phase_event(StudySessionPhase::Thinking)?);
 
         let mut usage = BrainUsage::default();
+        let speech_opened = AtomicBool::new(false);
         let turn = self
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: &transcript.final_text,
@@ -447,6 +454,7 @@ where
                 question: &question,
                 response_id: &response_id,
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await?;
@@ -485,24 +493,14 @@ where
             });
         }
         if matches!(outcome.resolution, TurnResolution::Evaluated { .. }) {
-            let response_text =
-                require_spoken_response_text(&turn.response_text, &self.config.gemini.model_id)?;
-            let frames = self
-                .transports
-                .synthesize_sonic(
-                    &self.config,
-                    &response_id,
-                    response_text,
-                    interrupt,
-                    &cancel,
-                )
+            require_spoken_response_text(&turn.response_text, &self.config.gemini.model_id)?;
+            let mut sink = ReplayFrameSink {
+                events: &mut events,
+                response_id: &response_id,
+            };
+            self.transports
+                .finish_speech(&self.config, &response_id, interrupt, &cancel, &mut sink)
                 .await?;
-            for frame in frames {
-                events.push(BrainEvent::AudioDelta {
-                    response_id: response_id.clone(),
-                    frame,
-                });
-            }
         }
         events.push(phases.phase_event(StudySessionPhase::Feedback)?);
         events.push(phases.phase_event(StudySessionPhase::Correction)?);
@@ -533,7 +531,15 @@ where
 
     async fn emit_turn(&self, job: RunnerTurnJob) {
         let mut deferred_events = Vec::new();
-        if let Err(error) = self.run_turn(&job, &mut deferred_events).await {
+        let outcome = self.run_turn(&job, &mut deferred_events).await;
+        // A turn replaced while its speech context was open must still tell the
+        // provider, even if it never reached its own finalizer.
+        if job.cancelled.is_cancelled() && job.speech_opened.load(Ordering::SeqCst) {
+            self.transports
+                .cancel_speech(&self.config, &job.response_id)
+                .await;
+        }
+        if let Err(error) = outcome {
             // A learner's own barge-in or stop is not an incident: a turn that
             // ended because it was cancelled reports no provider error.
             if job.cancelled.is_cancelled() {
@@ -678,6 +684,7 @@ where
                 question: &question,
                 response_id: &job.response_id,
                 session: &job.session,
+                speech_opened: &job.speech_opened,
                 usage: &mut usage,
             })
             .await?;
@@ -703,6 +710,7 @@ where
         turn: GeminiTurnResult,
         usage: BrainUsage,
     ) -> Result<(), BrainError> {
+        let speech_opened = turn.speech_opened;
         let outcome = turn.turn_outcome.ok_or_else(missing_turn_outcome_failure)?;
         let evaluated = matches!(outcome.resolution, TurnResolution::Evaluated { .. });
         // A live turn that produced no text has nothing honest to say. There is
@@ -739,31 +747,27 @@ where
             return Ok(());
         }
 
-        // A deferral is a recovery signal, not a response to speak.
-        if let Some(response_text) = response_text {
-            let frames = self
-                .transports
-                .synthesize_sonic(
+        // A deferral is a recovery signal, not a response to speak. The final
+        // text already reached the provider as it arrived; all that remains is
+        // to close the context and forward each frame as it is decoded.
+        if response_text.is_some() && speech_opened {
+            let mut sink = RunnerFrameSink {
+                event_tx: &job.event_tx,
+                response_id: &job.response_id,
+                cancelled: &job.cancelled,
+                stopped: false,
+            };
+            self.transports
+                .finish_speech(
                     &self.config,
                     &job.response_id,
-                    response_text,
                     FakeRuntimeInterrupt::None,
                     &job.cancelled,
+                    &mut sink,
                 )
                 .await?;
-            for frame in frames {
-                if !send_fake_unless_cancelled(
-                    &job.event_tx,
-                    BrainEvent::AudioDelta {
-                        response_id: job.response_id.clone(),
-                        frame,
-                    },
-                    &job.cancelled,
-                )
-                .await
-                {
-                    return Ok(());
-                }
+            if sink.stopped {
+                return Ok(());
             }
         }
 
@@ -899,25 +903,33 @@ where
             question,
             response_id,
             session,
+            speech_opened: speech_opened_flag,
             usage,
         } = job;
         let mut conversation = GeminiConversation::default();
         conversation.push_user_text(answer_text);
         let mut response_prompt = String::new();
         let mut turn_outcome: Option<TurnOutcome> = None;
+        let mut speech_opened = false;
         let mut executed_gemini_tool_stages = 0_u32;
         let mut active_gemini = self.config.gemini.clone();
+        // A one-shot replay has no session loop to cancel it, so it selects on a
+        // token that is never triggered rather than on nothing at all.
+        let idle_cancellation = CancellationToken::new();
+        let cancel = cancelled.unwrap_or(&idle_cancellation);
 
         for pass_index in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
+            let final_pass = pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES;
             if cancelled.is_some_and(CancellationToken::is_cancelled) {
                 return Ok(GeminiTurnResult {
                     response_text: response_prompt,
                     turn_outcome,
+                    speech_opened,
                 });
             }
             let mut active_config = self.config.clone();
             active_config.gemini = active_gemini.clone();
-            let tools = if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+            let tools = if final_pass {
                 &[] as &[Value]
             } else {
                 &active_config.tools
@@ -938,9 +950,10 @@ where
                 return Ok(GeminiTurnResult {
                     response_text: response_prompt,
                     turn_outcome,
+                    speech_opened,
                 });
             };
-            let stream = match attempt {
+            let stream: GeminiEventStream = match attempt {
                 Ok(stream) => stream,
                 Err(failure) => {
                     for event in failure.events {
@@ -965,44 +978,11 @@ where
                     return Err(failure.error);
                 }
             };
-            let stream = drain_gemini_fallback_activations(
-                fake_interrupt_gemini_stream(stream, interrupt),
-                events,
-                &mut active_gemini,
-                response_id,
-            );
-            {
-                let tool_call_names = gemini_function_call_names(&stream);
-                if !tool_call_names.is_empty() {
-                    if interrupt == FakeRuntimeInterrupt::CancelDuringGeminiToolCall {
-                        return Ok(GeminiTurnResult {
-                            response_text: response_prompt,
-                            turn_outcome,
-                        });
-                    }
-                    if cancelled.is_some_and(CancellationToken::is_cancelled) {
-                        return Ok(GeminiTurnResult {
-                            response_text: response_prompt,
-                            turn_outcome,
-                        });
-                    }
-                    if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
-                        return Err(gemini_tool_loop_budget_error(
-                            tool_call_names[0],
-                            &active_gemini.model_id,
-                            gemini_started.elapsed(),
-                        ));
-                    }
-                    reserve_gemini_tool_batch(
-                        &mut executed_gemini_tool_stages,
-                        &tool_call_names,
-                        &active_gemini.model_id,
-                        gemini_started.elapsed(),
-                    )?;
-                }
-            }
+            let mut stream = fake_interrupt_gemini_stream(stream, interrupt);
             let mut saw_tool_call = false;
-            for event in stream {
+            while let Some(item) = stream.next().await {
+                let event =
+                    item.map_err(|error| failure_with_latency(error, gemini_started.elapsed()))?;
                 match event {
                     GeminiStreamEvent::FunctionCall { id, name, args, .. } => {
                         saw_tool_call = true;
@@ -1010,21 +990,32 @@ where
                             return Ok(GeminiTurnResult {
                                 response_text: response_prompt,
                                 turn_outcome,
+                                speech_opened,
                             });
                         }
                         if cancelled.is_some_and(CancellationToken::is_cancelled) {
                             return Ok(GeminiTurnResult {
                                 response_text: response_prompt,
                                 turn_outcome,
+                                speech_opened,
                             });
                         }
-                        if pass_index + 1 >= MAX_GEMINI_TOOL_LOOP_PASSES {
+                        if final_pass {
                             return Err(gemini_tool_loop_budget_error(
                                 &name,
-                                &self.config.gemini.model_id,
+                                &active_gemini.model_id,
                                 gemini_started.elapsed(),
                             ));
                         }
+                        // Incremental processing makes the budget live: stages
+                        // are reserved as the calls arrive, not preflighted from
+                        // a buffered batch.
+                        reserve_gemini_tool_stage(
+                            &mut executed_gemini_tool_stages,
+                            &name,
+                            &active_gemini.model_id,
+                            gemini_started.elapsed(),
+                        )?;
                         let proposal = if name == "evaluate_spoken_answer" {
                             ToolProposal::evaluate_spoken_answer(
                                 &session.study_set_id,
@@ -1092,7 +1083,26 @@ where
                                 text: text.clone(),
                             });
                         }
-                        response_prompt.push_str(&text);
+                        // Only the final, post-outcome pass is an answer to the
+                        // learner. First-pass text is the model planning its
+                        // tool call, and a turn with no evaluated outcome has
+                        // nothing to say: neither reaches the speech provider.
+                        if final_pass && evaluated_turn_outcome(turn_outcome.as_ref()) {
+                            response_prompt.push_str(&text);
+                            if !text.trim().is_empty() {
+                                self.transports
+                                    .extend_speech(
+                                        &self.config,
+                                        response_id,
+                                        &text,
+                                        interrupt,
+                                        cancel,
+                                    )
+                                    .await?;
+                                speech_opened = true;
+                                speech_opened_flag.store(true, Ordering::SeqCst);
+                            }
+                        }
                         conversation.push_model_text(text);
                     }
                     GeminiStreamEvent::Usage {
@@ -1138,6 +1148,7 @@ where
         Ok(GeminiTurnResult {
             response_text: response_prompt,
             turn_outcome,
+            speech_opened,
         })
     }
 
@@ -1158,6 +1169,51 @@ where
             )
             .await
             .is_ok()
+    }
+}
+
+/// The runner's speech sink: every decoded frame becomes one `AudioDelta`, at
+/// once, unless the turn it belongs to was cancelled.
+struct RunnerFrameSink<'a> {
+    event_tx: &'a mpsc::Sender<BrainEvent>,
+    response_id: &'a str,
+    cancelled: &'a CancellationToken,
+    stopped: bool,
+}
+
+#[async_trait]
+impl SpeechFrameSink for RunnerFrameSink<'_> {
+    async fn frame(&mut self, frame: AudioFrame) -> bool {
+        let delivered = send_fake_unless_cancelled(
+            self.event_tx,
+            BrainEvent::AudioDelta {
+                response_id: self.response_id.to_owned(),
+                frame,
+            },
+            self.cancelled,
+        )
+        .await;
+        if !delivered {
+            self.stopped = true;
+        }
+        delivered
+    }
+}
+
+/// The fixture replay's speech sink: frames land in the reported event list.
+struct ReplayFrameSink<'a> {
+    events: &'a mut Vec<BrainEvent>,
+    response_id: &'a str,
+}
+
+#[async_trait]
+impl SpeechFrameSink for ReplayFrameSink<'_> {
+    async fn frame(&mut self, frame: AudioFrame) -> bool {
+        self.events.push(BrainEvent::AudioDelta {
+            response_id: self.response_id.to_owned(),
+            frame,
+        });
+        true
     }
 }
 
@@ -1248,6 +1304,9 @@ pub(crate) struct RunnerTurnJob {
     /// The open handshake already announced the first response; every later
     /// accepted turn announces its own.
     pub(crate) announce_question: bool,
+    /// Whether this turn opened a speech context, so a cancellation can tell
+    /// the provider about it even if the turn never reached its finalizer.
+    pub(crate) speech_opened: Arc<AtomicBool>,
     /// The one cooperative cancellation signal for this turn: the provider
     /// stages select on it and the event projection suppresses through it.
     pub(crate) cancelled: CancellationToken,
@@ -1332,6 +1391,7 @@ struct GeminiToolLoopJob<'a> {
     events: &'a mut Vec<BrainEvent>,
     usage: &'a mut BrainUsage,
     emit_text_delta: bool,
+    speech_opened: &'a AtomicBool,
     cancelled: Option<&'a CancellationToken>,
 }
 
@@ -1380,59 +1440,9 @@ fn reserve_gemini_tool_stage(
     Ok(())
 }
 
-fn reserve_gemini_tool_batch(
-    executed_gemini_tool_stages: &mut u32,
-    tool_names: &[&str],
-    model: &str,
-    latency: Duration,
-) -> Result<(), BrainError> {
-    let mut staged = *executed_gemini_tool_stages;
-    for tool_name in tool_names {
-        reserve_gemini_tool_stage(&mut staged, tool_name, model, latency)?;
-    }
-    *executed_gemini_tool_stages = staged;
-    Ok(())
-}
-
-fn gemini_function_call_names(stream: &[GeminiStreamEvent]) -> Vec<&str> {
-    stream
-        .iter()
-        .filter_map(|event| match event {
-            GeminiStreamEvent::FunctionCall { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn drain_gemini_fallback_activations(
-    stream: Vec<GeminiStreamEvent>,
-    events: &mut Vec<BrainEvent>,
-    active_gemini: &mut GeminiConfig,
-    response_id: &str,
-) -> Vec<GeminiStreamEvent> {
-    let mut deferred = Vec::with_capacity(stream.len());
-    for event in stream {
-        match event {
-            GeminiStreamEvent::FallbackActivated {
-                from_model,
-                to_model,
-                reason,
-                failure,
-            } => {
-                promote_active_gemini_fallback(active_gemini, &to_model);
-                events.push(BrainEvent::ProviderFallbackActivated {
-                    response_id: response_id.to_owned(),
-                    provider: "gemini".to_owned(),
-                    from_model,
-                    to_model,
-                    reason,
-                    failure,
-                });
-            }
-            event => deferred.push(event),
-        }
-    }
-    deferred
+/// Only an evaluated outcome authorizes speech.
+fn evaluated_turn_outcome(outcome: Option<&TurnOutcome>) -> bool {
+    outcome.is_some_and(|outcome| matches!(outcome.resolution, TurnResolution::Evaluated { .. }))
 }
 
 async fn manuscript_intent_authorization_stage<F>(
@@ -1729,8 +1739,12 @@ mod fallback_tests {
         );
     }
 
+    /// Task 5 (`ADAPTER-05`) replaced the pre-buffer batch scan with a live,
+    /// per-call reservation: a streamed response has no batch to preflight.
+    /// The budget therefore stops the call that exceeds it — every earlier call
+    /// in the same response is a stage the model was entitled to.
     #[tokio::test]
-    async fn gemini_tool_batches_preflight_budget_before_side_effects() {
+    async fn gemini_tool_stages_are_reserved_as_calls_arrive_and_stop_at_the_budget() {
         let store = learning_ready_seeded_store();
         let session_config = SessionConfig {
             session_id: Some(SessionId::new("voice-session-1")),
@@ -1762,6 +1776,7 @@ mod fallback_tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         let error = runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "NADH donates electrons to the electron transport chain.",
@@ -1773,6 +1788,7 @@ mod fallback_tests {
                 question: &question,
                 response_id: "response-over-budget",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -1792,7 +1808,13 @@ mod fallback_tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event, BrainEvent::AnswerEvaluated { .. })));
-        assert_eq!(usage.source_grounded_correction_count, 0);
+        // Exactly the budget was spent, and the call that would have exceeded it
+        // never executed: the loop stops at the boundary rather than after it.
+        assert_eq!(
+            usage.source_grounded_correction_count,
+            u64::from(MAX_GEMINI_EXECUTED_TOOL_STAGES),
+            "the budget is spent, and no further stage runs"
+        );
         assert!(store.snapshot().answer_attempts.is_empty());
     }
 
@@ -1894,9 +1916,10 @@ mod fallback_tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
-            Ok((0..=MAX_GEMINI_EXECUTED_TOOL_STAGES)
-                .map(|index| {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
+            Ok(fixture_gemini_stream(
+                (0..=MAX_GEMINI_EXECUTED_TOOL_STAGES)
+                    .map(|index| {
                     let args = json!({
                         "study_set_id": "biology-midterm",
                         "voice_session_id": "voice-session-1",
@@ -1916,40 +1939,49 @@ mod fallback_tests {
                         }),
                     }
                 })
-                .collect())
+                .collect(),
+            ))
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
+        ) -> Result<(), BrainError> {
+            unreachable!("test calls Gemini tool loop directly")
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
             unreachable!("test calls Gemini tool loop directly")
         }
     }
 }
 
 fn fake_interrupt_gemini_stream(
-    stream: Vec<GeminiStreamEvent>,
+    stream: GeminiEventStream,
     interrupt: FakeRuntimeInterrupt,
-) -> Vec<GeminiStreamEvent> {
+) -> GeminiEventStream {
     match interrupt {
-        FakeRuntimeInterrupt::NoGeminiManuscriptIntent => stream
-            .into_iter()
-            .filter(|event| {
-                !matches!(
-                    event,
-                    GeminiStreamEvent::FunctionCall { name, .. }
-                        if name == "emit_manuscript_intent"
-                )
-            })
-            .collect(),
-        FakeRuntimeInterrupt::MalformedGeminiManuscriptIntent => stream
-            .into_iter()
-            .map(|event| match event {
+        FakeRuntimeInterrupt::NoGeminiManuscriptIntent => Box::pin(stream.filter(|event| {
+            let keep = !matches!(
+                event,
+                Ok(GeminiStreamEvent::FunctionCall { name, .. })
+                    if name == "emit_manuscript_intent"
+            );
+            async move { keep }
+        })),
+        FakeRuntimeInterrupt::MalformedGeminiManuscriptIntent => Box::pin(stream.map(|event| {
+            event.map(|event| match event {
                 GeminiStreamEvent::FunctionCall { id, name, .. }
                     if name == "emit_manuscript_intent" =>
                 {
@@ -1975,10 +2007,9 @@ fn fake_interrupt_gemini_stream(
                 }
                 event => event,
             })
-            .collect(),
-        FakeRuntimeInterrupt::UnauthorizedGeminiManuscriptIntent => stream
-            .into_iter()
-            .map(|event| match event {
+        })),
+        FakeRuntimeInterrupt::UnauthorizedGeminiManuscriptIntent => Box::pin(stream.map(|event| {
+            event.map(|event| match event {
                 GeminiStreamEvent::FunctionCall { id, name, .. }
                     if name == "emit_manuscript_intent" =>
                 {
@@ -2004,32 +2035,45 @@ fn fake_interrupt_gemini_stream(
                 }
                 event => event,
             })
-            .collect(),
-        FakeRuntimeInterrupt::GeminiToolCallOnFinalPass
-            if stream
-                .iter()
-                .all(|event| !matches!(event, GeminiStreamEvent::FunctionCall { .. })) =>
-        {
-            let args = json!({
-                "type": "entity_intent",
-                "entity_id": "nadh",
-                "entity_kind": "concept",
-                "register": "correcting",
-                "emphasis": "marked",
-            });
-            vec![GeminiStreamEvent::FunctionCall {
-                id: "call-manuscript-final-pass".to_owned(),
-                name: "emit_manuscript_intent".to_owned(),
-                args: args.clone(),
-                part: json!({
-                    "functionCall": {
-                        "id": "call-manuscript-final-pass",
-                        "name": "emit_manuscript_intent",
-                        "args": args,
-                    }
-                }),
-            }]
-        }
+        })),
+        // A tool call the model was not offered, appended once the pass turns
+        // out to have proposed none of its own.
+        FakeRuntimeInterrupt::GeminiToolCallOnFinalPass => Box::pin(futures_util::stream::unfold(
+            (Some(stream), false, false),
+            |(stream, saw_call, appended)| async move {
+                let mut stream = stream?;
+                if let Some(item) = stream.next().await {
+                    let saw_call =
+                        saw_call || matches!(&item, Ok(GeminiStreamEvent::FunctionCall { .. }));
+                    return Some((item, (Some(stream), saw_call, appended)));
+                }
+                if saw_call || appended {
+                    return None;
+                }
+                let args = json!({
+                    "type": "entity_intent",
+                    "entity_id": "nadh",
+                    "entity_kind": "concept",
+                    "register": "correcting",
+                    "emphasis": "marked",
+                });
+                Some((
+                    Ok(GeminiStreamEvent::FunctionCall {
+                        id: "call-manuscript-final-pass".to_owned(),
+                        name: "emit_manuscript_intent".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-final-pass",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }),
+                    (Some(stream), saw_call, true),
+                ))
+            },
+        )),
         _ => stream,
     }
 }
@@ -2114,16 +2158,33 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         &self,
         config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure>;
+    ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure>;
 
-    async fn synthesize_sonic(
+    /// Feed more final-pass text into this response's speech context.
+    async fn extend_speech(
         &self,
         config: &CartesiaGeminiConfig,
         response_id: &str,
-        transcript: &str,
+        text: &str,
         interrupt: FakeRuntimeInterrupt,
         cancel: &CancellationToken,
-    ) -> Result<Vec<AudioFrame>, BrainError>;
+    ) -> Result<(), BrainError>;
+
+    /// Abandon this response's speech context: the turn was replaced or stopped
+    /// before it could finish speaking.
+    async fn cancel_speech(&self, config: &CartesiaGeminiConfig, response_id: &str) {
+        let _ = (config, response_id);
+    }
+
+    /// Close the context and stream its audio out, frame by frame.
+    async fn finish_speech(
+        &self,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        interrupt: FakeRuntimeInterrupt,
+        cancel: &CancellationToken,
+        sink: &mut dyn SpeechFrameSink,
+    ) -> Result<(), BrainError>;
 }
 
 /// The fixture transports, plus the one observation a test cannot make from the
@@ -2134,7 +2195,7 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
 /// "zero Sonic calls" directly observable.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FakeCartesiaGeminiTransports {
-    sonic_calls: Arc<AtomicU32>,
+    spoken_contexts: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl FakeCartesiaGeminiTransports {
@@ -2143,7 +2204,10 @@ impl FakeCartesiaGeminiTransports {
     }
 
     pub(crate) fn sonic_call_count(&self) -> u32 {
-        self.sonic_calls.load(Ordering::SeqCst)
+        self.spoken_contexts
+            .lock()
+            .expect("spoken context lock poisoned")
+            .len() as u32
     }
 }
 
@@ -2175,7 +2239,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         &self,
         _config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+    ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
         let has_function_response =
             request["contents"]
                 .as_array()
@@ -2209,7 +2273,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 input_tokens: 0,
                 output_tokens: 2,
             });
-            Ok(events)
+            Ok(fixture_gemini_stream(events))
         } else {
             if request.get("tools").is_none() {
                 return Err(GeminiStreamAttemptFailure {
@@ -2232,7 +2296,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                 "register": "correcting",
                 "emphasis": "marked",
             });
-            Ok(vec![
+            Ok(fixture_gemini_stream(vec![
                 GeminiStreamEvent::FunctionCall {
                     id: "call-eval-1".to_owned(),
                     name: "evaluate_spoken_answer".to_owned(),
@@ -2261,25 +2325,40 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
                     input_tokens: 20,
                     output_tokens: 8,
                 },
-            ])
+            ]))
         }
     }
 
-    async fn synthesize_sonic(
+    async fn extend_speech(
         &self,
         config: &CartesiaGeminiConfig,
         response_id: &str,
-        transcript: &str,
+        text: &str,
         interrupt: FakeRuntimeInterrupt,
         _cancel: &CancellationToken,
-    ) -> Result<Vec<AudioFrame>, BrainError> {
-        // Counted on entry, before any outcome: an asked-for synthesis that then
-        // failed is still a call the provider saw.
-        self.sonic_calls.fetch_add(1, Ordering::SeqCst);
-        let _request = sonic_generation_request(&config.sonic, response_id, transcript, false);
+    ) -> Result<(), BrainError> {
+        // Recorded on entry, before any outcome: an asked-for synthesis that
+        // then failed is still a context the provider saw.
+        self.spoken_contexts
+            .lock()
+            .expect("spoken context lock poisoned")
+            .insert(response_id.to_owned());
+        let _request = sonic_generation_request(&config.sonic, response_id, text, true);
         if interrupt == FakeRuntimeInterrupt::WriterFailureBeforeSonicAudio {
             return Err(fake_transport_failure("writer_failed_before_audio"));
         }
+        Ok(())
+    }
+
+    async fn finish_speech(
+        &self,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        _interrupt: FakeRuntimeInterrupt,
+        _cancel: &CancellationToken,
+        sink: &mut dyn SpeechFrameSink,
+    ) -> Result<(), BrainError> {
+        let _finalizer = sonic_generation_request(&config.sonic, response_id, "", false);
         let sonic = json!({
             "type": "chunk",
             "context_id": response_id,
@@ -2289,10 +2368,17 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         else {
             return Err(fake_transport_failure("sonic_audio_unparsed"));
         };
-        AudioFrame::from_base64(pcm16_base64)
-            .map(|frame| vec![frame])
-            .map_err(|_| fake_transport_failure("sonic_audio_invalid_base64"))
+        let frame = AudioFrame::from_base64(pcm16_base64)
+            .map_err(|_| fake_transport_failure("sonic_audio_invalid_base64"))?;
+        sink.frame(frame).await;
+        Ok(())
     }
+}
+
+/// A scripted provider response, delivered through the same incremental stream
+/// shape the live transport produces.
+fn fixture_gemini_stream(events: Vec<GeminiStreamEvent>) -> GeminiEventStream {
+    Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
 }
 
 /// Fixture-runtime transport faults. The wording stays inside the fake
@@ -2523,7 +2609,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         &self,
         config: &CartesiaGeminiConfig,
         request: Value,
-    ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+    ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
         let started = Instant::now();
         stream_gemini_http_with_attempt_events(self.gemini.as_ref(), &config.gemini, request)
             .await
@@ -2533,23 +2619,36 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
             })
     }
 
-    async fn synthesize_sonic(
+    async fn extend_speech(
         &self,
         config: &CartesiaGeminiConfig,
         response_id: &str,
-        transcript: &str,
+        text: &str,
         _interrupt: FakeRuntimeInterrupt,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<AudioFrame>, BrainError> {
+        _cancel: &CancellationToken,
+    ) -> Result<(), BrainError> {
         let started = Instant::now();
         self.voice
-            .speak(
-                &config.sonic,
-                &config.cartesia_api_key,
-                response_id,
-                transcript,
-                cancel,
-            )
+            .extend(&config.sonic, &config.cartesia_api_key, response_id, text)
+            .await
+            .map_err(|error| failure_with_latency(error, started.elapsed()))
+    }
+
+    async fn cancel_speech(&self, _config: &CartesiaGeminiConfig, response_id: &str) {
+        self.voice.cancel_context(response_id).await;
+    }
+
+    async fn finish_speech(
+        &self,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        _interrupt: FakeRuntimeInterrupt,
+        cancel: &CancellationToken,
+        sink: &mut dyn SpeechFrameSink,
+    ) -> Result<(), BrainError> {
+        let started = Instant::now();
+        self.voice
+            .finish(&config.sonic, response_id, cancel, sink)
             .await
             .map_err(|error| failure_with_latency(error, started.elapsed()))
     }
@@ -2559,6 +2658,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::AtomicU32;
     use std::sync::Mutex;
 
     use agent_domain::{SessionId, StudyMode};
@@ -2642,6 +2742,7 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         let turn = runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "omitted",
@@ -2653,6 +2754,7 @@ mod tests {
                 question: &question,
                 response_id: "response-1",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -2722,6 +2824,7 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "omitted",
@@ -2733,6 +2836,7 @@ mod tests {
                 question: &question,
                 response_id: "response-1",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -2800,6 +2904,7 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         let error = runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "omitted",
@@ -2811,6 +2916,7 @@ mod tests {
                 question: &question,
                 response_id: "response-1",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -2875,6 +2981,7 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         let error = runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "omitted",
@@ -2886,6 +2993,7 @@ mod tests {
                 question: &question,
                 response_id: "response-1",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -2939,6 +3047,7 @@ mod tests {
         let mut events = Vec::new();
         let mut usage = BrainUsage::default();
 
+        let speech_opened = AtomicBool::new(false);
         let error = runner
             .run_gemini_tool_loop(GeminiToolLoopJob {
                 answer_text: "omitted",
@@ -2950,6 +3059,7 @@ mod tests {
                 question: &question,
                 response_id: "response-1",
                 session: &session,
+                speech_opened: &speech_opened,
                 usage: &mut usage,
             })
             .await
@@ -3016,6 +3126,7 @@ mod tests {
                 },
                 phases: SessionPhaseTracker::ready(),
                 announce_question: false,
+                speech_opened: Arc::new(AtomicBool::new(false)),
                 cancelled: CancellationToken::new(),
                 completed: Arc::new(AtomicBool::new(false)),
             })
@@ -3097,6 +3208,7 @@ mod tests {
                 },
                 phases: SessionPhaseTracker::ready(),
                 announce_question: false,
+                speech_opened: Arc::new(AtomicBool::new(false)),
                 cancelled: CancellationToken::new(),
                 completed: Arc::new(AtomicBool::new(false)),
             })
@@ -3174,7 +3286,7 @@ mod tests {
             &self,
             config: &CartesiaGeminiConfig,
             request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             let mut models = self.models.lock().expect("models lock poisoned");
             models.push(config.gemini.model_id.clone());
             let call_index = models.len();
@@ -3191,7 +3303,7 @@ mod tests {
                     "question_id": "q-oxidative-phosphorylation-nadh",
                     "answer_text": "omitted",
                 });
-                Ok(vec![
+                Ok(fixture_gemini_stream(vec![
                     GeminiStreamEvent::FallbackActivated {
                         from_model: "gemini-3.5-pro".to_owned(),
                         to_model: "gemini-3.5-flash".to_owned(),
@@ -3210,7 +3322,7 @@ mod tests {
                             }
                         }),
                     },
-                ])
+                ]))
             } else {
                 assert!(request["contents"]
                     .as_array()
@@ -3223,22 +3335,33 @@ mod tests {
                             .flatten()
                             .any(|part| part.get("functionResponse").is_some())
                     }));
-                Ok(vec![GeminiStreamEvent::ModelPart {
+                Ok(fixture_gemini_stream(vec![GeminiStreamEvent::ModelPart {
                     text: Some("fallback continuation".to_owned()),
                     part: json!({ "text": "fallback continuation" }),
-                }])
+                }]))
             }
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3262,7 +3385,7 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             Err(GeminiStreamAttemptFailure {
                 events: vec![GeminiStreamEvent::FallbackActivated {
                     from_model: "gemini-3.5-pro".to_owned(),
@@ -3282,15 +3405,26 @@ mod tests {
             })
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3314,7 +3448,7 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             let mut calls = self.calls.lock().expect("calls lock poisoned");
             *calls += 1;
             let call_index = *calls;
@@ -3327,7 +3461,7 @@ mod tests {
                     "question_id": "q-oxidative-phosphorylation-nadh",
                     "answer_text": "omitted",
                 });
-                return Ok(vec![
+                return Ok(fixture_gemini_stream(vec![
                     GeminiStreamEvent::FallbackActivated {
                         from_model: "gemini-3.5-pro".to_owned(),
                         to_model: "gemini-3.5-flash".to_owned(),
@@ -3346,7 +3480,7 @@ mod tests {
                             }
                         }),
                     },
-                ]);
+                ]));
             }
 
             Err(GeminiStreamAttemptFailure {
@@ -3363,15 +3497,26 @@ mod tests {
             })
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3395,7 +3540,7 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             let mut stream = vec![GeminiStreamEvent::FallbackActivated {
                 from_model: "gemini-3.5-pro".to_owned(),
                 to_model: "gemini-3.5-flash".to_owned(),
@@ -3416,18 +3561,29 @@ mod tests {
                     }),
                 }
             }));
-            Ok(stream)
+            Ok(fixture_gemini_stream(stream))
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3451,22 +3607,33 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             tokio::time::sleep(self.delay).await;
-            Ok(vec![GeminiStreamEvent::Error(
+            Ok(fixture_gemini_stream(vec![GeminiStreamEvent::Error(
                 "Gemini stream provider error".to_owned(),
-            )])
+            )]))
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3500,26 +3667,37 @@ mod tests {
             &self,
             _config: &CartesiaGeminiConfig,
             _request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             *self
                 .gemini_calls
                 .lock()
                 .expect("gemini calls lock poisoned") += 1;
-            Ok(vec![GeminiStreamEvent::ModelPart {
+            Ok(fixture_gemini_stream(vec![GeminiStreamEvent::ModelPart {
                 text: Some("one provider turn".to_owned()),
                 part: json!({ "text": "one provider turn" }),
-            }])
+            }]))
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
-            _transcript: &str,
+            _text: &str,
             _interrupt: FakeRuntimeInterrupt,
             _cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            Ok(Vec::new())
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
         }
     }
 
@@ -3583,6 +3761,689 @@ mod tests {
                 .expect("gemini calls lock poisoned"),
             1
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5 (`ADAPTER-05`): only the final, post-outcome response is spoken.
+    //
+    // A first-pass part is the model planning its tool call, not an answer to
+    // the learner; a turn whose evaluation was deferred has nothing to say at
+    // all. Neither may reach the speech provider.
+    // -----------------------------------------------------------------
+
+    /// A latch a test can open once. Awaiting it is cancel-safe, so a `select!`
+    /// arm may drop the wait without losing the release.
+    struct Latch {
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl Latch {
+        fn closed() -> Self {
+            Self {
+                permits: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        fn open(&self) {
+            self.permits.add_permits(1);
+        }
+
+        async fn wait(&self) {
+            let _permit = self.permits.acquire().await.expect("the latch is alive");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5 (`ADAPTER-05`): the final answer reaches the learner's ears while
+    // the providers are still producing it.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sonic_emits_first_audio_delta_before_done() {
+        let store = two_question_seeded_store();
+        let script = Arc::new(StreamingSpeechScript::new());
+        // Only the speech provider's `done` is held back here: the model itself
+        // finishes normally.
+        script.release_gemini_eof();
+        let transports = StreamingSpeechTransports::new(Arc::clone(&script));
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports,
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+
+        // The provider delivers one chunk, then holds `done` back.
+        let mut events = Vec::new();
+        let first_audio = loop {
+            let event = timeout(Duration::from_secs(10), session.events.recv())
+                .await
+                .expect("the first audio frame arrives before the provider is done")
+                .expect("the session stays open");
+            if let BrainEvent::AudioDelta { response_id, frame } = &event {
+                break (response_id.clone(), frame.pcm16_bytes().to_vec());
+            }
+            if let BrainEvent::Error(error) = &event {
+                panic!("unexpected provider failure: {error:?}");
+            }
+            events.push(event);
+        };
+
+        assert_eq!(first_audio.0, "response-1");
+        assert_eq!(first_audio.1, vec![1_u8, 2]);
+        assert!(
+            !script.done_released(),
+            "the first AudioDelta must precede the provider's `done`"
+        );
+
+        script.release_done();
+        drain_until_response_completed(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn final_gemini_text_continuations_feed_sonic_before_gemini_eof() {
+        let store = two_question_seeded_store();
+        let script = Arc::new(StreamingSpeechScript::new());
+        let transports = StreamingSpeechTransports::new(Arc::clone(&script));
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports,
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+
+        // Both final-pass parts must reach Sonic while the Gemini body is still
+        // open. The latch is only released once they have.
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                () = script.both_continuations_written() => break,
+                event = session.events.recv() => events.push(event.expect("the session stays open")),
+            }
+        }
+        assert!(
+            !script.gemini_eof_released(),
+            "Sonic must receive the continuations before the Gemini body ends"
+        );
+
+        let written = script.sonic_writes();
+        let continuations = written
+            .iter()
+            .filter(|value| value["continue"] == serde_json::Value::Bool(true))
+            .map(|value| value["transcript"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continuations,
+            vec![
+                FINAL_RESPONSE_PART_ONE.to_owned(),
+                FINAL_RESPONSE_PART_TWO.to_owned()
+            ],
+            "{written:?}"
+        );
+        assert!(
+            written
+                .iter()
+                .all(|value| value["continue"] != serde_json::Value::Bool(false)),
+            "the finalizer may not be written before the model has finished: {written:?}"
+        );
+
+        script.release_gemini_eof();
+        script.release_done();
+        drain_until_response_completed(&mut session).await;
+
+        let written = script.sonic_writes();
+        let finalizers = written
+            .iter()
+            .filter(|value| value["continue"] == serde_json::Value::Bool(false))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finalizers.len(),
+            1,
+            "exactly one explicit finalizer closes the context: {written:?}"
+        );
+        assert_eq!(finalizers[0]["context_id"], "response-1");
+        let finalizer_index = written
+            .iter()
+            .position(|value| value["continue"] == serde_json::Value::Bool(false))
+            .expect("the finalizer was written");
+        assert_eq!(
+            finalizer_index,
+            written.len() - 1,
+            "the finalizer is the last thing written to the context: {written:?}"
+        );
+    }
+
+    const FINAL_RESPONSE_PART_ONE: &str = "That holds up. ";
+    const FINAL_RESPONSE_PART_TWO: &str = "Here is the next question.";
+
+    /// One scripted provider pair: a Gemini body whose EOF the test holds back,
+    /// and a Sonic connection whose `done` the test holds back.
+    struct StreamingSpeechScript {
+        sonic_writes: std::sync::Mutex<Vec<Value>>,
+        continuations: AtomicU32,
+        continuations_written: Latch,
+        gemini_eof: Latch,
+        gemini_eof_released: AtomicBool,
+        done: Latch,
+        done_released: AtomicBool,
+    }
+
+    impl StreamingSpeechScript {
+        fn new() -> Self {
+            Self {
+                sonic_writes: std::sync::Mutex::new(Vec::new()),
+                continuations: AtomicU32::new(0),
+                continuations_written: Latch::closed(),
+                gemini_eof: Latch::closed(),
+                gemini_eof_released: AtomicBool::new(false),
+                done: Latch::closed(),
+                done_released: AtomicBool::new(false),
+            }
+        }
+
+        fn sonic_writes(&self) -> Vec<Value> {
+            self.sonic_writes
+                .lock()
+                .expect("sonic write lock poisoned")
+                .clone()
+        }
+
+        async fn both_continuations_written(&self) {
+            self.continuations_written.wait().await;
+        }
+
+        fn release_gemini_eof(&self) {
+            self.gemini_eof_released.store(true, Ordering::SeqCst);
+            self.gemini_eof.open();
+        }
+
+        fn gemini_eof_released(&self) -> bool {
+            self.gemini_eof_released.load(Ordering::SeqCst)
+        }
+
+        fn release_done(&self) {
+            self.done_released.store(true, Ordering::SeqCst);
+            self.done.open();
+        }
+
+        fn done_released(&self) -> bool {
+            self.done_released.load(Ordering::SeqCst)
+        }
+
+        fn record_sonic_write(&self, value: &Value) {
+            self.sonic_writes
+                .lock()
+                .expect("sonic write lock poisoned")
+                .push(value.clone());
+            if value.get("continue").and_then(Value::as_bool) == Some(true)
+                && self.continuations.fetch_add(1, Ordering::SeqCst) + 1 == 2
+            {
+                self.continuations_written.open();
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamingSpeechTransports {
+        script: Arc<StreamingSpeechScript>,
+        voice: Arc<super::super::tts::SonicSessionVoice>,
+    }
+
+    impl StreamingSpeechTransports {
+        fn new(script: Arc<StreamingSpeechScript>) -> Self {
+            let voice = Arc::new(super::super::tts::SonicSessionVoice::new(Arc::new(
+                StreamingSonicConnector {
+                    script: Arc::clone(&script),
+                },
+            )));
+            Self { script, voice }
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for StreamingSpeechTransports {
+        fn open_session(&self) -> Self {
+            Self {
+                script: Arc::clone(&self.script),
+                voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::new(
+                    StreamingSonicConnector {
+                        script: Arc::clone(&self.script),
+                    },
+                ))),
+            }
+        }
+
+        async fn close_session(&self) {
+            self.voice.close().await;
+        }
+
+        async fn cancel_speech(&self, _config: &CartesiaGeminiConfig, response_id: &str) {
+            self.voice.cancel_context(response_id).await;
+        }
+
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+            _cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "a spoken answer".to_owned(),
+                confidence: Some(0.42),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<super::super::llm::GeminiEventStream, GeminiStreamAttemptFailure> {
+            let final_pass = request["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|content| {
+                    content["parts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|part| part.get("functionResponse").is_some())
+                });
+            if !final_pass {
+                let args = json!({
+                    "study_set_id": "biology-midterm",
+                    "voice_session_id": "voice-session-1",
+                    "question_id": "q-oxidative-phosphorylation-nadh",
+                    "answer_text": "a spoken answer",
+                });
+                return Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                    GeminiStreamEvent::FunctionCall {
+                        id: "call-eval-1".to_owned(),
+                        name: "evaluate_spoken_answer".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-eval-1",
+                                "name": "evaluate_spoken_answer",
+                                "args": args,
+                            }
+                        }),
+                    },
+                )])));
+            }
+            // The final pass hands over two text parts and then holds the body
+            // open until the test says otherwise.
+            let script = Arc::clone(&self.script);
+            let parts = std::collections::VecDeque::from([
+                FINAL_RESPONSE_PART_ONE,
+                FINAL_RESPONSE_PART_TWO,
+            ]);
+            Ok(Box::pin(futures_util::stream::unfold(
+                (parts, script, false),
+                |(mut parts, script, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    if let Some(text) = parts.pop_front() {
+                        return Some((
+                            Ok(GeminiStreamEvent::ModelPart {
+                                part: json!({ "text": text }),
+                                text: Some(text.to_owned()),
+                            }),
+                            (parts, script, false),
+                        ));
+                    }
+                    script.gemini_eof.wait().await;
+                    None
+                },
+            )))
+        }
+
+        async fn extend_speech(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            text: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BrainError> {
+            self.voice
+                .extend(&config.sonic, "sk_car_stream_secret", response_id, text)
+                .await
+        }
+
+        async fn finish_speech(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            cancel: &CancellationToken,
+            sink: &mut dyn super::super::tts::SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            self.voice
+                .finish(&config.sonic, response_id, cancel, sink)
+                .await
+        }
+    }
+
+    struct StreamingSonicConnector {
+        script: Arc<StreamingSpeechScript>,
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicConnector for StreamingSonicConnector {
+        type Socket = StreamingSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, BrainError> {
+            Ok(StreamingSonicSocket {
+                script: Arc::clone(&self.script),
+                pending: std::collections::VecDeque::new(),
+                finalized_context: None,
+                done_sent: false,
+                open: true,
+            })
+        }
+    }
+
+    struct StreamingSonicSocket {
+        script: Arc<StreamingSpeechScript>,
+        pending: std::collections::VecDeque<String>,
+        finalized_context: Option<String>,
+        done_sent: bool,
+        open: bool,
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicSocket for StreamingSonicSocket {
+        async fn send_json(&mut self, value: Value) -> Result<(), BrainError> {
+            self.script.record_sonic_write(&value);
+            if value.get("cancel").and_then(Value::as_bool) == Some(true) {
+                return Ok(());
+            }
+            if value.get("continue").and_then(Value::as_bool) == Some(false) {
+                let context_id = value["context_id"]
+                    .as_str()
+                    .expect("every generation names its context")
+                    .to_owned();
+                // The provider starts speaking as soon as the context closes.
+                self.pending.push_back(format!(
+                    r#"{{"type":"chunk","context_id":"{context_id}","data":"AQI="}}"#
+                ));
+                self.finalized_context = Some(context_id);
+            }
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
+            if let Some(text) = self.pending.pop_front() {
+                return Ok(Some(text));
+            }
+            if let Some(context_id) = self.finalized_context.clone() {
+                if !self.done_sent {
+                    // `done` is held back so the first frame must already have
+                    // reached the learner.
+                    self.script.done.wait().await;
+                    self.done_sent = true;
+                    return Ok(Some(format!(
+                        r#"{{"type":"done","context_id":"{context_id}"}}"#
+                    )));
+                }
+            }
+            self.open = false;
+            Ok(None)
+        }
+
+        fn is_open(&self) -> bool {
+            self.open
+        }
+
+        async fn close(&mut self) -> Result<(), BrainError> {
+            self.open = false;
+            Ok(())
+        }
+    }
+
+    const FIRST_PASS_PLANNING_TEXT: &str = "planning: I should evaluate this answer first.";
+    const FINAL_RESPONSE_TEXT: &str = "That holds up. Here is the next question.";
+
+    #[tokio::test]
+    async fn first_pass_or_unevaluated_text_is_never_spoken() {
+        let store = two_question_seeded_store();
+        let transports = SpeechRecordingTransports::default();
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            Arc::clone(&store) as Arc<dyn StudyMemoryStore>,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+        drain_until_response_completed(&mut session).await;
+
+        let spoken = transports.spoken();
+        assert_eq!(
+            spoken.len(),
+            1,
+            "exactly one response context is opened for an evaluated turn: {spoken:?}"
+        );
+        assert_eq!(spoken[0].0, "response-1");
+        assert!(
+            spoken[0].1.contains(FINAL_RESPONSE_TEXT),
+            "the final response must be spoken: {spoken:?}"
+        );
+        assert!(
+            !spoken[0].1.contains(FIRST_PASS_PLANNING_TEXT),
+            "first-pass tool-planning text must never reach the speech provider: {spoken:?}"
+        );
+
+        // A turn whose evaluation was deferred opens no speech context at all.
+        let deferring = SpeechRecordingTransports::default();
+        let deferred_runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            deferring.clone(),
+            store,
+            Arc::new(DeferringEvaluator) as Arc<dyn AnswerEvaluator>,
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut deferred_session = deferred_runner
+            .open(scripted_session_config("voice-session-2"))
+            .await
+            .unwrap();
+        deferred_session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                5_u8, 6, 7, 8,
+            ])))
+            .await
+            .unwrap();
+        let mut deferred_events = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(10), deferred_session.events.recv())
+                .await
+                .expect("the deferred turn completes")
+                .expect("the session stays open");
+            let completed = matches!(&event, BrainEvent::ResponseCompleted { .. });
+            deferred_events.push(event);
+            if completed {
+                break;
+            }
+        }
+        assert!(
+            deferred_events
+                .iter()
+                .any(|event| matches!(event, BrainEvent::TurnDeferred { .. })),
+            "the control only means something if the turn really deferred: {deferred_events:?}"
+        );
+        assert!(
+            deferring.spoken().is_empty(),
+            "a deferred turn opens no speech context: {:?}",
+            deferring.spoken()
+        );
+    }
+
+    /// Always defers, so the executor persists a deferred outcome.
+    struct DeferringEvaluator;
+
+    #[async_trait]
+    impl AnswerEvaluator for DeferringEvaluator {
+        async fn evaluate(
+            &self,
+            _request: &agent_domain::EvaluationRequest,
+        ) -> Result<agent_domain::EvaluationDecision, agent_domain::EvaluationError> {
+            Ok(agent_domain::EvaluationDecision::Deferred {
+                reason: agent_domain::EvaluationDeferralReason::InsufficientSemanticEvidence,
+                can_retry_same_question: true,
+            })
+        }
+    }
+
+    /// Fixture Ink, a two-pass Gemini script that speaks on both passes, and a
+    /// speech transport that records every context it was asked to open.
+    #[derive(Clone, Default)]
+    struct SpeechRecordingTransports {
+        spoken: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl SpeechRecordingTransports {
+        fn spoken(&self) -> Vec<(String, String)> {
+            self.spoken.lock().expect("spoken lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for SpeechRecordingTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+            _cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "a spoken answer".to_owned(),
+                confidence: Some(0.42),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
+            let final_pass = request["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|content| {
+                    content["parts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|part| part.get("functionResponse").is_some())
+                });
+            if final_pass {
+                return Ok(fixture_gemini_stream(vec![GeminiStreamEvent::ModelPart {
+                    part: json!({ "text": FINAL_RESPONSE_TEXT }),
+                    text: Some(FINAL_RESPONSE_TEXT.to_owned()),
+                }]));
+            }
+            let args = json!({
+                "study_set_id": "biology-midterm",
+                "voice_session_id": "voice-session-1",
+                "question_id": "q-oxidative-phosphorylation-nadh",
+                "answer_text": "a spoken answer",
+            });
+            Ok(fixture_gemini_stream(vec![
+                // The model narrates its plan next to the tool call. That text
+                // is not an answer to the learner.
+                GeminiStreamEvent::ModelPart {
+                    part: json!({ "text": FIRST_PASS_PLANNING_TEXT }),
+                    text: Some(FIRST_PASS_PLANNING_TEXT.to_owned()),
+                },
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-eval-1".to_owned(),
+                    name: "evaluate_spoken_answer".to_owned(),
+                    args: args.clone(),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-eval-1",
+                            "name": "evaluate_spoken_answer",
+                            "args": args,
+                        }
+                    }),
+                },
+            ]))
+        }
+
+        async fn extend_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            response_id: &str,
+            text: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BrainError> {
+            let mut spoken = self.spoken.lock().expect("spoken lock poisoned");
+            match spoken.iter_mut().find(|(id, _)| id == response_id) {
+                Some((_, spoken_text)) => spoken_text.push_str(text),
+                None => spoken.push((response_id.to_owned(), text.to_owned())),
+            }
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            let _ = response_id;
+            sink.frame(AudioFrame::from_pcm16_bytes(vec![1, 2])).await;
+            Ok(())
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3948,6 +4809,10 @@ mod tests {
             self.voice.close().await;
         }
 
+        async fn cancel_speech(&self, _config: &CartesiaGeminiConfig, response_id: &str) {
+            self.voice.cancel_context(response_id).await;
+        }
+
         async fn transcribe_audio(
             &self,
             config: &CartesiaGeminiConfig,
@@ -3964,26 +4829,33 @@ mod tests {
             &self,
             config: &CartesiaGeminiConfig,
             request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             self.inner.stream_gemini(config, request).await
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             config: &CartesiaGeminiConfig,
             response_id: &str,
-            transcript: &str,
+            text: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BrainError> {
+            self.voice
+                .extend(&config.sonic, "sk_car_session_secret", response_id, text)
+                .await
+        }
+
+        async fn finish_speech(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
             _interrupt: FakeRuntimeInterrupt,
             cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
+            sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
             self.voice
-                .speak(
-                    &config.sonic,
-                    "sk_car_session_secret",
-                    response_id,
-                    transcript,
-                    cancel,
-                )
+                .finish(&config.sonic, response_id, cancel, sink)
                 .await
         }
     }
@@ -4256,20 +5128,33 @@ mod tests {
             &self,
             config: &CartesiaGeminiConfig,
             request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             self.live.stream_gemini(config, request).await
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             config: &CartesiaGeminiConfig,
             response_id: &str,
-            transcript: &str,
+            text: &str,
             interrupt: FakeRuntimeInterrupt,
             cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
+        ) -> Result<(), BrainError> {
             self.inner
-                .synthesize_sonic(config, response_id, transcript, interrupt, cancel)
+                .extend_speech(config, response_id, text, interrupt, cancel)
+                .await
+        }
+
+        async fn finish_speech(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            interrupt: FakeRuntimeInterrupt,
+            cancel: &CancellationToken,
+            sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            self.inner
+                .finish_speech(config, response_id, interrupt, cancel, sink)
                 .await
         }
     }
@@ -4430,6 +5315,7 @@ mod tests {
     struct ProviderFinishesCancelledContextTransports {
         inner: FakeCartesiaGeminiTransports,
         script: Arc<ScriptedSonicScript>,
+        voice: Arc<super::super::tts::SonicSessionVoice>,
     }
 
     impl ProviderFinishesCancelledContextTransports {
@@ -4437,16 +5323,22 @@ mod tests {
         /// provider, so the barge-in lands on a real speech context.
         fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
             let (speaking, speaking_rx) = tokio::sync::oneshot::channel();
+            let script = Arc::new(ScriptedSonicScript {
+                connects: AtomicU32::new(0),
+                sent_json: std::sync::Mutex::new(Vec::new()),
+                released: AtomicBool::new(false),
+                release: tokio::sync::Notify::new(),
+                speaking: std::sync::Mutex::new(Some(speaking)),
+            });
             (
                 Self {
                     inner: FakeCartesiaGeminiTransports::new(),
-                    script: Arc::new(ScriptedSonicScript {
-                        connects: AtomicU32::new(0),
-                        sent_json: std::sync::Mutex::new(Vec::new()),
-                        released: AtomicBool::new(false),
-                        release: tokio::sync::Notify::new(),
-                        speaking: std::sync::Mutex::new(Some(speaking)),
-                    }),
+                    voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::new(
+                        ScriptedSonicConnector {
+                            script: Arc::clone(&script),
+                        },
+                    ))),
+                    script,
                 },
                 speaking_rx,
             )
@@ -4471,6 +5363,26 @@ mod tests {
 
     #[async_trait]
     impl CartesiaGeminiTransports for ProviderFinishesCancelledContextTransports {
+        fn open_session(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+                voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::new(
+                    ScriptedSonicConnector {
+                        script: Arc::clone(&self.script),
+                    },
+                ))),
+                script: Arc::clone(&self.script),
+            }
+        }
+
+        async fn close_session(&self) {
+            self.voice.close().await;
+        }
+
+        async fn cancel_speech(&self, _config: &CartesiaGeminiConfig, response_id: &str) {
+            self.voice.cancel_context(response_id).await;
+        }
+
         async fn transcribe_audio(
             &self,
             config: &CartesiaGeminiConfig,
@@ -4487,29 +5399,34 @@ mod tests {
             &self,
             config: &CartesiaGeminiConfig,
             request: Value,
-        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
             self.inner.stream_gemini(config, request).await
         }
 
-        async fn synthesize_sonic(
+        async fn extend_speech(
             &self,
             config: &CartesiaGeminiConfig,
             response_id: &str,
-            transcript: &str,
+            text: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BrainError> {
+            self.voice
+                .extend(&config.sonic, "sk_car_scripted_secret", response_id, text)
+                .await
+        }
+
+        async fn finish_speech(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
             _interrupt: FakeRuntimeInterrupt,
             cancel: &CancellationToken,
-        ) -> Result<Vec<AudioFrame>, BrainError> {
-            super::super::tts::synthesize_sonic_with_connector(
-                Arc::new(ScriptedSonicConnector {
-                    script: Arc::clone(&self.script),
-                }),
-                &config.sonic,
-                "sk_car_scripted_secret",
-                response_id,
-                transcript,
-                cancel,
-            )
-            .await
+            sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            self.voice
+                .finish(&config.sonic, response_id, cancel, sink)
+                .await
         }
     }
 

@@ -3,7 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
@@ -209,17 +209,40 @@ pub(crate) async fn synthesize_sonic_with_connector<C>(
     context_id: &str,
     transcript: &str,
     cancel: &CancellationToken,
-) -> Result<Vec<AudioFrame>, BrainError>
+    sink: &mut dyn SpeechFrameSink,
+) -> Result<(), BrainError>
 where
     C: SonicConnector + 'static,
     C::Socket: 'static,
 {
     let voice = SonicSessionVoice::new(connector);
-    let frames = voice
-        .speak(config, api_key, context_id, transcript, cancel)
-        .await;
+    let spoken = async {
+        voice
+            .extend(config, api_key, context_id, transcript)
+            .await?;
+        voice.finish(config, context_id, cancel, sink).await
+    }
+    .await;
     voice.close().await;
-    frames
+    spoken
+}
+
+/// Drive one already-connected socket through a whole response context.
+#[cfg(test)]
+pub(crate) async fn speak_sonic_on_socket<S>(
+    socket: &mut S,
+    config: &SonicConfig,
+    context_id: &str,
+    transcript: &str,
+    cancel: &CancellationToken,
+    sink: &mut dyn SpeechFrameSink,
+) -> Result<SonicContextOutcome, BrainError>
+where
+    S: SonicSocket + ?Sized,
+{
+    write_sonic_continuations(socket, config, context_id, transcript).await?;
+    write_sonic_finalizer(socket, config, context_id).await?;
+    stream_sonic_context(socket, config, context_id, cancel, sink).await
 }
 
 fn sonic_deadline_failure() -> BrainError {
@@ -231,32 +254,63 @@ fn sonic_deadline_failure() -> BrainError {
     )
 }
 
-/// What one response context produced, and whether its connection survived.
+/// What one response context left behind.
 #[derive(Debug)]
 pub(crate) struct SonicContextOutcome {
-    pub(crate) frames: Vec<AudioFrame>,
     /// Whether the connection is still usable for the next response context.
     pub(crate) connection_open: bool,
 }
 
-pub(crate) async fn synthesize_sonic_context<S>(
+async fn write_sonic_continuations<S>(
     socket: &mut S,
     config: &SonicConfig,
     context_id: &str,
-    transcript: &str,
-    cancel: &CancellationToken,
-) -> Result<SonicContextOutcome, BrainError>
+    text: &str,
+) -> Result<(), BrainError>
 where
     S: SonicSocket + ?Sized,
 {
-    for request in sonic_generation_requests(config, context_id, transcript) {
+    for request in sonic_continuation_requests(config, context_id, text) {
         socket
             .send_json(request)
             .await
             .map_err(|_| sonic_transport_failure("send_failed"))?;
     }
+    Ok(())
+}
 
-    let mut frames = Vec::new();
+/// The one explicit `continue: false` that tells the provider the response is
+/// complete. It is written once, after the model has finished.
+async fn write_sonic_finalizer<S>(
+    socket: &mut S,
+    config: &SonicConfig,
+    context_id: &str,
+) -> Result<(), BrainError>
+where
+    S: SonicSocket + ?Sized,
+{
+    socket
+        .send_json(sonic_generation_request(config, context_id, "", false))
+        .await
+        .map_err(|_| sonic_transport_failure("send_failed"))
+}
+
+/// Read one context's audio, handing each decoded frame straight to the sink.
+///
+/// `ADAPTER-05`: nothing accumulates here. A frame reaches the learner as soon
+/// as it is decoded, long before the provider's `done`.
+pub(crate) async fn stream_sonic_context<S>(
+    socket: &mut S,
+    config: &SonicConfig,
+    context_id: &str,
+    cancel: &CancellationToken,
+    sink: &mut dyn SpeechFrameSink,
+) -> Result<SonicContextOutcome, BrainError>
+where
+    S: SonicSocket + ?Sized,
+{
+    let _ = config;
+    let mut spoke = false;
     loop {
         // Cooperative: a barge-in does not wait for the provider to speak
         // again before the cancel control is written.
@@ -286,17 +340,21 @@ where
             } if event_context_id == context_id => {
                 let frame = AudioFrame::from_base64(pcm16_base64)
                     .map_err(|_| sonic_protocol_failure("invalid_audio_chunk"))?;
-                frames.push(frame);
+                spoke = true;
+                if !sink.frame(frame).await {
+                    // The consumer stopped listening, so the context is
+                    // cancelled and drained rather than left generating.
+                    return cancel_sonic_context_and_drain(socket, context_id).await;
+                }
             }
             SonicEvent::Done {
                 context_id: event_context_id,
             } if event_context_id == context_id => {
-                if frames.is_empty() {
+                if !spoke {
                     close_quietly(socket).await;
                     return Err(sonic_protocol_failure("no_audio_chunks"));
                 }
                 return Ok(SonicContextOutcome {
-                    frames,
                     connection_open: socket.is_open(),
                 });
             }
@@ -350,7 +408,6 @@ where
     }
     close_quietly(socket).await;
     Ok(SonicContextOutcome {
-        frames: Vec::new(),
         connection_open: false,
     })
 }
@@ -366,6 +423,17 @@ where
         .send_json(sonic_cancel_request(context_id))
         .await
         .map_err(|_| sonic_transport_failure("cancel_failed"))
+}
+
+/// Where decoded speech frames go as the provider produces them.
+///
+/// `ADAPTER-05`: frames leave the adapter one at a time, before the provider
+/// says it is done, so nothing accumulates a whole response's audio.
+#[async_trait]
+pub(crate) trait SpeechFrameSink: Send {
+    /// Deliver one frame. Returning `false` stops the context: the consumer is
+    /// gone, or the turn it belongs to was cancelled.
+    async fn frame(&mut self, frame: AudioFrame) -> bool;
 }
 
 #[async_trait]
@@ -449,22 +517,24 @@ impl SonicSessionVoice {
         Self::new(Arc::new(WebSocketSonicConnector))
     }
 
-    /// Speak one response context on this session's connection.
-    pub(crate) async fn speak(
+    /// Feed more final-pass text into this response's context.
+    ///
+    /// `ADAPTER-05`: each part is written as a `continue: true` input the moment
+    /// the model produces it, so the provider starts generating before the model
+    /// has finished writing.
+    pub(crate) async fn extend(
         &self,
         config: &SonicConfig,
         api_key: &str,
         context_id: &str,
-        transcript: &str,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<AudioFrame>, BrainError> {
-        let request = config.websocket_request(api_key)?;
-        let deadline = Instant::now() + config.stage_timeout;
+        text: &str,
+    ) -> Result<(), BrainError> {
         let mut held = self.socket.lock().await;
         // A connection is held only while the provider still has it open: every
         // exit below drops a connection that reported itself closed, so the
         // next response context can never be written to a dead socket.
         if held.is_none() {
+            let request = config.websocket_request(api_key)?;
             *held = Some(
                 match timeout(config.stage_timeout, self.connector.connect_boxed(request)).await {
                     Ok(socket) => socket?,
@@ -475,10 +545,34 @@ impl SonicSessionVoice {
         let socket = held
             .as_mut()
             .expect("the session connection was just established");
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        match write_sonic_continuations(socket.as_mut(), config, context_id, text).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *held = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// Close this response's input and stream its audio out, frame by frame.
+    pub(crate) async fn finish(
+        &self,
+        config: &SonicConfig,
+        context_id: &str,
+        cancel: &CancellationToken,
+        sink: &mut dyn SpeechFrameSink,
+    ) -> Result<(), BrainError> {
+        let mut held = self.socket.lock().await;
+        let Some(socket) = held.as_mut() else {
+            return Err(sonic_protocol_failure("no_open_context"));
+        };
+        if let Err(error) = write_sonic_finalizer(socket.as_mut(), config, context_id).await {
+            *held = None;
+            return Err(error);
+        }
         match timeout(
-            remaining,
-            synthesize_sonic_context(socket.as_mut(), config, context_id, transcript, cancel),
+            config.stage_timeout,
+            stream_sonic_context(socket.as_mut(), config, context_id, cancel, sink),
         )
         .await
         {
@@ -486,7 +580,7 @@ impl SonicSessionVoice {
                 if !outcome.connection_open {
                     *held = None;
                 }
-                Ok(outcome.frames)
+                Ok(())
             }
             // The context already closed the connection on its terminal paths.
             Ok(Err(error)) => {
@@ -502,6 +596,19 @@ impl SonicSessionVoice {
         }
     }
 
+    /// Cancel one response's context and close the connection it was using.
+    ///
+    /// `ADAPTER-03`: a turn replaced between its last text and its finalizer
+    /// still has an open context on the provider. It is told, drained, and the
+    /// connection is dropped rather than handed to the next turn mid-context.
+    pub(crate) async fn cancel_context(&self, context_id: &str) {
+        let mut held = self.socket.lock().await;
+        if let Some(socket) = held.as_mut() {
+            let _ = cancel_sonic_context_and_drain(socket.as_mut(), context_id).await;
+        }
+        *held = None;
+    }
+
     /// The single close path: session stop, session drop, or fatal error.
     pub(crate) async fn close(&self) {
         let mut held = self.socket.lock().await;
@@ -512,18 +619,12 @@ impl SonicSessionVoice {
     }
 }
 
-fn sonic_generation_requests(
-    config: &SonicConfig,
-    context_id: &str,
-    transcript: &str,
-) -> Vec<Value> {
-    let chunks = sonic_transcript_chunks(transcript);
-    chunks
+/// Every part of one continuation, all of them `continue: true`. Only
+/// [`write_sonic_finalizer`] ever writes `continue: false`.
+fn sonic_continuation_requests(config: &SonicConfig, context_id: &str, text: &str) -> Vec<Value> {
+    sonic_transcript_chunks(text)
         .iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            sonic_generation_request(config, context_id, chunk, index + 1 < chunks.len())
-        })
+        .map(|chunk| sonic_generation_request(config, context_id, chunk, true))
         .collect()
 }
 
@@ -669,6 +770,21 @@ mod tests {
 
     use super::*;
 
+    /// Collects what the provider actually spoke, so a test can assert on the
+    /// frames without the transport ever accumulating them.
+    #[derive(Default)]
+    struct RecordedFrames {
+        heard: Vec<AudioFrame>,
+    }
+
+    #[async_trait]
+    impl SpeechFrameSink for RecordedFrames {
+        async fn frame(&mut self, frame: AudioFrame) -> bool {
+            self.heard.push(frame);
+            true
+        }
+    }
+
     #[test]
     fn builds_streaming_generation_cancel_and_flush_requests() {
         let config = SonicConfig::default();
@@ -748,20 +864,22 @@ mod tests {
         };
         let long_transcript = "Connect the electron transport chain to proton pumping. Then explain why ATP synthase needs the gradient before it can make ATP. Finish with the role of oxygen as the final electron acceptor.";
 
-        let frames = synthesize_sonic_with_connector(
+        let mut heard = RecordedFrames::default();
+        synthesize_sonic_with_connector(
             Arc::new(connector),
             &SonicConfig::default(),
             "sk_car_connector_secret",
             "response-1",
             long_transcript,
             &CancellationToken::new(),
+            &mut heard,
         )
         .await
         .unwrap();
 
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].pcm16_bytes(), [1, 2]);
-        assert_eq!(frames[1].pcm16_bytes(), [3, 4]);
+        assert_eq!(heard.heard.len(), 2);
+        assert_eq!(heard.heard[0].pcm16_bytes(), [1, 2]);
+        assert_eq!(heard.heard[1].pcm16_bytes(), [3, 4]);
         let record = record.lock().expect("record lock poisoned");
         assert!(record
             .request_uri
@@ -801,6 +919,7 @@ mod tests {
             "response-1",
             transcript,
             &CancellationToken::new(),
+            &mut RecordedFrames::default(),
         )
         .await
         .unwrap_err();
@@ -836,12 +955,13 @@ mod tests {
             r#"{"type":"error","context_id":"response-1","message":"provider leaked assistant text"}"#,
         ]);
 
-        let error = synthesize_sonic_context(
+        let error = speak_sonic_on_socket(
             &mut provider_error,
             &SonicConfig::default(),
             "response-1",
             "assistant text must not appear in errors",
             &CancellationToken::new(),
+            &mut RecordedFrames::default(),
         )
         .await
         .unwrap_err();
@@ -857,12 +977,13 @@ mod tests {
         assert!(!rendered.contains("assistant text must not appear"));
 
         let mut send_error = FakeSonicSocket::with_send_error("writer leaked transcript");
-        let error = synthesize_sonic_context(
+        let error = speak_sonic_on_socket(
             &mut send_error,
             &SonicConfig::default(),
             "response-1",
             "another assistant payload",
             &CancellationToken::new(),
+            &mut RecordedFrames::default(),
         )
         .await
         .unwrap_err();
@@ -887,12 +1008,13 @@ mod tests {
             r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#,
         ]);
 
-        let error = synthesize_sonic_context(
+        let error = speak_sonic_on_socket(
             &mut socket,
             &SonicConfig::default(),
             "response-1",
             "partial assistant text",
             &CancellationToken::new(),
+            &mut RecordedFrames::default(),
         )
         .await
         .unwrap_err();
@@ -1038,6 +1160,7 @@ mod tests {
             let config = config.clone();
             let cancel = cancel.clone();
             async move {
+                let mut heard = RecordedFrames::default();
                 synthesize_sonic_with_connector(
                     Arc::clone(&connector),
                     &config,
@@ -1045,8 +1168,10 @@ mod tests {
                     "response-1",
                     "first response text",
                     &cancel,
+                    &mut heard,
                 )
                 .await
+                .map(|()| heard.heard)
             }
         });
 
@@ -1064,18 +1189,20 @@ mod tests {
         );
 
         let replacement = CancellationToken::new();
-        let frames = synthesize_sonic_with_connector(
+        let mut heard = RecordedFrames::default();
+        synthesize_sonic_with_connector(
             Arc::clone(&connector),
             &config,
             "sk_car_barge_secret",
             "response-2",
             "second response text",
             &replacement,
+            &mut heard,
         )
         .await
         .unwrap();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].pcm16_bytes(), [3, 4]);
+        assert_eq!(heard.heard.len(), 1);
+        assert_eq!(heard.heard[0].pcm16_bytes(), [3, 4]);
 
         let record = record.lock().expect("record lock poisoned");
         let written = record
@@ -1243,6 +1370,7 @@ mod tests {
             "response-1",
             transcript,
             &CancellationToken::new(),
+            &mut RecordedFrames::default(),
         )
         .await
         .unwrap_err();
@@ -1271,6 +1399,69 @@ mod tests {
         let rendered = format!("{error} {failure:?}");
         assert!(!rendered.contains("sk_car_cleanup_secret"));
         assert!(!rendered.contains(transcript));
+    }
+
+    /// Task 5 (`ADAPTER-05`) cancellation control: a cancel that lands after the
+    /// first frame stops the audio there, and the Task 3 cleanup still runs.
+    #[tokio::test]
+    async fn cancelling_after_the_first_frame_stops_audio_and_still_cleans_up() {
+        let record = Arc::new(Mutex::new(SocketRecord::default()));
+        let connector = RecordingSonicConnector {
+            record: record.clone(),
+            incoming: VecDeque::from([
+                r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#,
+                r#"{"type":"chunk","context_id":"response-1","data":"AwQ="}"#,
+                r#"{"type":"done","context_id":"response-1"}"#,
+            ]),
+        };
+        let cancel = CancellationToken::new();
+        let mut sink = CancellingAfterFirstFrame {
+            heard: Vec::new(),
+            cancel: cancel.clone(),
+        };
+
+        synthesize_sonic_with_connector(
+            Arc::new(connector),
+            &SonicConfig::default(),
+            "sk_car_cancel_secret",
+            "response-1",
+            "a response the learner interrupts",
+            &cancel,
+            &mut sink,
+        )
+        .await
+        .expect("a cancelled context is not a provider incident");
+
+        assert_eq!(sink.heard.len(), 1, "no frame may follow the cancel");
+        assert_eq!(sink.heard[0].pcm16_bytes(), [1, 2]);
+        let record = record.lock().expect("record lock poisoned");
+        assert!(
+            record
+                .sent_json
+                .iter()
+                .any(|value| value == &json!({ "context_id": "response-1", "cancel": true })),
+            "the Task 3 cleanup still writes the documented cancel: {:?}",
+            record.sent_json
+        );
+        assert!(
+            record.closed,
+            "the connection is closed on terminal cleanup"
+        );
+    }
+
+    /// Cancels the turn the instant its first frame is heard.
+    struct CancellingAfterFirstFrame {
+        heard: Vec<AudioFrame>,
+        cancel: CancellationToken,
+    }
+
+    #[async_trait]
+    impl SpeechFrameSink for CancellingAfterFirstFrame {
+        async fn frame(&mut self, frame: AudioFrame) -> bool {
+            self.heard.push(frame);
+            self.cancel.cancel();
+            true
+        }
     }
 
     /// Connects immediately, then never speaks. Only the stage deadline ends it.
