@@ -2,6 +2,13 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true,
+    // This package's automatic @types inclusion doesn't reach the workspace
+    // root's node_modules/@types (its typeRoots scan stops short of finding
+    // "node" there), so node:fs/node:path imports (used by
+    // src/theme/vellum-asset.test.ts) go unresolved without this. @types/node
+    // is already a real, installed workspace dependency (apps/web) hoisted to
+    // the root node_modules; this just makes it visible here too.
+    "types": ["node"],
     "paths": {
       "@/*": ["./src/*"],
       "@/assets/*": ["./assets/*"],
