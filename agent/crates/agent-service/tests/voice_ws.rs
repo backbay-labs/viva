@@ -9049,6 +9049,29 @@ async fn websocket_brain_open_failure_with_missing_session_close_keeps_provider_
     }));
 }
 
+/// CHARACTERIZATION OF AN OPEN DEFECT — `ADAPTER-06`, owned by Plan 07.
+///
+/// This test pins what the service *does*, not what an operator *should* see. A
+/// durable store read failure at session open is reported to operators as
+/// `tool_executor_failure`, which is the wrong label for a durability incident.
+/// The service is not where that is wrong: it reports the typed reason the brain
+/// handed it, and it must keep doing so — see the misclassification controls
+/// named below. The signal is lost one layer down, in
+/// `agent-adapters/src/cartesia_gemini`, where `select_session_question` maps
+/// *any* executor error to `outcome_contract_failure("select_next_question_failed")`
+/// and discards `PortErrorKind::Durability`. Recovering it there is Plan 07's
+/// `ADAPTER-06` row and is outside this lane's file ownership; this lane routed
+/// it to the coordinator rather than reclassifying at the socket, because a
+/// service-side guess at the failure's real class is exactly the defect
+/// `DOMAIN-009` closes.
+///
+/// When `ADAPTER-06` lands, this test flips back to
+/// `TerminalSessionReason::DurabilityDegraded` and regains its old name.
+/// Controls that must stay green either way:
+/// `websocket_protocol_wrapped_open_store_failure_emits_durability_degraded_terminal_phase`
+/// (a brain that *does* report durability degradation reaches the wire as
+/// `durability_degraded`) and
+/// `websocket_untyped_provider_error_cannot_be_classified_from_its_message`.
 #[tokio::test]
 async fn websocket_brain_open_store_failure_reports_the_brains_typed_terminal_reason() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
