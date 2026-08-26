@@ -1311,12 +1311,18 @@ function isLoopbackAgentUrl(value: string | null): boolean {
 /**
  * Least-privilege service credential selection. A scoped bearer is required; the legacy broad
  * bearer is accepted only behind the explicit migration escape hatch AND a loopback agent URL.
+ *
+ * A scoped credential that is configured but weak fails closed. Only an entirely absent scoped
+ * credential reaches the migration escape hatch, so a misconfigured deployment can never widen
+ * its own authority from least-privilege back to the legacy migration credential by degrading.
  */
 export function vivaAgentScopedCredential(scope: AgentCredentialScope): string | null {
-  const scoped = validatedSecret(AGENT_SCOPE_ENV[scope], {
+  const scoped = validateVivaWebSecret(process.env[AGENT_SCOPE_ENV[scope]], {
     maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES,
   });
-  return scoped ?? legacyAgentRestBearer();
+  if (scoped.ok) return scoped.value;
+  if (scoped.reason !== "missing") return null;
+  return legacyAgentRestBearer();
 }
 
 function legacyAgentRestBearer(): string | null {

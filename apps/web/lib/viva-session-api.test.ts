@@ -1561,6 +1561,37 @@ describe("Viva scoped service credential selection", () => {
     expect(publicBody.error).toBe("viva_session_agent_unavailable");
     expect(calls).toHaveLength(1);
   });
+
+  test("a present but weak scoped credential fails closed instead of degrading to the legacy bearer", async () => {
+    const calls: string[] = [];
+    // Every legacy escape-hatch precondition is satisfied here, so the only thing that can keep
+    // the request from silently borrowing the broad bearer is the scoped credential failing
+    // closed on its own strength gate.
+    process.env.VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+    process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER = "1";
+    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const weakValues = ["short-mint-bearer", "changeme", `viva-${"m".repeat(600)}`];
+    const observed: Array<{ error: string; status: number }> = [];
+    for (const weak of weakValues) {
+      resetVivaSessionMintRateLimitsForTests();
+      process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN = weak;
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as VivaSessionRouteFailureClass;
+      observed.push({ error: body.error, status: response.status });
+    }
+
+    expect(observed).toEqual(
+      weakValues.map(() => ({ error: "viva_session_agent_unavailable", status: 503 })),
+    );
+    expect(calls).toEqual([]);
+  });
 });
 
 function applyCanonicalOriginTestEnv() {
