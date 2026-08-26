@@ -101,6 +101,14 @@ export function VivaAtmosphere({ onReady }: VivaAtmosphereProps) {
       style={StyleSheet.absoluteFill}
     >
       <Image
+        // Android only, and load-bearing: RN defaults <Image> to a 300 ms
+        // fade-in (ImageProps.h, `Float fadeDuration{300.f}`), and onLoad fires
+        // when decoding finishes, not when that transition ends. Left at the
+        // default, signalReady() lifts the splash while the plate is still
+        // fading up from nothing — so the app opens on the bare base colour and
+        // watches the ground materialise, which is the exact flash this whole
+        // readiness gate exists to prevent. iOS and web ignore the prop.
+        fadeDuration={0}
         onError={(event) => {
           // A plate that cannot be decoded must not wedge the splash: the app
           // opens on flat canvas, which is far better than not opening at all.
