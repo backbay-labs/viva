@@ -16,3 +16,6 @@ agent/certs
 agent/target
 .playwright-cli
 /output/
+
+# Superpowers brainstorming companion scratch
+.superpowers/
