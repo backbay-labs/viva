@@ -6004,3 +6004,194 @@ mod transcript_confidence_tests {
         assert_eq!(confidence, None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 8 (`ADAPTER-08`): a forbidden final-pass tool call is attributed to the
+// model that actually ran, not to the configured primary.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod promoted_model_tests {
+    use super::live_failure_tests::live_session_config;
+    use super::tests::learning_ready_seeded_store;
+    use super::*;
+
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct PromotedFinalPassToolCallTransports {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for PromotedFinalPassToolCallTransports {
+        async fn transcribe_audio(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _frame: &AudioFrame,
+            _cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            Ok(RunnerTranscript {
+                interim_text: String::new(),
+                final_text: "omitted".to_owned(),
+                confidence: Some(0.42),
+            })
+        }
+
+        async fn stream_gemini(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _request: Value,
+        ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
+            let mut calls = self.calls.lock().expect("call lock poisoned");
+            *calls += 1;
+            let pass = *calls;
+            drop(calls);
+            if pass == 1 {
+                let args = json!({
+                    "study_set_id": "biology-midterm",
+                    "voice_session_id": "voice-session-1",
+                    "question_id": "q-oxidative-phosphorylation-nadh",
+                    "answer_text": "omitted",
+                });
+                return Ok(fixture_gemini_stream(vec![
+                    GeminiStreamEvent::FallbackActivated {
+                        from_model: "gemini-3.5-pro".to_owned(),
+                        to_model: "gemini-3.5-flash".to_owned(),
+                        reason: "primary_429".to_owned(),
+                        failure: None,
+                    },
+                    GeminiStreamEvent::FunctionCall {
+                        id: "call-eval-1".to_owned(),
+                        name: "evaluate_spoken_answer".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-eval-1",
+                                "name": "evaluate_spoken_answer",
+                                "args": args,
+                            }
+                        }),
+                    },
+                ]));
+            }
+            // The final pass may not call a tool at all.
+            Ok(fixture_gemini_stream(vec![
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-late-1".to_owned(),
+                    name: "retrieve_source_reference".to_owned(),
+                    args: json!({ "source_id": "src-1" }),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-late-1",
+                            "name": "retrieve_source_reference",
+                            "args": { "source_id": "src-1" },
+                        }
+                    }),
+                },
+            ]))
+        }
+
+        async fn extend_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _text: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+
+        async fn finish_speech(
+            &self,
+            _config: &CartesiaGeminiConfig,
+            _response_id: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
+            _sink: &mut dyn SpeechFrameSink,
+        ) -> Result<(), BrainError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_final_pass_tool_call_reports_the_promoted_active_model() {
+        let store = learning_ready_seeded_store();
+        let session_config = live_session_config("voice-session-1");
+        let _ = store.record_voice_session(&session_config).await.unwrap();
+        let session = AuthorizedStudySession::from_config(&session_config).unwrap();
+        let evaluator = synthetic_fixture_answer_evaluator();
+        let executor =
+            VivaToolExecutor::new(store.clone(), session.clone(), Arc::clone(&evaluator));
+        let question = select_session_question(
+            &executor,
+            "biology-midterm",
+            "voice-session-1",
+            "response-1",
+        )
+        .await
+        .unwrap();
+        let transports = PromotedFinalPassToolCallTransports::default();
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig {
+                gemini: GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    model_id: "gemini-3.5-pro".to_owned(),
+                    fallback_model_ids: vec!["gemini-3.5-flash".to_owned()],
+                    ..GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut events = Vec::new();
+        let mut usage = BrainUsage::default();
+        let speech_opened = AtomicBool::new(false);
+
+        let error = runner
+            .run_gemini_tool_loop(GeminiToolLoopJob {
+                answer_text: "omitted",
+                cancelled: None,
+                emit_text_delta: false,
+                events: &mut events,
+                executor: &executor,
+                interrupt: FakeRuntimeInterrupt::None,
+                question: &question,
+                response_id: "response-1",
+                session: &session,
+                speech_opened: &speech_opened,
+                usage: &mut usage,
+            })
+            .await
+            .expect_err("a final-pass tool call is refused");
+
+        assert_eq!(
+            *transports.calls.lock().expect("call lock poisoned"),
+            2,
+            "the refusal happens on the streamed final pass"
+        );
+        let failure = error.failure();
+        assert_eq!(failure.provider(), "gemini");
+        assert_eq!(
+            failure.model(),
+            "gemini-35-flash",
+            "the failure names the promoted model, not the configured primary: {failure:?}"
+        );
+        assert!(
+            failure
+                .metadata()
+                .contains("error_kind=tool_loop_budget_exceeded"),
+            "{failure:?}"
+        );
+        assert!(
+            failure
+                .metadata()
+                .contains("tool=retrieve_source_reference"),
+            "{failure:?}"
+        );
+    }
+}
