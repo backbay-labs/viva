@@ -9,16 +9,21 @@ import {
   HankenGrotesk_600SemiBold,
   HankenGrotesk_700Bold,
 } from "@expo-google-fonts/hanken-grotesk";
+import { Asset } from "expo-asset";
 import { useFonts } from "expo-font";
 import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
-import { useEffect } from "react";
+import * as SystemUI from "expo-system-ui";
+import { useEffect, useState } from "react";
+import { StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
+import { VELLUM_PLATE, VivaAtmosphere } from "@/components/atmosphere";
 import { colors } from "@/theme/tokens";
 
 void SplashScreen.preventAutoHideAsync();
+void SystemUI.setBackgroundColorAsync(colors.canvas);
 
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
@@ -29,33 +34,63 @@ export default function RootLayout() {
     HankenGrotesk_600SemiBold,
     HankenGrotesk_700Bold,
   });
+  const [plateReady, setPlateReady] = useState(false);
+
+  // The splash background is already the vellum's base colour, so holding it
+  // until the plate is decoded makes the handoff seamless. Hiding on fonts
+  // alone flashes flat canvas first, which is the exact impression this work
+  // exists to remove. A failed decode must not wedge the splash.
+  useEffect(() => {
+    let active = true;
+    Asset.fromModule(VELLUM_PLATE)
+      .downloadAsync()
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setPlateReady(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const ready = (fontsLoaded || fontError) && plateReady;
 
   useEffect(() => {
-    if (fontsLoaded || fontError) {
+    if (ready) {
       void SplashScreen.hideAsync();
     }
-  }, [fontError, fontsLoaded]);
+  }, [ready]);
 
-  if (!fontsLoaded && !fontError) {
+  if (!ready) {
     return null;
   }
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <StatusBar style="dark" />
-      <Stack
-        screenOptions={{
-          animation: "fade_from_bottom",
-          contentStyle: { backgroundColor: colors.canvas },
-          gestureEnabled: true,
-          headerShown: false,
-        }}
-      >
-        <Stack.Screen name="index" />
-        <Stack.Screen name="session" options={{ gestureEnabled: false }} />
-        <Stack.Screen name="recap" />
-        <Stack.Screen name="library" />
-      </Stack>
+    <GestureHandlerRootView style={styles.root}>
+      <View style={styles.root}>
+        <VivaAtmosphere />
+        <StatusBar style="dark" />
+        <Stack
+          screenOptions={{
+            animation: "fade_from_bottom",
+            contentStyle: { backgroundColor: "transparent" },
+            gestureEnabled: true,
+            headerShown: false,
+          }}
+        >
+          <Stack.Screen name="index" />
+          <Stack.Screen name="session" options={{ gestureEnabled: false }} />
+          <Stack.Screen name="recap" />
+          <Stack.Screen name="library" />
+        </Stack>
+      </View>
     </GestureHandlerRootView>
   );
 }
+
+const styles = StyleSheet.create({
+  root: {
+    backgroundColor: colors.canvas,
+    flex: 1,
+  },
+});

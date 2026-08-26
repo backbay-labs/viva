@@ -424,7 +424,8 @@ const styles = StyleSheet.create({
     opacity: 0.62,
   },
   safeArea: {
-    backgroundColor: colors.canvas,
+    // The atmosphere is mounted once at the root and shows through every screen.
+    backgroundColor: "transparent",
     flex: 1,
   },
   scheduledNote: {
