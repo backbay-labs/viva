@@ -9832,4 +9832,231 @@ mod tests {
             HEARTBEAT_TIMEOUT_TERMINAL_LABEL
         ));
     }
+
+    /// `SERVICE-017`: the state machine Tasks 8-11 fixed, frozen before the
+    /// responsibility split. These assert transitions, not files: an extraction
+    /// that changed an order, a count, or an identity would fail them wherever
+    /// the code ended up living.
+    mod ws_state_transition_characterization {
+        use super::*;
+
+        fn refresh_config(user_id: &str, study_set_id: &str, session_id: &str) -> SessionConfig {
+            SessionConfig {
+                session_id: Some(agent_domain::SessionId::new(session_id.to_owned())),
+                user_id: Some(user_id.to_owned()),
+                study_set_id: Some(study_set_id.to_owned()),
+                mode: None,
+                source_context: vec![agent_domain::SourceContext {
+                    source_id: "src-lecture-5-slide-18".to_owned(),
+                    document_id: "lec-5".to_owned(),
+                    span: "slide 18".to_owned(),
+                    excerpt: "client-supplied context is dropped".to_owned(),
+                    confidence: agent_domain::SourceConfidence::High,
+                    retrieval_reason: "client-supplied".to_owned(),
+                }],
+                active_concepts: vec!["client-supplied-concept".to_owned()],
+                client_generation_id: Some("generation-1".to_owned()),
+            }
+        }
+
+        /// An admitted turn is registered before a `QuestionStarted` can bind it.
+        /// A binding attempt with nothing admitted fails closed and mints nothing.
+        #[test]
+        fn ws_state_transition_characterization_registers_an_admitted_turn_before_binding() {
+            let mut bindings = TurnBindingTracker::default();
+            assert_eq!(
+                bindings.bind_question("response-1"),
+                Err(TurnBindingError::MissingTurn),
+                "a question cannot bind before its turn is admitted"
+            );
+
+            register_submitted_turn(&mut bindings, Some("turn-a"));
+            assert_eq!(bindings.bind_question("response-1"), Ok("turn-a"));
+            assert_eq!(bindings.turn_for_response("response-1"), Ok("turn-a"));
+
+            // A second question with nothing further admitted still fails closed.
+            assert_eq!(
+                bindings.bind_question("response-2"),
+                Err(TurnBindingError::MissingTurn)
+            );
+        }
+
+        /// One resolution releases one binding, and the turn id is then spent:
+        /// never re-bound, never re-registered, never recycled.
+        #[test]
+        fn ws_state_transition_characterization_spends_a_response_binding_exactly_once() {
+            let mut bindings = TurnBindingTracker::default();
+            register_submitted_turn(&mut bindings, Some("turn-a"));
+            assert_eq!(bindings.bind_question("response-1"), Ok("turn-a"));
+
+            bindings.release_response("response-1");
+            assert_eq!(
+                bindings.turn_for_response("response-1"),
+                Err(TurnBindingError::MissingResponse)
+            );
+            // A repeated resolution changes nothing.
+            bindings.release_response("response-1");
+            assert_eq!(
+                bindings.turn_for_response("response-1"),
+                Err(TurnBindingError::MissingResponse)
+            );
+            assert_eq!(
+                bindings.register_submission("turn-a".to_owned()),
+                Err(TurnBindingError::DuplicateTurn),
+                "a spent turn id is never recycled"
+            );
+            register_submitted_turn(&mut bindings, Some("turn-a"));
+            assert_eq!(
+                bindings.bind_question("response-2"),
+                Err(TurnBindingError::MissingTurn),
+                "the refused re-registration admitted nothing"
+            );
+        }
+
+        /// An in-socket context refresh restates identity; it cannot change it.
+        /// The bound generation, credential, user, study set, and the server-side
+        /// session id all survive a refresh that asks for something else.
+        #[test]
+        fn ws_state_transition_characterization_context_refresh_rebinds_no_identity() {
+            let binding = AuthorizedClientSession {
+                user_id: "user-1".to_owned(),
+                study_set_id: "biology-midterm".to_owned(),
+                session_id: "server-session-rotated".to_owned(),
+                client_session_id: "voice-session-1".to_owned(),
+                client_generation_id: "generation-1".to_owned(),
+                bound_session_token: "bound-token".to_owned(),
+                auth_mode: SessionAuthMode::Signed,
+            };
+            // A refresh that asserts someone else's identity is refused outright.
+            assert_eq!(
+                sanitize_refresh_session_config(
+                    refresh_config("attacker", "biology-midterm", "voice-session-1"),
+                    "generation-1",
+                    "bound-token",
+                    &binding,
+                ),
+                Err(ClientFrameError::invalid_session_identity())
+            );
+            assert_eq!(
+                sanitize_refresh_session_config(
+                    refresh_config("user-1", "someone-elses-set", "voice-session-1"),
+                    "generation-1",
+                    "bound-token",
+                    &binding,
+                ),
+                Err(ClientFrameError::invalid_session_identity())
+            );
+            assert_eq!(
+                sanitize_refresh_session_config(
+                    refresh_config("user-1", "biology-midterm", "server-session-rotated"),
+                    "generation-1",
+                    "bound-token",
+                    &binding,
+                ),
+                Err(ClientFrameError::invalid_session_identity()),
+                "the browser may only name the client session id, never the server's"
+            );
+
+            // One that restates the bound identity is accepted, and the
+            // provider-facing session id stays the server's own rotated value.
+            let refreshed = sanitize_refresh_session_config(
+                refresh_config("user-1", "biology-midterm", "voice-session-1"),
+                "generation-1",
+                "bound-token",
+                &binding,
+            )
+            .expect("a refresh that restates the bound identity is accepted");
+            assert_eq!(refreshed.user_id.as_deref(), Some("user-1"));
+            assert_eq!(refreshed.study_set_id.as_deref(), Some("biology-midterm"));
+            assert_eq!(
+                refreshed.session_id.as_deref(),
+                Some("server-session-rotated")
+            );
+            assert!(refreshed.source_context.is_empty());
+            assert!(refreshed.active_concepts.is_empty());
+            assert_eq!(refreshed.client_generation_id, None);
+
+            assert_eq!(
+                sanitize_refresh_session_config(
+                    refresh_config("user-1", "biology-midterm", "voice-session-1"),
+                    "generation-2",
+                    "bound-token",
+                    &binding,
+                ),
+                Err(ClientFrameError::generation_mismatch())
+            );
+            assert_eq!(
+                sanitize_refresh_session_config(
+                    refresh_config("user-1", "biology-midterm", "voice-session-1"),
+                    "generation-1",
+                    "some-other-token",
+                    &binding,
+                ),
+                Err(ClientFrameError::session_auth_failed(
+                    SessionAuthFailureCode::IdentityMismatch
+                ))
+            );
+
+            // And the refresh itself is a recoverable denial, so it reaches no
+            // deadline, no lease, and no provider input.
+            assert!(matches!(
+                bind_context_refresh("generation-1", &binding, SESSION_REFRESH_POLICY),
+                Ok(ClientInputAction::RecoverableDenial(_))
+            ));
+            assert!(matches!(
+                bind_context_refresh("generation-2", &binding, SESSION_REFRESH_POLICY),
+                Err(error) if error == ClientFrameError::generation_mismatch()
+            ));
+        }
+
+        /// A resolution moves the pending-answer and active-turn counters exactly
+        /// once, however many times the same response resolves.
+        #[test]
+        fn ws_state_transition_characterization_provider_counts_transition_once() {
+            let mut accounting = ProviderTurnAccounting::with_one_open_turn();
+            let resolved = BrainEvent::AnswerEvaluated {
+                response_id: "response-1".to_owned(),
+                evaluation: classifier_fixture_evaluation(),
+            };
+
+            accounting.apply(&resolved);
+            assert_eq!(accounting.pending_submitted_answers, 0);
+            assert_eq!(accounting.active_provider_turns, 0);
+            assert_eq!(accounting.turn_cap_deadline, None);
+
+            accounting.apply(&resolved);
+            assert_eq!(
+                accounting.pending_submitted_answers, 0,
+                "a repeated resolution must not move the counter twice"
+            );
+            assert_eq!(accounting.active_provider_turns, 0);
+        }
+
+        /// The between-turn deadline is re-armed only at zero outstanding turn
+        /// work. Any pending answer or active provider turn leaves it alone.
+        #[tokio::test(start_paused = true)]
+        async fn ws_state_transition_characterization_between_turn_idle_rearms_only_at_zero() {
+            let start = Instant::now();
+            let sleeper = tokio::time::sleep_until(start + Duration::from_secs(1));
+            tokio::pin!(sleeper);
+            let timeout = Duration::from_secs(600);
+
+            for (pending, active) in [(1_u32, 0_u32), (0, 1), (1, 1)] {
+                assert!(
+                    !rearm_between_turn_idle(pending, active, sleeper.as_mut(), start, timeout),
+                    "outstanding turn work ({pending}, {active}) must not re-arm"
+                );
+                assert_eq!(sleeper.deadline(), start + Duration::from_secs(1));
+            }
+
+            assert!(rearm_between_turn_idle(
+                0,
+                0,
+                sleeper.as_mut(),
+                start,
+                timeout
+            ));
+            assert_eq!(sleeper.deadline(), start + timeout);
+        }
+    }
 }

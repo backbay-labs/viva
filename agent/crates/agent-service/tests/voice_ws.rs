@@ -5524,11 +5524,87 @@ async fn websocket_records_auth_failure_for_forged_config_refresh() {
 /// typed first-frame parser and one published ready shape. These are source-level
 /// absence characterizations, so an accidental re-introduction of a private shadow
 /// type fails here instead of drifting silently.
-const WS_SOURCE: &str = include_str!("../src/ws.rs");
 const PROTOCOL_SOURCE: &str = include_str!("../src/protocol.rs");
 const LIB_SOURCE: &str = include_str!("../src/lib.rs");
-const APP_SOURCE: &str = include_str!("../src/app.rs");
 const MAIN_SOURCE: &str = include_str!("../src/main.rs");
+
+/// `SERVICE-017`: a module's whole source, root file plus the `src/<name>/*.rs`
+/// responsibility modules it declares, concatenated in a stable order.
+///
+/// Read at run time rather than `include_str!`d so that a structural
+/// characterization is about the RESPONSIBILITY, not about which file currently
+/// holds it — the same assertion has to mean the same thing before and after the
+/// decomposition, without its body being edited.
+fn module_source(name: &str) -> String {
+    module_source_with(name, false)
+}
+
+/// The same concatenation with each file truncated at its own first
+/// `#[cfg(test)]`, so "no production site does X" stays exactly that claim once a
+/// module has been split into several files that each carry their own tests.
+fn production_module_source(name: &str) -> String {
+    module_source_with(name, true)
+}
+
+fn module_source_with(name: &str, production_only: bool) -> String {
+    // A module is either `src/<name>.rs` or `src/<name>/mod.rs`, and may in
+    // addition declare `src/<name>/*.rs` responsibility modules.
+    let root = std::path::PathBuf::from(format!("src/{name}.rs"));
+    let mut paths = if root.exists() {
+        vec![root]
+    } else {
+        Vec::new()
+    };
+    if let Ok(entries) = std::fs::read_dir(format!("src/{name}")) {
+        let mut children = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .collect::<Vec<_>>();
+        children.sort();
+        paths.extend(children);
+    }
+    assert!(
+        !paths.is_empty(),
+        "src/{name}.rs or src/{name}/ must exist, read from the crate root"
+    );
+    let mut source = String::new();
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "{} is readable from the crate root: {error}",
+                path.display()
+            )
+        });
+        let text = if production_only {
+            text.split("#[cfg(test)]").next().unwrap_or("").to_owned()
+        } else {
+            text
+        };
+        source.push_str(&text);
+        source.push('\n');
+    }
+    source
+}
+
+fn ws_source() -> String {
+    module_source("ws")
+}
+
+fn app_source() -> String {
+    module_source("app")
+}
+
+/// `app.rs` composes the router from the `src/http` responsibility modules once
+/// they exist, so an HTTP structural characterization spans both.
+fn http_surface_source() -> String {
+    let mut source = app_source();
+    if std::path::Path::new("src/http").exists() {
+        source.push('\n');
+        source.push_str(&module_source("http"));
+    }
+    source
+}
 
 #[test]
 fn protocol_v5_fixture_shadow_types_are_absent() {
@@ -5545,18 +5621,18 @@ fn protocol_v5_fixture_shadow_types_are_absent() {
     // `SERVICE-007`: the private parallel first-frame struct is deleted; the initial
     // frame is Plan 05's public `ClientFrame::SessionConfig`.
     assert!(
-        !WS_SOURCE.contains("InitialClientFrame"),
+        !ws_source().contains("InitialClientFrame"),
         "ws.rs still declares a private first-frame shadow of ClientFrame::SessionConfig"
     );
 
     // `SERVICE-008` overlap: no service-local wire error JSON survives; the only
     // fallback is Plan 05's published constant.
     assert!(
-        WS_SOURCE.contains("VOICE_SERIALIZATION_FALLBACK_FRAME"),
+        ws_source().contains("VOICE_SERIALIZATION_FALLBACK_FRAME"),
         "ws.rs must serialize through Plan 05's published fallback constant"
     );
     assert!(
-        !WS_SOURCE.contains("VOICE_INTERNAL_SERIALIZATION"),
+        !ws_source().contains("VOICE_INTERNAL_SERIALIZATION"),
         "ws.rs must not restate the fallback frame body"
     );
 }
@@ -5575,19 +5651,20 @@ fn protocol_v5_fixture_shadow_types_are_absent() {
 #[test]
 fn outbound_writes_have_exactly_one_deadline_owner() {
     assert_eq!(
-        WS_SOURCE.matches("ws_timeouts.outbound_write").count(),
+        ws_source().matches("ws_timeouts.outbound_write").count(),
         1,
         "the outbound write deadline must be read exactly once, where BoundedSender is built"
     );
     assert_eq!(
-        WS_SOURCE.matches("struct BoundedSender").count(),
+        ws_source().matches("struct BoundedSender").count(),
         1,
         "there is exactly one bounded sender type"
     );
     // The deadline is applied by `BoundedSender::send` alone. The only other
     // `tokio::time::timeout` calls in the module are read-side or drain-side
     // waits, never a write.
-    let bounded_send = WS_SOURCE
+    let ws_source = ws_source();
+    let bounded_send = ws_source
         .split_once("impl<S> BoundedSender<S>")
         .expect("BoundedSender impl block")
         .1;
@@ -17991,7 +18068,8 @@ async fn websocket_scoped_cancel_after_audio_end_does_not_close_the_session() {
 /// instructions wide, so it is characterized here rather than raced for.
 #[test]
 fn server_owned_capacity_drain_registers_its_waiter_before_each_zero_check() {
-    let body = APP_SOURCE
+    let app_source = app_source();
+    let body = app_source
         .split_once("pub async fn begin_drain_and_wait")
         .expect("begin_drain_and_wait is the one drain entry point")
         .1
@@ -18069,9 +18147,11 @@ fn server_owned_capacity_shutdown_waits_on_the_configured_drain_grace() {
 /// The counter is still waited on, so a future worker cannot be drained past.
 #[test]
 fn server_owned_capacity_has_no_background_worker_under_confirm_delete() {
-    for source in [WS_SOURCE, APP_SOURCE, MAIN_SOURCE] {
-        // Everything before the crate's first `#[cfg(test)]` is what ships.
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    for production in [
+        production_module_source("ws"),
+        production_module_source("app"),
+        MAIN_SOURCE.to_owned(),
+    ] {
         assert_eq!(
             production.matches("enter_background_worker()").count(),
             0,
@@ -18079,11 +18159,11 @@ fn server_owned_capacity_has_no_background_worker_under_confirm_delete() {
         );
     }
     assert!(
-        APP_SOURCE.contains("pub fn enter_background_worker"),
+        app_source().contains("pub fn enter_background_worker"),
         "the guard the drain waits on still exists"
     );
     assert!(
-        !LIB_SOURCE.contains("restore") && !WS_SOURCE.contains("deletion_finalizer"),
+        !LIB_SOURCE.contains("restore") && !ws_source().contains("deletion_finalizer"),
         "CONFIRM_DELETE leaves no restore or finalizer surface"
     );
 }
@@ -18494,4 +18574,311 @@ async fn websocket_drain_releases_every_lease_and_reports_drained() {
     drop(holder);
     drop(queued);
     drop(silent);
+}
+
+/// `SERVICE-017`: the router surface, frozen before the responsibility split.
+///
+/// Every registered route is exercised with its correct method and a minimally
+/// valid body, and each response is asserted to be neither `404` nor `405`. The
+/// matched-route pattern is recorded by a `route_layer`, so a handler that never
+/// ran, ran under a different pattern, or ran twice is visible directly rather
+/// than inferred from a status code.
+fn router_surface_app() -> (axum::Router, Arc<Mutex<Vec<String>>>) {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some("rest-secret".into()),
+            session_token_secret: Some("session-secret".into()),
+            allowed_origins: vec![],
+        },
+        4,
+        inner,
+    )
+    .with_operator_access(OperatorAccess::new(Some(RedactedSecret::from(
+        FIXTURE_OPERATOR_CREDENTIAL,
+    ))));
+    let matched = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorder = matched.clone();
+    let router = build_router(state).route_layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            let recorder = recorder.clone();
+            async move {
+                if let Some(matched_path) = request.extensions().get::<axum::extract::MatchedPath>()
+                {
+                    recorder
+                        .lock()
+                        .expect("matched path log poisoned")
+                        .push(matched_path.as_str().to_owned());
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    (router, matched)
+}
+
+fn router_surface_request(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("origin", "http://localhost:3000")
+        .header("authorization", "Bearer rest-secret")
+        .header("content-type", "application/json");
+    builder
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+        .expect("router surface request builds")
+}
+
+const ROUTER_SURFACE_PASTE_BODY: &str = r#"{"title":"Cell Division","course":"Biology 201","exam_date":"2031-06-01T09:30:00.000Z","pasted_text":"mitosis chromosome spindle metaphase cytokinesis"}"#;
+const ROUTER_SURFACE_FILE_BODY: &str = r#"{"title":"Lecture 9","course":"Biology 201","exam_date":"2031-06-01T09:30:00.000Z","file_name":"lecture-9.txt","content_base64":"bWl0b3NpcyBjaHJvbW9zb21lIHNwaW5kbGUgbWV0YXBoYXNlIGN5dG9raW5lc2lz"}"#;
+const ROUTER_SURFACE_RETRY_BODY: &str = r#"{"file_name":"lecture-9.txt","content_base64":"bWl0b3NpcyBjaHJvbW9zb21lIHNwaW5kbGUgbWV0YXBoYXNlIGN5dG9raW5lc2lz"}"#;
+
+#[tokio::test]
+async fn router_surface_registration_matches_every_route_exactly_once() {
+    let rows: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("GET", "/", None, "/"),
+        ("GET", "/health", None, "/health"),
+        ("GET", "/live", None, "/live"),
+        ("GET", "/ready", None, "/ready"),
+        ("GET", "/health/brain", None, "/health/brain"),
+        (
+            "POST",
+            "/study-sets/paste",
+            Some(ROUTER_SURFACE_PASTE_BODY),
+            "/study-sets/paste",
+        ),
+        (
+            "POST",
+            "/study-sets/files",
+            Some(ROUTER_SURFACE_FILE_BODY),
+            "/study-sets/files",
+        ),
+        (
+            "POST",
+            "/study-sets/biology-midterm/files/retry",
+            Some(ROUTER_SURFACE_RETRY_BODY),
+            "/study-sets/{study_set_id}/files/retry",
+        ),
+        ("GET", "/study-sets/export", None, "/study-sets/export"),
+        ("GET", "/study-sets/library", None, "/study-sets/library"),
+        (
+            "GET",
+            "/v1/study-sets/biology-midterm/projection?voice_session_id=voice-session-1",
+            None,
+            "/v1/study-sets/{study_set_id}/projection",
+        ),
+        (
+            "DELETE",
+            "/study-sets/biology-midterm",
+            None,
+            "/study-sets/{study_set_id}",
+        ),
+        (
+            "DELETE",
+            "/study-sets/biology-midterm/sessions/voice-session-1",
+            None,
+            "/study-sets/{study_set_id}/sessions/{voice_session_id}",
+        ),
+        ("GET", "/ws", None, "/ws"),
+    ];
+
+    for (method, uri, body, expected_pattern) in rows {
+        let (app, matched) = router_surface_app();
+        let response = app
+            .oneshot(router_surface_request(method, uri, body))
+            .await
+            .expect("router surface request completes");
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} is not registered"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri} is registered under a different method"
+        );
+        let matched = matched.lock().expect("matched path log poisoned").clone();
+        assert_eq!(
+            matched,
+            vec![expected_pattern.to_owned()],
+            "{method} {uri} must run exactly one handler, under its own pattern"
+        );
+    }
+}
+
+#[tokio::test]
+async fn router_surface_registration_rejects_unknown_paths_and_wrong_methods() {
+    let (app, matched) = router_surface_app();
+    let response = app
+        .oneshot(router_surface_request(
+            "GET",
+            "/not-a-registered-route",
+            None,
+        ))
+        .await
+        .expect("unknown path completes");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        matched
+            .lock()
+            .expect("matched path log poisoned")
+            .is_empty(),
+        "an unknown path must reach no handler"
+    );
+
+    // `D-04 CONFIRM_DELETE`: there is no restore route to match.
+    let (app, matched) = router_surface_app();
+    let response = app
+        .oneshot(router_surface_request(
+            "POST",
+            "/v1/study-sets/biology-midterm/restore",
+            None,
+        ))
+        .await
+        .expect("restore path completes");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(matched
+        .lock()
+        .expect("matched path log poisoned")
+        .is_empty());
+
+    for (method, uri) in [("DELETE", "/live"), ("POST", "/ready"), ("DELETE", "/ws")] {
+        let (app, _matched) = router_surface_app();
+        let response = app
+            .oneshot(router_surface_request(method, uri, None))
+            .await
+            .expect("wrong-method request completes");
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri} must be refused as a wrong method, not routed"
+        );
+    }
+}
+
+/// A merge that registered a group twice would panic inside `Router::merge`, and
+/// a path registered in two groups would too. Building the router is therefore
+/// itself the duplicate-merge control; this pins that it is exercised.
+#[test]
+fn router_surface_registration_builds_without_a_duplicate_registration() {
+    let (_app, _matched) = router_surface_app();
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(inner.clone())),
+        "synthetic",
+        VoiceWsAccess::default(),
+        1,
+        inner,
+    );
+    let _router = build_router(state);
+}
+
+/// `SERVICE-017`: the two state-machine properties that are about ORDER and
+/// OWNERSHIP rather than about a value, frozen across the responsibility split.
+/// Both read the whole `src/ws` surface, so the same claim means the same thing
+/// before and after the move without the assertion being edited.
+#[test]
+fn ws_state_transition_characterization_releases_a_binding_only_after_forwarding() {
+    let source = ws_source();
+    assert_eq!(
+        source.matches("turn_bindings.release_response(").count(),
+        1,
+        "a response binding is released in exactly one place"
+    );
+    let accounting = source
+        .split_once("async fn forward_brain_event_with_turn_accounting")
+        .expect("the one accounting forwarder")
+        .1;
+    let forward = accounting
+        .find("let result = forward_brain_event(")
+        .expect("the event is forwarded first");
+    let guard = accounting
+        .find("if matches!(result, ForwardBrainEvent::Continue) {")
+        .expect("accounting is guarded by a successful forward");
+    let apply = accounting
+        .find("apply_provider_turn_accounting(resolution, runtime);")
+        .expect("the single classification is applied once");
+    let release = accounting
+        .find("turn_bindings.release_response(response_id);")
+        .expect("the binding is released inside that guard");
+    assert!(
+        forward < guard && guard < apply && apply < release,
+        "the resolution must reach the wire before its binding is spent"
+    );
+    assert_eq!(
+        source
+            .matches("let resolution = classify_provider_turn_event(&event);")
+            .count(),
+        1,
+        "one classifier, one call site: both counters consume the same value"
+    );
+}
+
+#[test]
+fn ws_state_transition_characterization_terminal_paths_drop_every_owned_guard() {
+    let source = ws_source();
+    let admission = source
+        .split_once("struct VoiceAdmission {")
+        .expect("the admission carrier")
+        .1
+        .split_once("\n}\n")
+        .expect("the admission carrier closes")
+        .0;
+    for owned in ["_permit:", "_ip_lease:", "_handler_guard:"] {
+        assert!(
+            admission.contains(owned),
+            "the admission carries {owned} so every exit releases it"
+        );
+    }
+    // Taken by value, so there is no exit — slow client, heartbeat expiry, drain,
+    // policy close, or panic-free early return — that can leave one held.
+    assert!(
+        source.contains("admission: VoiceAdmission,"),
+        "the session takes ownership of the admission"
+    );
+    for leak in [
+        "std::mem::forget",
+        "ManuallyDrop",
+        "Box::leak",
+        ".into_raw(",
+    ] {
+        assert!(
+            !source.contains(leak),
+            "nothing in the websocket runtime may defeat a guard's Drop ({leak})"
+        );
+    }
+}
+
+/// Every registered route path is declared exactly once across the HTTP surface,
+/// so a group cannot be merged twice or a path registered in two groups.
+#[test]
+fn router_surface_registration_declares_every_path_once() {
+    let source = http_surface_source();
+    for path in [
+        "\"/\"",
+        "\"/health\"",
+        "\"/live\"",
+        "\"/ready\"",
+        "\"/health/brain\"",
+        "\"/study-sets/paste\"",
+        "\"/study-sets/files\"",
+        "\"/study-sets/{study_set_id}/files/retry\"",
+        "\"/study-sets/export\"",
+        "\"/study-sets/library\"",
+        "\"/v1/study-sets/{study_set_id}/projection\"",
+        "\"/study-sets/{study_set_id}\"",
+        "\"/study-sets/{study_set_id}/sessions/{voice_session_id}\"",
+        "\"/ws\"",
+    ] {
+        assert_eq!(
+            source.matches(path).count(),
+            1,
+            "{path} must be registered exactly once across the HTTP surface"
+        );
+    }
+    // `D-04 CONFIRM_DELETE`: no restore path is registered anywhere.
+    assert!(!source.contains("/restore"));
 }
