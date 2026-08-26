@@ -23,7 +23,7 @@ use agent_domain::{
     tool_executor::VIVA_STUDY_MODE,
     AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent,
     BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError, BrainProviderFailure,
-    BrainProviderFailureParts, BrainUsage, ConceptStatus, EvaluationLabel, PersistedTurnOutcome,
+    BrainProviderFailureParts, BrainUsage, EvaluationLabel, PersistedTurnOutcome,
     QuestionProgressionResult, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
     RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore, StudyQuestion, StudySessionPhase,
     StudySessionRecap, StudySessionState, StudySourceReference, ToolProposal, TurnOutcome,
@@ -231,12 +231,19 @@ pub(crate) fn evaluation_label_wire(label: EvaluationLabel) -> &'static str {
 /// Every graded field is copied from the outcome. `answer_text` is the
 /// transcript this turn actually carried — a transport fact, never a grade — and
 /// the source is the one the executor re-retrieved for a rubric-authorized id.
+///
+/// The learner-visible mastery value is the one the executor persisted for this
+/// turn's own concept, or failing that the first concept the outcome names. An
+/// evaluated outcome that names no concept at all has no honest status to show,
+/// so it is a typed contract failure rather than an adapter-chosen default —
+/// this is the last place an adapter could have picked a mastery value, and it
+/// does not.
 pub(crate) fn answer_evaluation_from_outcome(
     outcome: &TurnOutcome,
     answer_text: &str,
     source: &StudySourceReference,
     question: &StudyQuestion,
-) -> Option<AnswerEvaluation> {
+) -> Result<Option<AnswerEvaluation>, BrainError> {
     let TurnResolution::Evaluated {
         label,
         confidence,
@@ -246,16 +253,16 @@ pub(crate) fn answer_evaluation_from_outcome(
         ..
     } = &outcome.resolution
     else {
-        return None;
+        return Ok(None);
     };
     let concept_status = concept_transitions
         .iter()
         .find(|transition| transition.concept_id == question.concept_id)
         .or_else(|| concept_transitions.first())
-        .map_or(ConceptStatus::Review, |transition| {
-            transition.to_status.clone()
-        });
-    Some(AnswerEvaluation {
+        .ok_or_else(|| outcome_contract_failure("turn_outcome_without_concept_transition"))?
+        .to_status
+        .clone();
+    Ok(Some(AnswerEvaluation {
         question_id: outcome.question_id.clone(),
         answer_text: answer_text.to_owned(),
         label: evaluation_label_wire(*label).to_owned(),
@@ -264,7 +271,7 @@ pub(crate) fn answer_evaluation_from_outcome(
         source: source.clone(),
         concept_status,
         confidence_score: *confidence,
-    })
+    }))
 }
 
 /// The complete set of learner-visible events one persisted outcome authorizes.
@@ -1135,5 +1142,79 @@ mod tests {
         assert!(SessionPhaseTracker::ready()
             .phase_event_if_legal(StudySessionPhase::Recap)
             .is_none());
+    }
+
+    /// The projection copies a persisted mastery value; it never picks one.
+    #[test]
+    fn evaluation_projection_copies_a_persisted_status_and_never_defaults_one() {
+        let mut outcome = crate::synthetic::learning_core_turn_outcome("evaluated_mostly_correct")
+            .expect("the immutable corpus publishes the case");
+        let source = agent_domain::fixture_source_reference();
+        let TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &outcome.resolution
+        else {
+            panic!("the corpus case is evaluated");
+        };
+        let transitions = concept_transitions.clone();
+        assert!(
+            transitions.len() > 1,
+            "the case must name more than one concept for the preference to be observable"
+        );
+
+        // This turn's own concept wins, whichever position it holds.
+        for expected in &transitions {
+            let mut question = agent_domain::fixture_question();
+            question.concept_id = expected.concept_id.clone();
+            let evaluation =
+                answer_evaluation_from_outcome(&outcome, "the answer", &source, &question)
+                    .expect("a transition-bearing outcome projects")
+                    .expect("an evaluated outcome carries an evaluation");
+            assert_eq!(evaluation.concept_status, expected.to_status);
+            assert_eq!(evaluation.answer_text, "the answer");
+        }
+
+        // A concept the outcome never mentions falls back to the outcome's own
+        // first transition, still a persisted value.
+        let mut unrelated = agent_domain::fixture_question();
+        unrelated.concept_id = "concept-the-outcome-never-names".to_owned();
+        assert_eq!(
+            answer_evaluation_from_outcome(&outcome, "the answer", &source, &unrelated)
+                .expect("a transition-bearing outcome projects")
+                .expect("an evaluated outcome carries an evaluation")
+                .concept_status,
+            transitions[0].to_status
+        );
+
+        // With no transition at all there is nothing honest to show.
+        if let TurnResolution::Evaluated {
+            concept_transitions,
+            ..
+        } = &mut outcome.resolution
+        {
+            concept_transitions.clear();
+        }
+        let error = answer_evaluation_from_outcome(&outcome, "the answer", &source, &unrelated)
+            .expect_err("a transition-less evaluated outcome has no status to show");
+        assert_eq!(
+            error.failure().failure_class(),
+            BrainFailureClass::ToolExecutorFailure
+        );
+        assert_eq!(error.failure().stage(), BrainFailureStage::Tools);
+        assert_eq!(
+            error.failure().metadata(),
+            "error_kind=turn_outcome_without_concept_transition"
+        );
+
+        // A deferral carries no evaluation and is not a failure.
+        let deferred =
+            crate::synthetic::learning_core_turn_outcome("deferred_insufficient_semantic_evidence")
+                .expect("the immutable corpus publishes the case");
+        assert!(
+            answer_evaluation_from_outcome(&deferred, "the answer", &source, &unrelated)
+                .expect("a deferral projects")
+                .is_none()
+        );
     }
 }

@@ -425,7 +425,7 @@ where
             .retrieve_outcome_source(&executor, &session, &question, &outcome, &response_id)
             .await?;
         let evaluation =
-            answer_evaluation_from_outcome(&outcome, &transcript.final_text, &source, &question);
+            answer_evaluation_from_outcome(&outcome, &transcript.final_text, &source, &question)?;
         events.extend(learning_event_projection(
             &outcome,
             &response_id,
@@ -663,7 +663,7 @@ where
                 &job.response_id,
             )
             .await?;
-        let evaluation = answer_evaluation_from_outcome(&outcome, answer_text, &source, question);
+        let evaluation = answer_evaluation_from_outcome(&outcome, answer_text, &source, question)?;
         for event in learning_event_projection(&outcome, &job.response_id, &source, evaluation) {
             if !send_fake_unless_cancelled(&job.event_tx, event, &job.cancelled).await {
                 return Ok(());

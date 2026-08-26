@@ -3115,3 +3115,57 @@ async fn live_session_with_no_active_concepts_substitutes_no_fixture_concept() {
         );
     }
 }
+
+/// The last adapter-chosen mastery value: an evaluated outcome that names no
+/// concept transition has no honest status to show a learner, so the turn is a
+/// typed contract failure rather than a silent default.
+#[tokio::test]
+async fn evaluated_outcome_without_a_concept_transition_fails_closed_without_a_default_status() {
+    let mut outcome = learning_core_turn_outcome("evaluated_optional_contradiction_is_shaky");
+    if let agent_domain::TurnResolution::Evaluated {
+        concept_transitions,
+        ..
+    } = &mut outcome.resolution
+    {
+        concept_transitions.clear();
+    }
+    let store = Arc::new(FixtureOutcomeStore::new(
+        learning_core_question(),
+        learning_core_sources(),
+        outcome,
+    ));
+    let events = run_fixture_outcome_turn(Arc::clone(&store)).await;
+
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            BrainEvent::AnswerEvaluated { .. }
+                | BrainEvent::ConceptStatus { .. }
+                | BrainEvent::AudioDelta { .. }
+                | BrainEvent::RecapReady { .. }
+        )),
+        "no learner-visible mastery may be invented for a transition-less outcome: {events:?}"
+    );
+    let failures = events
+        .iter()
+        .filter_map(|event| match event {
+            BrainEvent::Error(error) => error.failure().cloned(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1, "{events:?}");
+    assert_eq!(
+        failures[0].failure_class(),
+        BrainFailureClass::ToolExecutorFailure
+    );
+    assert_eq!(failures[0].stage(), BrainFailureStage::Tools);
+    assert_eq!(
+        failures[0].metadata(),
+        "error_kind=turn_outcome_without_concept_transition"
+    );
+
+    let calls = store.calls();
+    assert_eq!(calls.record_concept_status, 0);
+    assert!(calls.persist_review_schedule_decision.is_empty());
+    assert_eq!(calls.recorded_recaps, 0);
+}

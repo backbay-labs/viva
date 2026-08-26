@@ -740,12 +740,18 @@ async fn emit_study_answer_sequence(event_tx: &mpsc::Sender<BrainEvent>, job: St
             }
         };
 
-        let evaluation = answer_evaluation_from_outcome(
+        let evaluation = match answer_evaluation_from_outcome(
             &outcome,
             &job.answer_input.text,
             &source,
             &job.question,
-        );
+        ) {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        };
         for event in learning_event_projection(&outcome, &job.response_id, &source, evaluation) {
             let concept_intent = match &event {
                 BrainEvent::ConceptStatus { concept_id, .. } => Some(concept_id.clone()),
