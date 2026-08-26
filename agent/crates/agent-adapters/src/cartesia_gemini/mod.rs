@@ -1,32 +1,30 @@
 pub mod constants;
 pub mod llm;
+mod projection;
 mod runner;
+mod session;
 pub mod stt;
 pub mod tts;
 
 use std::{
     env, fmt,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use serde_json::json;
-use serde_json::Value;
+use futures_util::StreamExt;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_util::sync::CancellationToken;
 
 use agent_domain::{
-    learning_outcome::{VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA},
-    tool_executor::VIVA_STUDY_MODE,
-    AnswerEvaluation, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent,
-    BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError, BrainProviderFailure,
-    BrainProviderFailureParts, BrainUsage, EvaluationLabel, PersistedTurnOutcome,
-    QuestionProgressionResult, RealtimeBrain, RealtimeBrainCapabilities, RealtimeSession,
-    RealtimeSessionTaskGuard, SessionConfig, StudyMemoryStore, StudyQuestion, StudySessionPhase,
-    StudySessionRecap, StudySessionState, StudySourceReference, ToolProposal, TurnOutcome,
-    TurnResolution, VivaToolExecutor,
+    tool_executor::VIVA_STUDY_MODE, AudioFrame, AuthorizedStudySession, BrainError, BrainEvent,
+    BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderFailure,
+    BrainProviderFailureParts, BrainUsage, QuestionProgressionResult, RealtimeBrain,
+    RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, SessionConfig,
+    StudyMemoryStore, StudyQuestion, ToolProposal, TurnOutcome, VivaToolExecutor,
 };
 
 pub use llm::{
@@ -39,10 +37,20 @@ pub use stt::{
 };
 pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEvent};
 
-use runner::{
-    answer_attempt_envelope, CartesiaGeminiRunner, FakeCartesiaGeminiTransports,
-    LiveCartesiaGeminiTransports, RunnerInput,
+pub(crate) use projection::{
+    answer_evaluation_from_outcome, emit_provider_failure, learning_event_projection,
+    outcome_contract_failure, parse_persisted_turn_outcome, recap_from_tool_result,
+    send_fake_unless_cancelled, SessionPhaseTracker,
 };
+
+use crate::synthetic::fixture_response_text;
+use llm::{GeminiEventStream, GeminiStreamAttemptFailure};
+use runner::CartesiaGeminiRunner;
+use session::{
+    answer_attempt_envelope, CartesiaGeminiTransports, LiveCartesiaGeminiTransports, RunnerInput,
+    RunnerTranscript,
+};
+use tts::SpeechFrameSink;
 
 pub(crate) const FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT: &str =
     "NADH donates electrons to the electron transport chain.";
@@ -380,244 +388,6 @@ pub(crate) fn websocket_handshake_status(
 /// before it can reach a caller.
 pub(crate) fn websocket_close_code(frame: Option<&CloseFrame>) -> Option<u16> {
     frame.map(|frame| frame.code.into())
-}
-
-/// The session's phase, driven only through Plan 06's one legal-transition
-/// table.
-///
-/// A raw `SessionPhase` send cannot exist behind this type: every emission is a
-/// transition the domain accepted, and a rejected transition becomes a typed
-/// domain failure *before* any event is produced.
-#[derive(Clone)]
-pub(crate) struct SessionPhaseTracker {
-    state: Arc<Mutex<StudySessionState>>,
-}
-
-impl SessionPhaseTracker {
-    pub(crate) fn ready() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(StudySessionState::ready())),
-        }
-    }
-
-    /// Enter `listening` for a newly accepted turn.
-    ///
-    /// A fresh or completed turn moves forward through the legal table; a turn
-    /// that replaced one still in flight uses the machine's one explicit
-    /// backward motion, which is exactly what a barge-in is. Neither path
-    /// invents a transition the domain does not allow.
-    pub(crate) fn begin_turn(&self) -> Result<BrainEvent, BrainError> {
-        let mut state = self.state.lock().map_err(|_| phase_machine_failure())?;
-        let phase = if state
-            .phase()
-            .can_transition_to(StudySessionPhase::Listening)
-        {
-            state.transition(StudySessionPhase::Listening)
-        } else {
-            state.restart_after_cancellation()
-        }
-        .map_err(|_| phase_machine_failure())?;
-        Ok(BrainEvent::SessionPhase { phase })
-    }
-
-    pub(crate) fn phase_event(&self, to: StudySessionPhase) -> Result<BrainEvent, BrainError> {
-        let mut state = self.state.lock().map_err(|_| phase_machine_failure())?;
-        state
-            .transition(to)
-            .map(|phase| BrainEvent::SessionPhase { phase })
-            .map_err(|_| phase_machine_failure())
-    }
-
-    /// The one deliberately permissive reader: session teardown claims the recap
-    /// phase only when the session actually reached a phase that leads there. A
-    /// session that never took a turn simply never claims it, which is not a
-    /// rejected emission but an emission that is never attempted.
-    pub(crate) fn phase_event_if_legal(&self, to: StudySessionPhase) -> Option<BrainEvent> {
-        let mut state = self.state.lock().ok()?;
-        state
-            .transition(to)
-            .ok()
-            .map(|phase| BrainEvent::SessionPhase { phase })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phase(&self) -> StudySessionPhase {
-        self.state.lock().expect("phase lock poisoned").phase()
-    }
-}
-
-fn phase_machine_failure() -> BrainError {
-    brain_failure(BrainProviderFailureParts {
-        failure_class: BrainFailureClass::ToolExecutorFailure,
-        stage: BrainFailureStage::Session,
-        retry_eligible: false,
-        latency_ms: 0,
-        provider: "server".to_owned(),
-        model: "viva-session".to_owned(),
-        metadata: "error_kind=illegal_phase_transition".to_owned(),
-    })
-}
-
-fn outcome_contract_failure(error_kind: &'static str) -> BrainError {
-    brain_failure(BrainProviderFailureParts {
-        failure_class: BrainFailureClass::ToolExecutorFailure,
-        stage: BrainFailureStage::Tools,
-        retry_eligible: false,
-        latency_ms: 0,
-        provider: "server".to_owned(),
-        model: "viva-tools".to_owned(),
-        metadata: format!("error_kind={error_kind}"),
-    })
-}
-
-/// Deserialize the Plan 04 executor's `evaluate_spoken_answer` payload.
-///
-/// The wrapper has exactly two members and the adapter reads exactly one of
-/// them: `record` is checked for its schema and for naming this very response,
-/// and is then never consulted for a learner fact. Validation happens before any
-/// event, transition, disposition, schedule, or recap exists.
-pub(crate) fn parse_persisted_turn_outcome(
-    result: &Value,
-    response_id: &str,
-) -> Result<TurnOutcome, BrainError> {
-    let persisted: PersistedTurnOutcome = serde_json::from_value(result.clone())
-        .map_err(|_| outcome_contract_failure("persisted_turn_outcome_malformed"))?;
-    if persisted.record.schema != VIVA_TURN_OUTCOME_RECORD_SCHEMA {
-        return Err(outcome_contract_failure("turn_outcome_receipt_schema"));
-    }
-    if persisted.turn_outcome.schema != VIVA_TURN_OUTCOME_SCHEMA {
-        return Err(outcome_contract_failure("turn_outcome_schema"));
-    }
-    if persisted.record.response_id != persisted.turn_outcome.response_id {
-        return Err(outcome_contract_failure("turn_outcome_receipt_response_id"));
-    }
-    if persisted.turn_outcome.response_id != response_id {
-        return Err(outcome_contract_failure("turn_outcome_response_id"));
-    }
-    Ok(persisted.turn_outcome)
-}
-
-/// The v2 recap the Plan 04 executor folded from persisted evidence.
-pub(crate) fn recap_from_tool_result(result: &Value) -> Result<StudySessionRecap, BrainError> {
-    serde_json::from_value(
-        result
-            .get("recap")
-            .cloned()
-            .ok_or_else(|| outcome_contract_failure("recap_payload_missing"))?,
-    )
-    .map_err(|_| outcome_contract_failure("recap_payload_malformed"))
-}
-
-/// The exact rubric wire token for a server-derived label. The adapter maps, it
-/// never chooses: every arm is a `EvaluationLabel` the executor already decided.
-pub(crate) fn evaluation_label_wire(label: EvaluationLabel) -> &'static str {
-    match label {
-        EvaluationLabel::Strong => "strong",
-        EvaluationLabel::MostlyCorrect => "mostly correct",
-        EvaluationLabel::PartiallyCorrect => "partially correct",
-        EvaluationLabel::Vague => "vague",
-        EvaluationLabel::Wrong => "wrong",
-        EvaluationLabel::InsufficientEvidence => "insufficient evidence",
-    }
-}
-
-/// Project a persisted evaluated outcome into the browser's evaluation payload.
-///
-/// Every graded field is copied from the outcome. `answer_text` is the
-/// transcript this turn actually carried — a transport fact, never a grade — and
-/// the source is the one the executor re-retrieved for a rubric-authorized id.
-///
-/// The learner-visible mastery value is the one the executor persisted for this
-/// turn's own concept, or failing that the first concept the outcome names. An
-/// evaluated outcome that names no concept at all has no honest status to show,
-/// so it is a typed contract failure rather than an adapter-chosen default —
-/// this is the last place an adapter could have picked a mastery value, and it
-/// does not.
-pub(crate) fn answer_evaluation_from_outcome(
-    outcome: &TurnOutcome,
-    answer_text: &str,
-    source: &StudySourceReference,
-    question: &StudyQuestion,
-) -> Result<Option<AnswerEvaluation>, BrainError> {
-    let TurnResolution::Evaluated {
-        label,
-        confidence,
-        concept_transitions,
-        concise_feedback,
-        retry_prompt,
-        ..
-    } = &outcome.resolution
-    else {
-        return Ok(None);
-    };
-    let concept_status = concept_transitions
-        .iter()
-        .find(|transition| transition.concept_id == question.concept_id)
-        .or_else(|| concept_transitions.first())
-        .ok_or_else(|| outcome_contract_failure("turn_outcome_without_concept_transition"))?
-        .to_status
-        .clone();
-    Ok(Some(AnswerEvaluation {
-        question_id: outcome.question_id.clone(),
-        answer_text: answer_text.to_owned(),
-        label: evaluation_label_wire(*label).to_owned(),
-        concise_feedback: concise_feedback.clone(),
-        retry_prompt: retry_prompt.clone().unwrap_or_default(),
-        source: source.clone(),
-        concept_status,
-        confidence_score: *confidence,
-    }))
-}
-
-/// The complete set of learner-visible events one persisted outcome authorizes.
-///
-/// An evaluated outcome yields its source, its evaluation, and one
-/// `ConceptStatus` per persisted transition, in persisted order. A deferred
-/// outcome yields exactly one `TurnDeferred` carrying only Plan 04's four fields
-/// — no feedback, no confidence, no status, no schedule, no recap.
-pub(crate) fn learning_event_projection(
-    outcome: &TurnOutcome,
-    response_id: &str,
-    source: &StudySourceReference,
-    evaluation: Option<AnswerEvaluation>,
-) -> Vec<BrainEvent> {
-    match &outcome.resolution {
-        TurnResolution::Evaluated {
-            concept_transitions,
-            ..
-        } => {
-            let mut events = vec![BrainEvent::SourceReference {
-                response_id: response_id.to_owned(),
-                source: source.clone(),
-            }];
-            if let Some(evaluation) = evaluation {
-                events.push(BrainEvent::AnswerEvaluated {
-                    response_id: response_id.to_owned(),
-                    evaluation,
-                });
-            }
-            events.extend(
-                concept_transitions
-                    .iter()
-                    .map(|transition| BrainEvent::ConceptStatus {
-                        response_id: response_id.to_owned(),
-                        concept_id: transition.concept_id.clone(),
-                        status: transition.to_status.clone(),
-                    }),
-            );
-            events
-        }
-        TurnResolution::Deferred {
-            reason,
-            can_retry_same_question,
-            ..
-        } => vec![BrainEvent::TurnDeferred {
-            response_id: response_id.to_owned(),
-            question_id: outcome.question_id.clone(),
-            reason: reason.clone(),
-            can_retry_same_question: *can_retry_same_question,
-        }],
-    }
 }
 
 /// This session's authorized question for one response, from the D-02B cursor.
@@ -1228,40 +998,6 @@ impl RealtimeBrain for FakeCartesiaGeminiRuntime {
     }
 }
 
-/// Emit one event unless the turn it belongs to was cancelled.
-///
-/// `ADAPTER-03`: the signal is the same cooperative token the provider stages
-/// select on, so a barge-in suppresses this turn's remaining events and the
-/// provider's cancel/close controls through one source of truth.
-async fn send_fake_unless_cancelled(
-    event_tx: &mpsc::Sender<BrainEvent>,
-    event: BrainEvent,
-    cancelled: &CancellationToken,
-) -> bool {
-    if cancelled.is_cancelled() {
-        return false;
-    }
-    if event_tx.send(event).await.is_err() {
-        return false;
-    }
-    tokio::task::yield_now().await;
-    !cancelled.is_cancelled()
-}
-
-/// The one provider-error emission path.
-///
-/// Plan 06 collapsed `BrainError` to a single classified variant, so the class,
-/// stage, retry policy, and terminal reason were all chosen at the boundary that
-/// observed the failure. Nothing here re-reads a message to guess any of them,
-/// and there is no second emitter a generic code path could pick by accident.
-async fn emit_provider_failure(event_tx: &mpsc::Sender<BrainEvent>, error: BrainError) {
-    let _ = event_tx
-        .send(BrainEvent::Error(BrainProviderError::from_failure(
-            error.failure().clone(),
-        )))
-        .await;
-}
-
 fn env_value(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -1298,6 +1034,373 @@ fn parse_gemini_fallback_models(value: &str, primary_model: &str) -> Vec<String>
 // allowlisted diagnostic code may survive; the body, reason, and provider code
 // are discarded whole.
 // ---------------------------------------------------------------------------
+fn fake_interrupt_gemini_stream(
+    stream: GeminiEventStream,
+    interrupt: FakeRuntimeInterrupt,
+) -> GeminiEventStream {
+    match interrupt {
+        FakeRuntimeInterrupt::NoGeminiManuscriptIntent => Box::pin(stream.filter(|event| {
+            let keep = !matches!(
+                event,
+                Ok(GeminiStreamEvent::FunctionCall { name, .. })
+                    if name == "emit_manuscript_intent"
+            );
+            async move { keep }
+        })),
+        FakeRuntimeInterrupt::MalformedGeminiManuscriptIntent => Box::pin(stream.map(|event| {
+            event.map(|event| match event {
+                GeminiStreamEvent::FunctionCall { id, name, .. }
+                    if name == "emit_manuscript_intent" =>
+                {
+                    let args = json!({
+                        "type": "entity_intent",
+                        "entity_id": "<script>raw-markup</script>",
+                        "entity_kind": "concept",
+                        "register": "correcting",
+                        "emphasis": "marked",
+                    });
+                    GeminiStreamEvent::FunctionCall {
+                        id,
+                        name,
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-invalid",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }
+                }
+                event => event,
+            })
+        })),
+        FakeRuntimeInterrupt::UnauthorizedGeminiManuscriptIntent => Box::pin(stream.map(|event| {
+            event.map(|event| match event {
+                GeminiStreamEvent::FunctionCall { id, name, .. }
+                    if name == "emit_manuscript_intent" =>
+                {
+                    let args = json!({
+                        "type": "entity_intent",
+                        "entity_id": "unknown-concept",
+                        "entity_kind": "concept",
+                        "register": "correcting",
+                        "emphasis": "marked",
+                    });
+                    GeminiStreamEvent::FunctionCall {
+                        id,
+                        name,
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-unauthorized",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }
+                }
+                event => event,
+            })
+        })),
+        // A tool call the model was not offered, appended once the pass turns
+        // out to have proposed none of its own.
+        FakeRuntimeInterrupt::GeminiToolCallOnFinalPass => Box::pin(futures_util::stream::unfold(
+            (Some(stream), false, false),
+            |(stream, saw_call, appended)| async move {
+                let mut stream = stream?;
+                if let Some(item) = stream.next().await {
+                    let saw_call =
+                        saw_call || matches!(&item, Ok(GeminiStreamEvent::FunctionCall { .. }));
+                    return Some((item, (Some(stream), saw_call, appended)));
+                }
+                if saw_call || appended {
+                    return None;
+                }
+                let args = json!({
+                    "type": "entity_intent",
+                    "entity_id": "nadh",
+                    "entity_kind": "concept",
+                    "register": "correcting",
+                    "emphasis": "marked",
+                });
+                Some((
+                    Ok(GeminiStreamEvent::FunctionCall {
+                        id: "call-manuscript-final-pass".to_owned(),
+                        name: "emit_manuscript_intent".to_owned(),
+                        args: args.clone(),
+                        part: json!({
+                            "functionCall": {
+                                "id": "call-manuscript-final-pass",
+                                "name": "emit_manuscript_intent",
+                                "args": args,
+                            }
+                        }),
+                    }),
+                    (Some(stream), saw_call, true),
+                ))
+            },
+        )),
+        _ => stream,
+    }
+}
+
+/// The fixture transports, plus the one observation a test cannot make from the
+/// event stream: whether the speech provider was *asked* to speak at all.
+///
+/// A turn that must not speak is not proven by the absence of `AudioDelta` —
+/// synthesis could have run and its frames been dropped. The counter below makes
+/// "zero Sonic calls" directly observable.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FakeCartesiaGeminiTransports {
+    spoken_contexts: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// Every entry into a provider stage, so "no provider call" is observable
+    /// rather than inferred from an absent event.
+    provider_calls: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl FakeCartesiaGeminiTransports {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn sonic_call_count(&self) -> u32 {
+        self.spoken_contexts
+            .lock()
+            .expect("spoken context lock poisoned")
+            .len() as u32
+    }
+
+    pub(crate) fn provider_call_count(&self) -> u32 {
+        self.provider_calls.load(Ordering::SeqCst)
+    }
+
+    fn record_provider_call(&self) {
+        self.provider_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
+    async fn transcribe_audio(
+        &self,
+        _config: &CartesiaGeminiConfig,
+        _response_id: &str,
+        frame: &AudioFrame,
+        _cancel: &CancellationToken,
+    ) -> Result<RunnerTranscript, BrainError> {
+        self.record_provider_call();
+        let pcm_len = audio_frame_bytes(frame).len();
+        let Some(InkEvent::TurnEnd { text, confidence }) = parse_ink_event(
+            r#"{"type":"transcript","is_final":true,"text":"NADH donates electrons to the electron transport chain."}"#,
+        ) else {
+            return Err(fake_transport_failure("ink_transcript_unparsed"));
+        };
+        Ok(RunnerTranscript {
+            interim_text: format!("received {pcm_len} PCM16 bytes"),
+            // The fixture Ink event carries no confidence field, so the v5 fake
+            // fixture reports an explicit absence rather than a default. The
+            // value is read back out of the parsed event, not hardcoded.
+            final_text: text,
+            confidence,
+        })
+    }
+
+    async fn stream_gemini(
+        &self,
+        _config: &CartesiaGeminiConfig,
+        request: Value,
+    ) -> Result<GeminiEventStream, GeminiStreamAttemptFailure> {
+        self.record_provider_call();
+        let has_function_response =
+            request["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|content| {
+                    content["parts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|part| part.get("functionResponse").is_some())
+                });
+        if has_function_response {
+            if request.get("tools").is_some() {
+                return Err(GeminiStreamAttemptFailure {
+                    events: Vec::new(),
+                    error: fake_transport_failure("final_request_advertised_tools"),
+                });
+            }
+            // The fixture runtime speaks the persisted outcome's own feedback,
+            // read back out of the tool response it was just handed. There is no
+            // shared fallback sentence and no topic copy of its own.
+            let mut events = Vec::new();
+            if let Some(text) = fake_final_response_text(&request) {
+                events.push(GeminiStreamEvent::ModelPart {
+                    part: json!({ "text": text }),
+                    text: Some(text),
+                });
+            }
+            events.push(GeminiStreamEvent::Usage {
+                input_tokens: 0,
+                output_tokens: 2,
+            });
+            Ok(fixture_gemini_stream(events))
+        } else {
+            if request.get("tools").is_none() {
+                return Err(GeminiStreamAttemptFailure {
+                    events: Vec::new(),
+                    error: fake_transport_failure("request_omitted_tools"),
+                });
+            }
+            let answer_text = first_user_text(&request)
+                .unwrap_or_else(|| FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT.to_owned());
+            let args = json!({
+                "study_set_id": "biology-midterm",
+                "voice_session_id": "voice-session-1",
+                "question_id": "q-oxidative-phosphorylation-nadh",
+                "answer_text": answer_text,
+            });
+            let manuscript_args = json!({
+                "type": "entity_intent",
+                "entity_id": "nadh",
+                "entity_kind": "concept",
+                "register": "correcting",
+                "emphasis": "marked",
+            });
+            Ok(fixture_gemini_stream(vec![
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-eval-1".to_owned(),
+                    name: "evaluate_spoken_answer".to_owned(),
+                    args: args.clone(),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-eval-1",
+                            "name": "evaluate_spoken_answer",
+                            "args": args,
+                        }
+                    }),
+                },
+                GeminiStreamEvent::FunctionCall {
+                    id: "call-manuscript-1".to_owned(),
+                    name: "emit_manuscript_intent".to_owned(),
+                    args: manuscript_args.clone(),
+                    part: json!({
+                        "functionCall": {
+                            "id": "call-manuscript-1",
+                            "name": "emit_manuscript_intent",
+                            "args": manuscript_args,
+                        }
+                    }),
+                },
+                GeminiStreamEvent::Usage {
+                    input_tokens: 20,
+                    output_tokens: 8,
+                },
+            ]))
+        }
+    }
+
+    async fn extend_speech(
+        &self,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        text: &str,
+        interrupt: FakeRuntimeInterrupt,
+        _cancel: &CancellationToken,
+    ) -> Result<(), BrainError> {
+        // Recorded on entry, before any outcome: an asked-for synthesis that
+        // then failed is still a context the provider saw.
+        self.record_provider_call();
+        self.spoken_contexts
+            .lock()
+            .expect("spoken context lock poisoned")
+            .insert(response_id.to_owned());
+        let _request = sonic_generation_request(&config.sonic, response_id, text, true);
+        if interrupt == FakeRuntimeInterrupt::WriterFailureBeforeSonicAudio {
+            return Err(fake_transport_failure("writer_failed_before_audio"));
+        }
+        Ok(())
+    }
+
+    async fn finish_speech(
+        &self,
+        config: &CartesiaGeminiConfig,
+        response_id: &str,
+        _interrupt: FakeRuntimeInterrupt,
+        _cancel: &CancellationToken,
+        sink: &mut dyn SpeechFrameSink,
+    ) -> Result<(), BrainError> {
+        self.record_provider_call();
+        let _finalizer = sonic_generation_request(&config.sonic, response_id, "", false);
+        let sonic = json!({
+            "type": "chunk",
+            "context_id": response_id,
+            "data": "AQIDBA==",
+        });
+        let Some(SonicEvent::Audio { pcm16_base64, .. }) = parse_sonic_event(&sonic.to_string())
+        else {
+            return Err(fake_transport_failure("sonic_audio_unparsed"));
+        };
+        let frame = AudioFrame::from_base64(pcm16_base64)
+            .map_err(|_| fake_transport_failure("sonic_audio_invalid_base64"))?;
+        sink.frame(frame).await;
+        Ok(())
+    }
+}
+
+/// A scripted provider response, delivered through the same incremental stream
+/// shape the live transport produces.
+fn fixture_gemini_stream(events: Vec<GeminiStreamEvent>) -> GeminiEventStream {
+    Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
+}
+
+/// Fixture-runtime transport faults. The wording stays inside the fake
+/// transports; a live failure never reaches this function.
+fn fake_transport_failure(error_kind: &'static str) -> BrainError {
+    brain_failure(BrainProviderFailureParts {
+        failure_class: BrainFailureClass::MalformedStream,
+        stage: BrainFailureStage::Provider,
+        retry_eligible: false,
+        latency_ms: 0,
+        provider: "fake_cartesia_gemini".to_owned(),
+        model: "fake_cartesia_gemini".to_owned(),
+        metadata: format!("stage=fake_transport error_kind={error_kind}"),
+    })
+}
+
+/// Read the persisted outcome back out of the tool response the fixture runtime
+/// is replaying, and speak that outcome's own copy.
+fn fake_final_response_text(request: &Value) -> Option<String> {
+    let outcome = request["contents"]
+        .as_array()?
+        .iter()
+        .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+        .filter_map(|part| part.get("functionResponse"))
+        .filter(|response| {
+            response.get("name").and_then(Value::as_str) == Some("evaluate_spoken_answer")
+        })
+        .find_map(|response| {
+            serde_json::from_value::<TurnOutcome>(
+                response["response"]["result"]["turn_outcome"].clone(),
+            )
+            .ok()
+        })?;
+    fixture_response_text(&outcome)
+}
+
+fn first_user_text(request: &Value) -> Option<String> {
+    request["contents"]
+        .as_array()?
+        .iter()
+        .find(|content| content.get("role").and_then(Value::as_str) == Some("user"))?
+        .get("parts")?
+        .as_array()?
+        .iter()
+        .find_map(|part| part.get("text").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(test)]
 mod cartesia_diagnostics_tests {
     use std::net::SocketAddr;
@@ -1976,138 +2079,5 @@ mod tests {
         assert!(!disabled.provider_zero_data_retention_confirmed());
         assert!(!alias.live_runtime_enabled);
         assert!(!alias.provider_zero_data_retention_confirmed());
-    }
-
-    #[test]
-    fn phase_tracker_emits_only_legal_transitions_and_fails_closed_otherwise() {
-        let tracker = SessionPhaseTracker::ready();
-
-        for phase in [
-            StudySessionPhase::Listening,
-            StudySessionPhase::Thinking,
-            StudySessionPhase::Feedback,
-            StudySessionPhase::Correction,
-        ] {
-            assert_eq!(
-                tracker.phase_event(phase).expect("legal transition"),
-                BrainEvent::SessionPhase { phase }
-            );
-        }
-        assert_eq!(tracker.phase(), StudySessionPhase::Correction);
-
-        // A second Feedback claim is backward motion the domain refuses, and the
-        // refusal is a typed failure rather than an emitted phase.
-        let error = tracker
-            .phase_event(StudySessionPhase::Feedback)
-            .expect_err("backward motion is illegal");
-        assert_eq!(
-            error.failure().failure_class(),
-            BrainFailureClass::ToolExecutorFailure
-        );
-        assert_eq!(error.failure().stage(), BrainFailureStage::Session);
-        assert_eq!(tracker.phase(), StudySessionPhase::Correction);
-
-        // A barge-in during a turn takes the machine's one explicit backward
-        // motion rather than an illegal forward claim.
-        assert_eq!(
-            tracker.begin_turn().expect("a replacement turn restarts"),
-            BrainEvent::SessionPhase {
-                phase: StudySessionPhase::Listening
-            }
-        );
-        assert!(tracker.phase_event(StudySessionPhase::Thinking).is_ok());
-        assert_eq!(
-            tracker.begin_turn().expect("a second barge-in restarts"),
-            BrainEvent::SessionPhase {
-                phase: StudySessionPhase::Listening
-            }
-        );
-        for phase in [
-            StudySessionPhase::Thinking,
-            StudySessionPhase::Feedback,
-            StudySessionPhase::Correction,
-        ] {
-            tracker.phase_event(phase).expect("legal transition");
-        }
-        assert!(tracker
-            .phase_event_if_legal(StudySessionPhase::Recap)
-            .is_some());
-        assert!(SessionPhaseTracker::ready()
-            .phase_event_if_legal(StudySessionPhase::Recap)
-            .is_none());
-    }
-
-    /// The projection copies a persisted mastery value; it never picks one.
-    #[test]
-    fn evaluation_projection_copies_a_persisted_status_and_never_defaults_one() {
-        let mut outcome = crate::synthetic::learning_core_turn_outcome("evaluated_mostly_correct")
-            .expect("the immutable corpus publishes the case");
-        let source = agent_domain::fixture_source_reference();
-        let TurnResolution::Evaluated {
-            concept_transitions,
-            ..
-        } = &outcome.resolution
-        else {
-            panic!("the corpus case is evaluated");
-        };
-        let transitions = concept_transitions.clone();
-        assert!(
-            transitions.len() > 1,
-            "the case must name more than one concept for the preference to be observable"
-        );
-
-        // This turn's own concept wins, whichever position it holds.
-        for expected in &transitions {
-            let mut question = agent_domain::fixture_question();
-            question.concept_id = expected.concept_id.clone();
-            let evaluation =
-                answer_evaluation_from_outcome(&outcome, "the answer", &source, &question)
-                    .expect("a transition-bearing outcome projects")
-                    .expect("an evaluated outcome carries an evaluation");
-            assert_eq!(evaluation.concept_status, expected.to_status);
-            assert_eq!(evaluation.answer_text, "the answer");
-        }
-
-        // A concept the outcome never mentions falls back to the outcome's own
-        // first transition, still a persisted value.
-        let mut unrelated = agent_domain::fixture_question();
-        unrelated.concept_id = "concept-the-outcome-never-names".to_owned();
-        assert_eq!(
-            answer_evaluation_from_outcome(&outcome, "the answer", &source, &unrelated)
-                .expect("a transition-bearing outcome projects")
-                .expect("an evaluated outcome carries an evaluation")
-                .concept_status,
-            transitions[0].to_status
-        );
-
-        // With no transition at all there is nothing honest to show.
-        if let TurnResolution::Evaluated {
-            concept_transitions,
-            ..
-        } = &mut outcome.resolution
-        {
-            concept_transitions.clear();
-        }
-        let error = answer_evaluation_from_outcome(&outcome, "the answer", &source, &unrelated)
-            .expect_err("a transition-less evaluated outcome has no status to show");
-        assert_eq!(
-            error.failure().failure_class(),
-            BrainFailureClass::ToolExecutorFailure
-        );
-        assert_eq!(error.failure().stage(), BrainFailureStage::Tools);
-        assert_eq!(
-            error.failure().metadata(),
-            "error_kind=turn_outcome_without_concept_transition"
-        );
-
-        // A deferral carries no evaluation and is not a failure.
-        let deferred =
-            crate::synthetic::learning_core_turn_outcome("deferred_insufficient_semantic_evidence")
-                .expect("the immutable corpus publishes the case");
-        assert!(
-            answer_evaluation_from_outcome(&deferred, "the answer", &source, &unrelated)
-                .expect("a deferral projects")
-                .is_none()
-        );
     }
 }
