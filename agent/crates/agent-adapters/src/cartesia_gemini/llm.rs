@@ -523,16 +523,28 @@ fn sanitized_gemini_http_status_error(config: &GeminiConfig, status: u16) -> Bra
 }
 
 pub(crate) async fn stream_gemini_http_with_attempt_events(
+    client: &ReqwestGeminiSseClient,
     config: &GeminiConfig,
     request: Value,
 ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
-    stream_gemini_with_client_attempt_events(&ReqwestGeminiSseClient::default(), config, request)
-        .await
+    stream_gemini_with_client_attempt_events(client, config, request).await
 }
 
-#[derive(Clone, Default)]
-struct ReqwestGeminiSseClient {
+/// The HTTP client every Gemini call in one process shares.
+///
+/// `ADAPTER-04`: `reqwest::Client` owns the connection pool, so constructing one
+/// per call discards every keep-alive connection. The pool is built once and
+/// handed to both the streaming tool loop and the provider-backed evaluator.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReqwestGeminiSseClient {
     client: reqwest::Client,
+}
+
+impl ReqwestGeminiSseClient {
+    /// One shared pool. There is deliberately no per-call constructor.
+    pub(crate) fn shared() -> Self {
+        Self::default()
+    }
 }
 
 #[async_trait]
@@ -1890,6 +1902,7 @@ data: [DONE]
         });
 
         let error = stream_gemini_http_with_attempt_events(
+            &ReqwestGeminiSseClient::shared(),
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
                 model_id: "gemini-3.5-flash".to_owned(),
@@ -1947,6 +1960,7 @@ data: [DONE]
         });
 
         let error = stream_gemini_http_with_attempt_events(
+            &ReqwestGeminiSseClient::shared(),
             &GeminiConfig {
                 api_key: "local-fixture".to_owned(),
                 base_url,
@@ -3025,17 +3039,19 @@ pub(crate) struct GeminiAnswerEvaluator {
 }
 
 impl GeminiAnswerEvaluator {
-    /// The live composition. Task 4 later moves this onto the shared connection
-    /// pool without changing evaluator semantics.
-    pub(crate) fn live(config: &GeminiConfig) -> Self {
+    /// The live composition, on the session's shared HTTP connection pool.
+    ///
+    /// `ADAPTER-04`: the evaluator and the streaming tool loop are two uses of
+    /// the same Gemini endpoint, so they share one pool. Evaluator semantics are
+    /// unchanged by where the connection comes from.
+    pub(crate) fn live(config: &GeminiConfig, client: Arc<ReqwestGeminiSseClient>) -> Self {
         Self {
-            client: Arc::new(ReqwestGeminiSseClient::default()),
+            client,
             config: config.clone(),
         }
     }
 
-    /// The injectable seam this lane already owned. Task 4 moves the live
-    /// composition onto it without changing evaluator semantics.
+    /// The injectable seam this lane already owned.
     #[cfg(test)]
     pub(crate) fn with_client(client: Arc<dyn GeminiSseClient>, config: GeminiConfig) -> Self {
         Self { client, config }

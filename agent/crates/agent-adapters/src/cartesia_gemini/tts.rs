@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -194,32 +196,14 @@ pub fn sonic_flush_request(config: &SonicConfig, context_id: &str) -> Value {
     request
 }
 
-pub(crate) async fn synthesize_sonic_websocket(
-    config: &SonicConfig,
-    api_key: &str,
-    context_id: &str,
-    transcript: &str,
-    cancel: &CancellationToken,
-) -> Result<Vec<AudioFrame>, BrainError> {
-    synthesize_sonic_with_connector(
-        &WebSocketSonicConnector,
-        config,
-        api_key,
-        context_id,
-        transcript,
-        cancel,
-    )
-    .await
-}
-
-/// One response's speech, bounded by the stage deadline and cancellable.
+/// One response's speech on a connection that lives only for that response.
 ///
-/// `ADAPTER-03`: the deadline is split so that only the handshake runs outside
-/// the scope that owns the socket. Once the connection exists every exit —
-/// success, provider failure, cancellation, or deadline — writes the controls
-/// Cartesia documents and closes the connection, instead of dropping it.
+/// This is the single-shot shape the session connection replaced; it survives as
+/// a test seam so the connect/deadline/cleanup contract can be driven directly
+/// against a scripted connector.
+#[cfg(test)]
 pub(crate) async fn synthesize_sonic_with_connector<C>(
-    connector: &C,
+    connector: Arc<C>,
     config: &SonicConfig,
     api_key: &str,
     context_id: &str,
@@ -227,37 +211,15 @@ pub(crate) async fn synthesize_sonic_with_connector<C>(
     cancel: &CancellationToken,
 ) -> Result<Vec<AudioFrame>, BrainError>
 where
-    C: SonicConnector,
+    C: SonicConnector + 'static,
+    C::Socket: 'static,
 {
-    let request = config.websocket_request(api_key)?;
-    let deadline = Instant::now() + config.stage_timeout;
-    // A deadline that fires before the handshake completes has no socket to
-    // close, and cleanup must not pretend otherwise.
-    let mut socket = match timeout(config.stage_timeout, connector.connect(request)).await {
-        Ok(socket) => socket?,
-        Err(_) => return Err(sonic_deadline_failure()),
-    };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match timeout(
-        remaining,
-        synthesize_sonic_context(&mut socket, config, context_id, transcript, cancel),
-    )
-    .await
-    {
-        Ok(Ok(frames)) => {
-            close_quietly(&mut socket).await;
-            Ok(frames)
-        }
-        // The context already closed the connection on its own terminal paths.
-        Ok(Err(error)) => Err(error),
-        Err(_) => {
-            // Cleanup is best-effort: a failed cancel or close must not replace
-            // the sanitized terminal classification the deadline produced.
-            let _ = cancel_sonic_context(&mut socket, context_id).await;
-            close_quietly(&mut socket).await;
-            Err(sonic_deadline_failure())
-        }
-    }
+    let voice = SonicSessionVoice::new(connector);
+    let frames = voice
+        .speak(config, api_key, context_id, transcript, cancel)
+        .await;
+    voice.close().await;
+    frames
 }
 
 fn sonic_deadline_failure() -> BrainError {
@@ -269,13 +231,21 @@ fn sonic_deadline_failure() -> BrainError {
     )
 }
 
+/// What one response context produced, and whether its connection survived.
+#[derive(Debug)]
+pub(crate) struct SonicContextOutcome {
+    pub(crate) frames: Vec<AudioFrame>,
+    /// Whether the connection is still usable for the next response context.
+    pub(crate) connection_open: bool,
+}
+
 pub(crate) async fn synthesize_sonic_context<S>(
     socket: &mut S,
     config: &SonicConfig,
     context_id: &str,
     transcript: &str,
     cancel: &CancellationToken,
-) -> Result<Vec<AudioFrame>, BrainError>
+) -> Result<SonicContextOutcome, BrainError>
 where
     S: SonicSocket + ?Sized,
 {
@@ -325,7 +295,10 @@ where
                     close_quietly(socket).await;
                     return Err(sonic_protocol_failure("no_audio_chunks"));
                 }
-                return Ok(frames);
+                return Ok(SonicContextOutcome {
+                    frames,
+                    connection_open: socket.is_open(),
+                });
             }
             SonicEvent::FlushDone { .. } => {}
             SonicEvent::Error {
@@ -357,7 +330,7 @@ where
 async fn cancel_sonic_context_and_drain<S>(
     socket: &mut S,
     context_id: &str,
-) -> Result<Vec<AudioFrame>, BrainError>
+) -> Result<SonicContextOutcome, BrainError>
 where
     S: SonicSocket + ?Sized,
 {
@@ -376,7 +349,10 @@ where
         }
     }
     close_quietly(socket).await;
-    Ok(Vec::new())
+    Ok(SonicContextOutcome {
+        frames: Vec::new(),
+        connection_open: false,
+    })
 }
 
 pub(crate) async fn cancel_sonic_context<S>(
@@ -397,6 +373,15 @@ pub(crate) trait SonicSocket: Send {
     async fn send_json(&mut self, value: Value) -> Result<(), BrainError>;
     async fn next_text(&mut self) -> Result<Option<String>, BrainError>;
     async fn close(&mut self) -> Result<(), BrainError>;
+
+    /// Whether this connection is still usable for another response context.
+    ///
+    /// `ADAPTER-04`: a session-scoped connection is only reused while the
+    /// provider still holds it open. A socket the provider hung up on is
+    /// replaced, never written to again.
+    fn is_open(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -404,6 +389,127 @@ pub(crate) trait SonicConnector: Send + Sync {
     type Socket: SonicSocket;
 
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError>;
+}
+
+/// The object-safe half of [`SonicConnector`], so one session can hold a
+/// connector without the runner being generic over its socket type.
+#[async_trait]
+pub(crate) trait DynSonicConnector: Send + Sync {
+    async fn connect_boxed(&self, request: Request<()>)
+        -> Result<Box<dyn SonicSocket>, BrainError>;
+}
+
+#[async_trait]
+impl<C> DynSonicConnector for C
+where
+    C: SonicConnector,
+    C::Socket: 'static,
+{
+    async fn connect_boxed(
+        &self,
+        request: Request<()>,
+    ) -> Result<Box<dyn SonicSocket>, BrainError> {
+        Ok(Box::new(self.connect(request).await?))
+    }
+}
+
+/// One Viva realtime session's speech connection.
+///
+/// `ADAPTER-04`: Cartesia documents one multiplexed Sonic WebSocket serving many
+/// generations, a new context per conversational turn, and idle sockets counting
+/// against concurrency limits. So the connection is opened on first speech,
+/// reused across the session's response contexts, replaced when the provider
+/// closes it, and closed once when the session ends. It is per learner session,
+/// never a process-global pool keyed by learner id.
+pub(crate) struct SonicSessionVoice {
+    connector: Arc<dyn DynSonicConnector>,
+    socket: tokio::sync::Mutex<Option<Box<dyn SonicSocket>>>,
+}
+
+impl fmt::Debug for SonicSessionVoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SonicSessionVoice")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SonicSessionVoice {
+    pub(crate) fn new<C>(connector: Arc<C>) -> Self
+    where
+        C: DynSonicConnector + 'static,
+    {
+        Self {
+            connector,
+            socket: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn websocket() -> Self {
+        Self::new(Arc::new(WebSocketSonicConnector))
+    }
+
+    /// Speak one response context on this session's connection.
+    pub(crate) async fn speak(
+        &self,
+        config: &SonicConfig,
+        api_key: &str,
+        context_id: &str,
+        transcript: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<AudioFrame>, BrainError> {
+        let request = config.websocket_request(api_key)?;
+        let deadline = Instant::now() + config.stage_timeout;
+        let mut held = self.socket.lock().await;
+        // A connection is held only while the provider still has it open: every
+        // exit below drops a connection that reported itself closed, so the
+        // next response context can never be written to a dead socket.
+        if held.is_none() {
+            *held = Some(
+                match timeout(config.stage_timeout, self.connector.connect_boxed(request)).await {
+                    Ok(socket) => socket?,
+                    Err(_) => return Err(sonic_deadline_failure()),
+                },
+            );
+        }
+        let socket = held
+            .as_mut()
+            .expect("the session connection was just established");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(
+            remaining,
+            synthesize_sonic_context(socket.as_mut(), config, context_id, transcript, cancel),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => {
+                if !outcome.connection_open {
+                    *held = None;
+                }
+                Ok(outcome.frames)
+            }
+            // The context already closed the connection on its terminal paths.
+            Ok(Err(error)) => {
+                *held = None;
+                Err(error)
+            }
+            Err(_) => {
+                let _ = cancel_sonic_context(socket.as_mut(), context_id).await;
+                close_quietly(socket.as_mut()).await;
+                *held = None;
+                Err(sonic_deadline_failure())
+            }
+        }
+    }
+
+    /// The single close path: session stop, session drop, or fatal error.
+    pub(crate) async fn close(&self) {
+        let mut held = self.socket.lock().await;
+        if let Some(socket) = held.as_mut() {
+            close_quietly(socket.as_mut()).await;
+        }
+        *held = None;
+    }
 }
 
 fn sonic_generation_requests(
@@ -458,12 +564,13 @@ impl SonicConnector for WebSocketSonicConnector {
         let (socket, _) = connect_async(request)
             .await
             .map_err(|_| sonic_transport_failure("connect_failed"))?;
-        Ok(TungsteniteSonicSocket { socket })
+        Ok(TungsteniteSonicSocket { socket, open: true })
     }
 }
 
 struct TungsteniteSonicSocket {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    open: bool,
 }
 
 #[async_trait]
@@ -472,12 +579,14 @@ impl SonicSocket for TungsteniteSonicSocket {
         self.socket
             .send(Message::Text(value.to_string().into()))
             .await
+            .inspect_err(|_| self.open = false)
             .map_err(|_| sonic_transport_failure("send_failed"))
     }
 
     async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
         loop {
             let Some(message) = self.socket.next().await else {
+                self.open = false;
                 return Ok(None);
             };
             match message {
@@ -486,19 +595,31 @@ impl SonicSocket for TungsteniteSonicSocket {
                     .socket
                     .send(Message::Pong(payload))
                     .await
+                    .inspect_err(|_| self.open = false)
                     .map_err(|_| sonic_transport_failure("pong_failed"))?,
-                Ok(Message::Close(_)) => return Ok(None),
+                Ok(Message::Close(_)) => {
+                    self.open = false;
+                    return Ok(None);
+                }
                 Ok(Message::Binary(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Err(_) => return Err(sonic_transport_failure("receive_failed")),
+                Err(_) => {
+                    self.open = false;
+                    return Err(sonic_transport_failure("receive_failed"));
+                }
             }
         }
     }
 
     async fn close(&mut self) -> Result<(), BrainError> {
+        self.open = false;
         self.socket
             .close(None)
             .await
             .map_err(|_| sonic_transport_failure("close_failed"))
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
     }
 }
 
@@ -628,7 +749,7 @@ mod tests {
         let long_transcript = "Connect the electron transport chain to proton pumping. Then explain why ATP synthase needs the gradient before it can make ATP. Finish with the role of oxygen as the final electron acceptor.";
 
         let frames = synthesize_sonic_with_connector(
-            &connector,
+            Arc::new(connector),
             &SonicConfig::default(),
             "sk_car_connector_secret",
             "response-1",
@@ -674,7 +795,7 @@ mod tests {
         let transcript = "assistant text must not appear in timeout evidence";
 
         let error = synthesize_sonic_with_connector(
-            &connector,
+            Arc::new(connector),
             &config,
             "sk_car_timeout_secret",
             "response-1",
@@ -918,7 +1039,7 @@ mod tests {
             let cancel = cancel.clone();
             async move {
                 synthesize_sonic_with_connector(
-                    &*connector,
+                    Arc::clone(&connector),
                     &config,
                     "sk_car_barge_secret",
                     "response-1",
@@ -944,7 +1065,7 @@ mod tests {
 
         let replacement = CancellationToken::new();
         let frames = synthesize_sonic_with_connector(
-            &*connector,
+            Arc::clone(&connector),
             &config,
             "sk_car_barge_secret",
             "response-2",
@@ -1116,7 +1237,7 @@ mod tests {
         let transcript = "assistant text must not appear in cleanup evidence";
 
         let error = synthesize_sonic_with_connector(
-            &connector,
+            Arc::new(connector),
             &config,
             "sk_car_cleanup_secret",
             "response-1",

@@ -28,10 +28,10 @@ use crate::synthetic::{fixture_response_text, synthetic_fixture_answer_evaluator
 
 use super::llm::{
     stream_gemini_http_with_attempt_events, GeminiAnswerEvaluator, GeminiConversation,
-    GeminiStreamAttemptFailure,
+    GeminiStreamAttemptFailure, ReqwestGeminiSseClient,
 };
 use super::stt::transcribe_ink_websocket;
-use super::tts::synthesize_sonic_websocket;
+use super::tts::SonicSessionVoice;
 use super::{
     answer_evaluation_from_outcome, audio_frame_bytes, brain_failure, duration_ms,
     emit_provider_failure, failure_with_latency, gemini_request, learning_event_projection,
@@ -123,8 +123,12 @@ impl CartesiaGeminiRunner<LiveCartesiaGeminiTransports> {
         let transports = LiveCartesiaGeminiTransports::new(config.live_runtime_enabled);
         // The live composition always names the provider-backed evaluator. A
         // missing credential or a closed runtime gate makes the runtime
-        // unselectable; it never makes it quietly synthetic.
-        let evaluator = Arc::new(GeminiAnswerEvaluator::live(&config.gemini));
+        // unselectable; it never makes it quietly synthetic. The evaluator
+        // shares the transports' one HTTP connection pool.
+        let evaluator = Arc::new(GeminiAnswerEvaluator::live(
+            &config.gemini,
+            transports.gemini_client(),
+        ));
         Self {
             config,
             transports,
@@ -226,7 +230,15 @@ where
         let phases = SessionPhaseTracker::ready();
         let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
         let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
-        let runner = self.clone();
+        // This session's own provider connections, minted once the session is
+        // authorized and durably recorded.
+        let runner = CartesiaGeminiRunner {
+            config: self.config.clone(),
+            transports: self.transports.open_session(),
+            store: self.store.clone(),
+            evaluator: Arc::clone(&self.evaluator),
+            evaluator_provenance: self.evaluator_provenance,
+        };
         let task = tokio::spawn(async move {
             let _ = event_tx
                 .send(BrainEvent::SessionPhase {
@@ -340,6 +352,9 @@ where
                     response_id,
                 ));
             }
+            // One bounded teardown for the session's provider connections,
+            // whether the learner stopped or the session was dropped.
+            runner.transports.close_session().await;
         });
 
         Ok(RealtimeSession {
@@ -2075,6 +2090,18 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         Ok(())
     }
 
+    /// Provider state for one opened Viva realtime session.
+    ///
+    /// `ADAPTER-04`: the returned instance owns this session's sockets,
+    /// response contexts, and unread frames. Only process-wide connection pools
+    /// are shared with other sessions; nothing is keyed by learner id.
+    fn open_session(&self) -> Self {
+        self.clone()
+    }
+
+    /// The single teardown path, invoked by Stop or session drop.
+    async fn close_session(&self) {}
+
     async fn transcribe_audio(
         &self,
         config: &CartesiaGeminiConfig,
@@ -2411,21 +2438,50 @@ fn is_valid_manuscript_id(text: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The live provider transports.
+///
+/// `ADAPTER-04`: one `reqwest::Client` — the HTTP connection pool — is shared by
+/// every Gemini call in the process, while the Cartesia speech connection is
+/// per opened session. Cloning shares both through `Arc`; only
+/// [`open_session`](CartesiaGeminiTransports::open_session) mints a new speech
+/// connection.
+#[derive(Clone, Debug)]
 pub(crate) struct LiveCartesiaGeminiTransports {
     live_runtime_enabled: bool,
+    gemini: Arc<ReqwestGeminiSseClient>,
+    voice: Arc<SonicSessionVoice>,
 }
 
 impl LiveCartesiaGeminiTransports {
     pub(crate) fn new(live_runtime_enabled: bool) -> Self {
         Self {
             live_runtime_enabled,
+            gemini: Arc::new(ReqwestGeminiSseClient::shared()),
+            voice: Arc::new(SonicSessionVoice::websocket()),
         }
+    }
+
+    /// The shared HTTP pool, so the evaluator and the tool loop reuse one.
+    pub(crate) fn gemini_client(&self) -> Arc<ReqwestGeminiSseClient> {
+        Arc::clone(&self.gemini)
     }
 }
 
 #[async_trait]
 impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
+    fn open_session(&self) -> Self {
+        Self {
+            live_runtime_enabled: self.live_runtime_enabled,
+            // The HTTP pool is process-wide; the speech connection is not.
+            gemini: Arc::clone(&self.gemini),
+            voice: Arc::new(SonicSessionVoice::websocket()),
+        }
+    }
+
+    async fn close_session(&self) {
+        self.voice.close().await;
+    }
+
     async fn authorize_open(&self) -> Result<(), BrainError> {
         if self.live_runtime_enabled {
             return Ok(());
@@ -2469,7 +2525,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         request: Value,
     ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
         let started = Instant::now();
-        stream_gemini_http_with_attempt_events(&config.gemini, request)
+        stream_gemini_http_with_attempt_events(self.gemini.as_ref(), &config.gemini, request)
             .await
             .map_err(|failure| GeminiStreamAttemptFailure {
                 events: failure.events,
@@ -2486,15 +2542,16 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         cancel: &CancellationToken,
     ) -> Result<Vec<AudioFrame>, BrainError> {
         let started = Instant::now();
-        synthesize_sonic_websocket(
-            &config.sonic,
-            &config.cartesia_api_key,
-            response_id,
-            transcript,
-            cancel,
-        )
-        .await
-        .map_err(|error| failure_with_latency(error, started.elapsed()))
+        self.voice
+            .speak(
+                &config.sonic,
+                &config.cartesia_api_key,
+                response_id,
+                transcript,
+                cancel,
+            )
+            .await
+            .map_err(|error| failure_with_latency(error, started.elapsed()))
     }
 }
 
@@ -3529,6 +3586,695 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Task 4 (`ADAPTER-04`): one HTTP connection pool, one session-scoped Sonic
+    // connection, and connection state that belongs to a learner session rather
+    // than to a process-global pool or to a single turn.
+    //
+    // Every assertion below is a causal counter — accepted TCP connections,
+    // provider dials, provider closes, per-socket writes — never a timing
+    // threshold.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn gemini_two_pass_tool_loop_reuses_one_http_connection_pool() {
+        let server = GeminiKeepAliveServer::start().await;
+        let store = learning_ready_seeded_store();
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig {
+                gemini: super::super::GeminiConfig {
+                    api_key: "gemini-test-key".to_owned(),
+                    base_url: server.base_url.clone(),
+                    ..super::super::GeminiConfig::default()
+                },
+                ..CartesiaGeminiConfig::default()
+            },
+            PooledGeminiTransports::new(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner.open(session_config).await.unwrap();
+
+        session
+            .input
+            .send(BrainInput::Text("one pooled turn".to_owned()))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(10), session.events.recv())
+                .await
+                .expect("the pooled turn completes")
+                .expect("the session stays open");
+            let completed = matches!(&event, BrainEvent::ResponseCompleted { .. });
+            let failed = matches!(&event, BrainEvent::Error(_));
+            events.push(event);
+            if completed || failed {
+                break;
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BrainEvent::Error(_))),
+            "the pooled turn must succeed: {events:?}"
+        );
+
+        assert_eq!(
+            server.requests(),
+            2,
+            "the tool loop makes both Gemini passes"
+        );
+        assert_eq!(
+            server.accepted_connections(),
+            1,
+            "both passes must share one HTTP connection pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn sonic_two_turns_use_one_socket_and_distinct_contexts() {
+        let store = two_question_seeded_store();
+        let transports = SessionScopedSonicTransports::new(false);
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+
+        for bytes in [vec![1_u8, 2, 3, 4], vec![5_u8, 6, 7, 8]] {
+            session
+                .input
+                .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)))
+                .await
+                .unwrap();
+            drain_until_response_completed(&mut session).await;
+        }
+
+        assert_eq!(
+            transports.connects(),
+            1,
+            "one session-duration Sonic connection serves both response contexts"
+        );
+        let contexts = transports.generation_contexts();
+        assert_eq!(
+            contexts,
+            vec!["response-1".to_owned(), "response-2".to_owned()]
+        );
+        assert_eq!(
+            transports.closes(),
+            0,
+            "the session connection is not closed between turns"
+        );
+
+        session.input.send(BrainInput::Stop).await.unwrap();
+        drain_until_session_end(&mut session).await;
+        assert_eq!(
+            transports.closes(),
+            1,
+            "session stop closes the provider connection exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_connections_are_session_scoped_and_closed_on_stop() {
+        let store = two_question_seeded_store();
+        let transports = SessionScopedSonicTransports::new(false);
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+
+        let mut first = runner
+            .open(scripted_session_config_for(
+                "voice-session-1",
+                Some("session-a"),
+            ))
+            .await
+            .unwrap();
+        first
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+        drain_until_response_completed(&mut first).await;
+
+        // A second learner session gets its own provider session state: its own
+        // socket, its own contexts, and none of the first session's frames.
+        let mut second = runner
+            .open(scripted_session_config_for(
+                "voice-session-2",
+                Some("session-b"),
+            ))
+            .await
+            .unwrap();
+        second
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                5_u8, 6, 7, 8,
+            ])))
+            .await
+            .unwrap();
+        drain_until_response_completed(&mut second).await;
+
+        assert_eq!(
+            transports.connects(),
+            2,
+            "provider connection state is per learner session, never shared"
+        );
+        let by_context = transports.sockets_by_context();
+        assert_eq!(
+            by_context.len(),
+            2,
+            "the two sessions name distinct response contexts: {by_context:?}"
+        );
+        assert!(
+            by_context.values().all(|sockets| sockets.len() == 1),
+            "a response context belongs to exactly one session socket: {by_context:?}"
+        );
+        assert_eq!(
+            by_context
+                .values()
+                .flatten()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2,
+            "neither session may be served from the other's connection: {by_context:?}"
+        );
+
+        first.input.send(BrainInput::Stop).await.unwrap();
+        drain_until_session_end(&mut first).await;
+        assert_eq!(transports.closes(), 1);
+        second.input.send(BrainInput::Stop).await.unwrap();
+        drain_until_session_end(&mut second).await;
+        assert_eq!(
+            transports.closes(),
+            2,
+            "each session closes its own connection exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_provider_socket_is_not_returned_to_the_next_turn() {
+        let store = two_question_seeded_store();
+        // The provider closes the first connection as soon as response-1 ends.
+        let transports = SessionScopedSonicTransports::new(true);
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner
+            .open(scripted_session_config("voice-session-1"))
+            .await
+            .unwrap();
+
+        for bytes in [vec![1_u8, 2, 3, 4], vec![5_u8, 6, 7, 8]] {
+            session
+                .input
+                .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(bytes)))
+                .await
+                .unwrap();
+            drain_until_response_completed(&mut session).await;
+        }
+
+        assert_eq!(
+            transports.connects(),
+            2,
+            "a dead connection is replaced, not reused"
+        );
+        let by_context = transports.sockets_by_context();
+        assert_eq!(by_context["response-1"], vec![0_u32]);
+        assert_eq!(
+            by_context["response-2"],
+            vec![1_u32],
+            "the replacement turn must never write to the closed socket"
+        );
+    }
+
+    fn scripted_session_config(voice_session_id: &str) -> SessionConfig {
+        scripted_session_config_for(voice_session_id, None)
+    }
+
+    fn scripted_session_config_for(
+        voice_session_id: &str,
+        client_generation_id: Option<&str>,
+    ) -> SessionConfig {
+        SessionConfig {
+            session_id: Some(SessionId::new(voice_session_id)),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            client_generation_id: client_generation_id.map(ToOwned::to_owned),
+            ..SessionConfig::default()
+        }
+    }
+
+    async fn drain_until_response_completed(session: &mut RealtimeSession) {
+        loop {
+            let event = timeout(Duration::from_secs(10), session.events.recv())
+                .await
+                .expect("the turn completes")
+                .expect("the session stays open");
+            if let BrainEvent::Error(error) = &event {
+                panic!("unexpected provider failure: {error:?}");
+            }
+            if matches!(event, BrainEvent::RecapReady { .. }) {
+                return;
+            }
+        }
+    }
+
+    async fn drain_until_session_end(session: &mut RealtimeSession) {
+        while let Ok(Some(_)) = timeout(Duration::from_millis(200), session.events.recv()).await {}
+    }
+
+    /// Fixture Ink/Gemini with a counting, scriptable Sonic connection.
+    #[derive(Clone)]
+    struct SessionScopedSonicTransports {
+        inner: FakeCartesiaGeminiTransports,
+        connector: Arc<CountingSonicConnector>,
+        voice: Arc<super::super::tts::SonicSessionVoice>,
+    }
+
+    impl SessionScopedSonicTransports {
+        fn new(die_after_first_context: bool) -> Self {
+            let connector = Arc::new(CountingSonicConnector::new(die_after_first_context));
+            Self {
+                inner: FakeCartesiaGeminiTransports::new(),
+                voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::clone(
+                    &connector,
+                ))),
+                connector,
+            }
+        }
+
+        fn connects(&self) -> u32 {
+            self.connector.record().connects
+        }
+
+        fn closes(&self) -> u32 {
+            self.connector.record().closes
+        }
+
+        /// Every generation context written, in order, deduplicated.
+        fn generation_contexts(&self) -> Vec<String> {
+            let mut contexts = Vec::new();
+            for (_, value) in self.connector.record().sent {
+                if value.get("cancel").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let Some(context_id) = value["context_id"].as_str() else {
+                    continue;
+                };
+                if contexts.last().map(String::as_str) != Some(context_id) {
+                    contexts.push(context_id.to_owned());
+                }
+            }
+            contexts
+        }
+
+        /// Which socket index each response context was written on.
+        fn sockets_by_context(&self) -> std::collections::BTreeMap<String, Vec<u32>> {
+            let mut by_context: std::collections::BTreeMap<String, Vec<u32>> =
+                std::collections::BTreeMap::new();
+            for (index, value) in self.connector.record().sent {
+                let Some(context_id) = value["context_id"].as_str() else {
+                    continue;
+                };
+                let sockets = by_context.entry(context_id.to_owned()).or_default();
+                if !sockets.contains(&index) {
+                    sockets.push(index);
+                }
+            }
+            by_context
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for SessionScopedSonicTransports {
+        fn open_session(&self) -> Self {
+            Self {
+                inner: self.inner.clone(),
+                voice: Arc::new(super::super::tts::SonicSessionVoice::new(Arc::clone(
+                    &self.connector,
+                ))),
+                connector: Arc::clone(&self.connector),
+            }
+        }
+
+        async fn close_session(&self) {
+            self.voice.close().await;
+        }
+
+        async fn transcribe_audio(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            frame: &AudioFrame,
+            cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            self.inner
+                .transcribe_audio(config, response_id, frame, cancel)
+                .await
+        }
+
+        async fn stream_gemini(
+            &self,
+            config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            self.inner.stream_gemini(config, request).await
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            self.voice
+                .speak(
+                    &config.sonic,
+                    "sk_car_session_secret",
+                    response_id,
+                    transcript,
+                    cancel,
+                )
+                .await
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingSonicRecord {
+        connects: u32,
+        closes: u32,
+        sent: Vec<(u32, Value)>,
+    }
+
+    struct CountingSonicConnector {
+        record: Arc<std::sync::Mutex<CountingSonicRecord>>,
+        die_after_first_context: bool,
+    }
+
+    impl CountingSonicConnector {
+        fn new(die_after_first_context: bool) -> Self {
+            Self {
+                record: Arc::new(std::sync::Mutex::new(CountingSonicRecord::default())),
+                die_after_first_context,
+            }
+        }
+
+        fn record(&self) -> CountingSonicRecord {
+            self.record.lock().expect("record lock poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicConnector for CountingSonicConnector {
+        type Socket = CountingSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, BrainError> {
+            let index = {
+                let mut record = self.record.lock().expect("record lock poisoned");
+                let index = record.connects;
+                record.connects += 1;
+                index
+            };
+            Ok(CountingSonicSocket {
+                index,
+                record: Arc::clone(&self.record),
+                pending: std::collections::VecDeque::new(),
+                open: true,
+                die_after_first_context: self.die_after_first_context,
+                contexts_finished: 0,
+            })
+        }
+    }
+
+    /// Answers every finalized generation with one chunk plus `done` for that
+    /// context, so a multiplexed connection can serve many response contexts.
+    struct CountingSonicSocket {
+        index: u32,
+        record: Arc<std::sync::Mutex<CountingSonicRecord>>,
+        pending: std::collections::VecDeque<String>,
+        open: bool,
+        die_after_first_context: bool,
+        contexts_finished: u32,
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicSocket for CountingSonicSocket {
+        async fn send_json(&mut self, value: Value) -> Result<(), BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent
+                .push((self.index, value.clone()));
+            if !self.open {
+                return Err(brain_failure(BrainProviderFailureParts {
+                    failure_class: BrainFailureClass::NetworkDisconnect,
+                    stage: BrainFailureStage::Transport,
+                    retry_eligible: true,
+                    latency_ms: 0,
+                    provider: "cartesia".to_owned(),
+                    model: "cartesia-sonic".to_owned(),
+                    metadata: "stage=cartesia_sonic error_kind=send_failed".to_owned(),
+                }));
+            }
+            if value.get("cancel").and_then(Value::as_bool) == Some(true) {
+                return Ok(());
+            }
+            if value.get("continue").and_then(Value::as_bool) == Some(false) {
+                let context_id = value["context_id"]
+                    .as_str()
+                    .expect("every generation names its context")
+                    .to_owned();
+                self.pending.push_back(format!(
+                    r#"{{"type":"chunk","context_id":"{context_id}","data":"AQI="}}"#
+                ));
+                self.pending
+                    .push_back(format!(r#"{{"type":"done","context_id":"{context_id}"}}"#));
+            }
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
+            let next = self.pending.pop_front();
+            if next
+                .as_deref()
+                .is_some_and(|text| text.contains(r#""type":"done""#))
+            {
+                self.contexts_finished += 1;
+                if self.die_after_first_context && self.contexts_finished == 1 {
+                    // The provider hangs up as soon as the response ends.
+                    self.open = false;
+                }
+            }
+            Ok(next)
+        }
+
+        fn is_open(&self) -> bool {
+            self.open
+        }
+
+        async fn close(&mut self) -> Result<(), BrainError> {
+            self.open = false;
+            self.record.lock().expect("record lock poisoned").closes += 1;
+            Ok(())
+        }
+    }
+
+    /// A local keep-alive HTTP/1.1 server that counts accepted TCP connections
+    /// and serves the two `streamGenerateContent` passes of one tool loop.
+    struct GeminiKeepAliveServer {
+        base_url: String,
+        record: Arc<std::sync::Mutex<(u32, u32)>>,
+    }
+
+    impl GeminiKeepAliveServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port is available");
+            let port = listener.local_addr().expect("bound address").port();
+            let record = Arc::new(std::sync::Mutex::new((0_u32, 0_u32)));
+            let served = Arc::clone(&record);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    served.lock().expect("server lock poisoned").0 += 1;
+                    let served = Arc::clone(&served);
+                    tokio::spawn(async move {
+                        serve_gemini_connection(stream, served).await;
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                record,
+            }
+        }
+
+        fn accepted_connections(&self) -> u32 {
+            self.record.lock().expect("server lock poisoned").0
+        }
+
+        fn requests(&self) -> u32 {
+            self.record.lock().expect("server lock poisoned").1
+        }
+    }
+
+    async fn serve_gemini_connection(
+        mut stream: tokio::net::TcpStream,
+        record: Arc<std::sync::Mutex<(u32, u32)>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buffer = Vec::new();
+        let mut scratch = [0_u8; 4096];
+        loop {
+            // Read one complete request: headers, then exactly Content-Length bytes.
+            let head_end = loop {
+                if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                match stream.read(&mut scratch).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => buffer.extend_from_slice(&scratch[..read]),
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+            let content_length = head
+                .split("\r\n")
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or_default();
+            while buffer.len() < head_end + content_length {
+                match stream.read(&mut scratch).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => buffer.extend_from_slice(&scratch[..read]),
+                }
+            }
+            let request_body =
+                String::from_utf8_lossy(&buffer[head_end..head_end + content_length]).to_string();
+            buffer.drain(..head_end + content_length);
+
+            let pass = {
+                let mut record = record.lock().expect("server lock poisoned");
+                record.1 += 1;
+                record.1
+            };
+            // The first pass proposes the evaluation tool; the second speaks.
+            let body = if pass == 1 && !request_body.contains("functionResponse") {
+                concat!(
+                    r#"data: {"candidates":[{"content":{"parts":[{"functionCall":"#,
+                    r#"{"id":"call-eval-1","name":"evaluate_spoken_answer","args":{}}}]}}],"#,
+                    r#""usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":3}}"#,
+                    "\n\n"
+                )
+                .to_owned()
+            } else {
+                concat!(
+                    r#"data: {"candidates":[{"content":{"parts":[{"text":"#,
+                    r#""Thanks - here is the next question."}]}}],"#,
+                    r#""usageMetadata":{"promptTokenCount":13,"candidatesTokenCount":5}}"#,
+                    "\n\n"
+                )
+                .to_owned()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            if stream.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Fixture Ink/Sonic with a live, pooled Gemini client.
+    #[derive(Clone)]
+    struct PooledGeminiTransports {
+        inner: FakeCartesiaGeminiTransports,
+        live: LiveCartesiaGeminiTransports,
+    }
+
+    impl PooledGeminiTransports {
+        fn new() -> Self {
+            Self {
+                inner: FakeCartesiaGeminiTransports::new(),
+                live: LiveCartesiaGeminiTransports::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for PooledGeminiTransports {
+        async fn transcribe_audio(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            frame: &AudioFrame,
+            cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            self.inner
+                .transcribe_audio(config, response_id, frame, cancel)
+                .await
+        }
+
+        async fn stream_gemini(
+            &self,
+            config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            self.live.stream_gemini(config, request).await
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            transcript: &str,
+            interrupt: FakeRuntimeInterrupt,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            self.inner
+                .synthesize_sonic(config, response_id, transcript, interrupt, cancel)
+                .await
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Task 3 (`ADAPTER-03`): a cancelled speech context never becomes audio,
     // even when the provider finishes generating it anyway.
     //
@@ -3754,9 +4500,9 @@ mod tests {
             cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             super::super::tts::synthesize_sonic_with_connector(
-                &ScriptedSonicConnector {
+                Arc::new(ScriptedSonicConnector {
                     script: Arc::clone(&self.script),
-                },
+                }),
                 &config.sonic,
                 "sk_car_scripted_secret",
                 response_id,
