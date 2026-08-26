@@ -1126,10 +1126,11 @@ pub async fn build_study_store(
     let pool = data::connect_pg(&pg_config)
         .await
         .map_err(|error| ServiceConfigError::StudyStoreInit(error.to_string()))?;
+    // `SERVICE-013`: connect and run idempotent migrations, and nothing else.
+    // Startup writes no application row — it does not seed, restore, or resurrect
+    // one — so a restart cannot undo a deletion, and there is no production seed
+    // toggle that could put the behaviour back.
     data::run_migrations(&pool)
-        .await
-        .map_err(|error| ServiceConfigError::StudyStoreInit(error.to_string()))?;
-    data::seed_postgres_fixture(&pool)
         .await
         .map_err(|error| ServiceConfigError::StudyStoreInit(error.to_string()))?;
     Ok(Arc::new(data::PostgresStudyStore::new(pool)))
@@ -3173,5 +3174,121 @@ mod tests {
             "2001:db8::/129".parse::<IpNetwork>(),
             Err(IpNetworkError::InvalidPrefix)
         );
+    }
+}
+
+/// `SERVICE-013`: normal service startup may connect and run idempotent
+/// migrations. It must not seed, restore, or mutate application rows. Fixture
+/// setup stays explicit, in tests and development commands, outside
+/// `build_study_store`.
+#[cfg(test)]
+mod postgres_startup_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    const FIXTURE_DOCUMENT_ID: &str = "22222222-2222-4222-8222-222222222222";
+    const FIXTURE_SOURCE_ID: &str = "33333333-3333-4333-8333-333333333333";
+    const FIXTURE_CONCEPT_ID: &str = "55555555-5555-4555-8555-555555555555";
+
+    #[tokio::test]
+    #[ignore = "requires SERVICE_POSTGRES_REQUIRED=1 and a disposable PostgreSQL 16 DATABASE_URL"]
+    async fn postgres_startup_does_not_resurrect_fixture() {
+        let database_url = required_service_postgres_url();
+        let pool = data::connect_pg(&data::PgConfig::new(database_url.clone()))
+            .await
+            .expect("isolated postgres should connect");
+        data::run_migrations(&pool)
+            .await
+            .expect("migrations should run");
+        data::seed_postgres_fixture(&pool)
+            .await
+            .expect("explicit test fixture seed should run");
+
+        let before: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM study_documents), \
+                    (SELECT COUNT(*) FROM source_spans), \
+                    (SELECT COUNT(*) FROM concepts)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row counts should load");
+
+        sqlx::query("UPDATE study_documents SET deleted_at = NOW() WHERE id = $1")
+            .bind(Uuid::parse_str(FIXTURE_DOCUMENT_ID).expect("document UUID"))
+            .execute(&pool)
+            .await
+            .expect("document should tombstone");
+        sqlx::query("UPDATE source_spans SET deleted_at = NOW() WHERE id = $1")
+            .bind(Uuid::parse_str(FIXTURE_SOURCE_ID).expect("source UUID"))
+            .execute(&pool)
+            .await
+            .expect("source should tombstone");
+        sqlx::query("UPDATE concepts SET label = 'deletion-sentinel' WHERE id = $1")
+            .bind(Uuid::parse_str(FIXTURE_CONCEPT_ID).expect("concept UUID"))
+            .execute(&pool)
+            .await
+            .expect("concept sentinel should persist");
+
+        let config = ServiceConfig {
+            database_url: Some(database_url),
+            ..ServiceConfig::default()
+        };
+        drop(
+            build_study_store(&config)
+                .await
+                .expect("first startup should succeed"),
+        );
+        drop(
+            build_study_store(&config)
+                .await
+                .expect("second startup should succeed"),
+        );
+
+        let after: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM study_documents), \
+                    (SELECT COUNT(*) FROM source_spans), \
+                    (SELECT COUNT(*) FROM concepts)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row counts should reload");
+        assert_eq!(after, before);
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NOT NULL FROM study_documents WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(FIXTURE_DOCUMENT_ID).expect("document UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("document tombstone should load"));
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NOT NULL FROM source_spans WHERE id = $1",
+        )
+        .bind(Uuid::parse_str(FIXTURE_SOURCE_ID).expect("source UUID"))
+        .fetch_one(&pool)
+        .await
+        .expect("source tombstone should load"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT label FROM concepts WHERE id = $1")
+                .bind(Uuid::parse_str(FIXTURE_CONCEPT_ID).expect("concept UUID"))
+                .fetch_one(&pool)
+                .await
+                .expect("concept label should load"),
+            "deletion-sentinel",
+        );
+    }
+
+    /// The flag and the URL are both required. A missing one fails the gate
+    /// rather than returning quietly, so a skipped run can never be read as
+    /// evidence.
+    fn required_service_postgres_url() -> String {
+        assert_eq!(
+            std::env::var("SERVICE_POSTGRES_REQUIRED").as_deref(),
+            Ok("1"),
+            "service durable tests require SERVICE_POSTGRES_REQUIRED=1",
+        );
+        std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .expect("SERVICE_POSTGRES_REQUIRED=1 requires a non-empty DATABASE_URL")
     }
 }
