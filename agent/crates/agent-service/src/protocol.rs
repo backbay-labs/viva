@@ -3810,11 +3810,16 @@ mod tests {
 
         // The 20 ms production turn ends at sequence 2,249; smaller valid chunks push
         // the final sequence past it while the aggregate bounds stay identical.
-        assert_eq!(2_250 * 960, VIVA_AUDIO_MAX_TURN_BYTES);
-        assert_eq!(4_500 * 480, VIVA_AUDIO_MAX_TURN_BYTES);
-        assert!(4_500 - 1 > 2_250 - 1);
-        assert!(263 * VIVA_AUDIO_MAX_CHUNK_BYTES <= VIVA_AUDIO_MAX_TURN_BYTES);
-        assert!(264 * VIVA_AUDIO_MAX_CHUNK_BYTES > VIVA_AUDIO_MAX_TURN_BYTES);
+        // These are deliberate frame-size contract pins: they fail the moment a
+        // constant moves, which is exactly why they read as constant to clippy.
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert_eq!(2_250 * 960, VIVA_AUDIO_MAX_TURN_BYTES);
+            assert_eq!(4_500 * 480, VIVA_AUDIO_MAX_TURN_BYTES);
+            assert!(4_500 - 1 > 2_250 - 1);
+            assert!(263 * VIVA_AUDIO_MAX_CHUNK_BYTES <= VIVA_AUDIO_MAX_TURN_BYTES);
+            assert!(264 * VIVA_AUDIO_MAX_CHUNK_BYTES > VIVA_AUDIO_MAX_TURN_BYTES);
+        }
     }
 
     /// `VOICE-AUTH-001` / `VOICE-REFRESH-001` / `VOICE-AUTHORITY-001`. Every v5 client
@@ -4753,7 +4758,7 @@ mod tests {
             assert!(ids.insert(outcome.id.as_str()), "{} duplicated", outcome.id);
             let classified = classify_voice_termination(&outcome.input);
             assert_eq!(
-                serde_json::to_value(&classified).expect("classification serializes"),
+                serde_json::to_value(classified).expect("classification serializes"),
                 outcome.expected,
                 "{}",
                 outcome.id
