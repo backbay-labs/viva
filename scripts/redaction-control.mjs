@@ -904,6 +904,350 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*\/\/\ scans\ clean\ and\ filters\ to\ `answer_text`\.\ Scanning\ only\ the\ raw\ form\s*$/,
     ]),
   },
+  // A-16 (2026-08-26): coordinator-applied sanction rows for Plan 07 live-adapter
+  // sources (node 07 admission), generated from the audit own detection over the
+  // lane diff, keyed by BOTH the evidence marker and the structural field each
+  // line trips. Anchored literals of reviewed lines only; api_key/Bearer rows
+  // are parameter/validation/header code, never values or logs. Plan 12
+  // reconciles the whole block at 12B.
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ "NADH\ donates\ electrons"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "the\ learner\ answer"\.to_owned\(\),\s*$/,
+      /^\s*assert!\(serialized\.contains\(\&request\.answer_text\)\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*let\ api_key\ =\ HeaderValue::from_str\(\&request\.api_key\)\.map_err\(\|_\|\ \{\s*$/,
+      /^\s*api_key:\ format!\("\{GEMINI_TOKEN_MARKER\}\\u\{7f\}\\u\{1\}"\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*\/\/\ allowlisted\ diagnostic\ code\.\ No\ provider\ body,\ prompt,\ audio,\ token,\ URL,\s*$/,
+      /^\s*prompt:\ "State\ the\ two\ claims\."\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*fn\ gemini_request_carries_only_server_trusted_source_context\(\)\ \{\s*$/,
+      /^\s*\/\/\ browser\-forged\ `trusted_source_context`\ turn\ in\ the\ conversation\ must\s*$/,
+      /^\s*"name":\ "trusted_source_context",\s*$/,
+      /^\s*!declared\.iter\(\)\.any\(\|name\|\ name\ ==\ "trusted_source_context"\),\s*$/,
+      /^\s*!serialized\.contains\("trusted_source_context"\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+    marker: "status_token",
+    patterns: Object.freeze([
+      /^\s*fn\ hostile_gemini_error_body\(status_token:\ \&str\)\ \->\ String\ \{\s*$/,
+      /^\s*r\#"\{\{"error":\{\{"code":429,"status":"\{status_token\}","message":"\{GEMINI_BODY_MARKER\}\ \{GEMINI_PROMPT_MARKER\}\ \{GEMINI_AUDIO_MARKER\}\ \{GEMINI_TOKEN_MARKER\}\ \{GEMINI_URL_MARKER\}\ \{GEMINI_QUERY_MARKER\}\ \{GEMINI_TRANSCRIPT_MARKER\}"\}\}\}\}"\#\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/mod.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*let\ answer_text\ =\ first_user_text\(\&request\)\s*$/,
+      /^\s*"answer_text":\ answer_text,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/mod.rs",
+    marker: "cancellation_token",
+    patterns: Object.freeze([
+      /^\s*\&CancellationToken::new\(\),\s*$/,
+      /^\s*let\ cancel\ =\ CancellationToken::new\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/mod.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*let\ Some\(SonicEvent::Audio\ \{\ pcm16_base64,\ \.\.\ \}\)\ =\ parse_sonic_event\(\&sonic\.to_string\(\)\)\s*$/,
+      /^\s*let\ frame\ =\ AudioFrame::from_base64\(pcm16_base64\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/mod.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*\/\/\ request\ URL\ or\ query,\ prompt,\ transcript,\ answer,\ audio,\ or\ credential\ has\ no\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/projection.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ Every\ graded\ field\ is\ copied\ from\ the\ outcome\.\ `answer_text`\ is\ the\s*$/,
+      /^\s*answer_text:\ \&str,\s*$/,
+      /^\s*answer_text:\ answer_text\.to_owned\(\),\s*$/,
+      /^\s*assert_eq!\(evaluation\.answer_text,\ "the\ answer"\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([
+      /^\s*cartesia_api_key:\ String::new\(\),\s*$/,
+      /^\s*cartesia_api_key:\ "sk_car_live_label_probe"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ \&str,\s*$/,
+      /^\s*let\ evaluation\ =\ answer_evaluation_from_outcome\(\&outcome,\ answer_text,\ \&source,\ question\)\?;\s*$/,
+      /^\s*"answer_text":\ "a\ spoken\ answer",\s*$/,
+      /^\s*answer_text:\ "the\ learner\ answer"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*api_key:\ "gemini\-live\-label\-probe"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "cancellation_token",
+    patterns: Object.freeze([
+      /^\s*cancelled:\ CancellationToken::new\(\),\s*$/,
+      /^\s*let\ cancel\ =\ CancellationToken::new\(\);\s*$/,
+      /^\s*let\ idle_cancellation\ =\ CancellationToken::new\(\);\s*$/,
+      /^\s*if\ cancelled\.is_some_and\(CancellationToken::is_cancelled\)\ \{\s*$/,
+      /^\s*\&CancellationToken::new\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "cartesia_api_key",
+    patterns: Object.freeze([
+      /^\s*cartesia_api_key:\ String::new\(\),\s*$/,
+      /^\s*cartesia_api_key:\ "sk_car_live_label_probe"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*follow_up\.prompt\ =\ "Explain\ what\ the\ proton\ gradient\ powers\."\.to_owned\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([
+      /^\s*transcribe_ink_websocket\(\&config\.ink,\ \&config\.cartesia_api_key,\ frame,\ cancel\)\s*$/,
+      /^\s*\.extend\(\&config\.sonic,\ \&config\.cartesia_api_key,\ response_id,\ text\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*api_key:\ "gemini\-test\-key"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*authorization:\ F,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
+    marker: "cartesia_api_key",
+    patterns: Object.freeze([
+      /^\s*transcribe_ink_websocket\(\&config\.ink,\ \&config\.cartesia_api_key,\ frame,\ cancel\)\s*$/,
+      /^\s*\.extend\(\&config\.sonic,\ \&config\.cartesia_api_key,\ response_id,\ text\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/stt.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*let\ authorization\ =\ HeaderValue::from_str\(\&format!\("Bearer\ \{api_key\}"\)\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/stt.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*transcribe_ink_with_connector\(\&WebSocketInkConnector,\ config,\ api_key,\ frame,\ cancel\)\.await\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/stt.rs",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*let\ authorization\ =\ HeaderValue::from_str\(\&format!\("Bearer\ \{api_key\}"\)\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/stt.rs",
+    marker: "cancellation_token",
+    patterns: Object.freeze([
+      /^\s*\&CancellationToken::new\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*let\ authorization\ =\ HeaderValue::from_str\(\&format!\("Bearer\ \{api_key\}"\)\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*\.extend\(config,\ api_key,\ context_id,\ transcript\)\s*$/,
+      /^\s*api_key:\ \&str,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*let\ authorization\ =\ HeaderValue::from_str\(\&format!\("Bearer\ \{api_key\}"\)\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
+    marker: "cancellation_token",
+    patterns: Object.freeze([
+      /^\s*\&CancellationToken::new\(\),\s*$/,
+      /^\s*let\ cancel\ =\ CancellationToken::new\(\);\s*$/,
+      /^\s*let\ replacement\ =\ CancellationToken::new\(\);\s*$/,
+      /^\s*\.finish\(\&config,\ "response\-2",\ \&CancellationToken::new\(\),\ \&mut\ heard\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*let\ frame\ =\ AudioFrame::from_base64\(pcm16_base64\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/synthetic.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ answer\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/synthetic.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*Some\(prompt\)\ =>\ format!\("\{concise_feedback\}\ \{prompt\}"\),\s*$/,
+      /^\s*prompt:\ "Trace\ the\ electrons\."\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/src/synthetic.rs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*ConceptStatus,\ RealtimeBrain,\ SessionId,\ SourceConfidence,\ SourceContext,\ StudyMode,\s*$/,
+      /^\s*\/\/\/\ Values\ a\ hostile\ browser\ could\ put\ in\ `SessionConfig\.source_context`\.\s*$/,
+      /^\s*fn\ forged_source_context\(\)\ \->\ Vec<SourceContext>\ \{\s*$/,
+      /^\s*\/\/\/\ A\ browser\ can\ put\ anything\ in\ `SessionConfig\.source_context`\.\ It\ is\ not\s*$/,
+      /^\s*source_context:\ forged_source_context\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([
+      /^\s*cartesia_api_key:\ "viva\-release\-check\-cartesia\-placeholder\-key"\.to_owned\(\),\s*$/,
+      /^\s*cartesia_api_key:\ "cartesia\-loopback\-key"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ evaluation's\ `answer_text`\ can\ be\ compared\ with\ the\ fixture's\.\s*$/,
+      /^\s*"answer_text":\ "NADH\ donates\ electrons\ to\ the\ chain\ and\ pumps\ protons\.",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "api_key",
+    patterns: Object.freeze([
+      /^\s*api_key:\ "viva\-release\-check\-gemini\-placeholder\-key"\.to_owned\(\),\s*$/,
+      /^\s*api_key:\ "gemini\-loopback\-key"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "cartesia_api_key",
+    patterns: Object.freeze([
+      /^\s*cartesia_api_key:\ "viva\-release\-check\-cartesia\-placeholder\-key"\.to_owned\(\),\s*$/,
+      /^\s*cartesia_api_key:\ "cartesia\-loopback\-key"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "pcm16_base64",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ constructors\ and\ reads\ them\ back\ through\ the\ borrowed\ `pcm16_base64\(\)`\s*$/,
+      /^\s*AudioFrame::from_base64\(frame\.pcm16_base64\(\)\)\.expect\("cached\ base64\ decodes"\),\s*$/,
+      /^\s*const\ ALLOWED_FRAME_ACCESSORS:\ \[\&str;\ 3\]\ =\ \["pcm16_bytes",\ "pcm16_bytes_owned",\ "pcm16_base64"\];\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*follow_up\.prompt\ =\ "Explain\ what\ the\ proton\ gradient\ powers\."\.to_owned\(\);\s*$/,
+      /^\s*prompt:\ "Trace\ the\ electrons\ from\ NADH\ through\ the\ chain\."\.to_owned\(\),\s*$/,
+      /^\s*prompt:\ "Name\ the\ two\ treaties\ that\ ended\ the\ war\ and\ say\ which\ came\ first\."\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*!body\.contains\("session_token"\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*BrainEvent::TranscriptFinal\ \{\ \.\.\ \}\ =>\ "transcript_final",\s*$/,
+      /^\s*"transcript_final",\s*$/,
+      /^\s*\/\/\/\ The\ fixture's\ own\ `transcript_final\.confidence`\.\ Plan\ 05\ freezes\ it\ as\s*$/,
+      /^\s*let\ finals\ =\ bound\("transcript_final"\);\s*$/,
+      /^\s*\.filter\(\|event\|\ event\["type"\]\ ==\ "transcript_final"\)\s*$/,
+      /^\s*"transcript_final:\{response_id\}:confidence=\{\}",\s*$/,
+      /^\s*"transcript_final:response\-1:confidence=none",\s*$/,
+      /^\s*"transcript_final:response\-2:confidence=none",\s*$/,
+      /^\s*"transcript_final:fake\-cartesia\-gemini\-session\-response\-1:confidence=none",\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
+    marker: "viva-release-check-gemini-placeholder-key",
+    patterns: Object.freeze([
+      /^\s*api_key:\ "viva\-release\-check\-gemini\-placeholder\-key"\.to_owned\(\),\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
