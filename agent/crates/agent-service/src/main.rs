@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     .with_trusted_study_set_id(config.trusted_study_set_id)
     .with_trusted_session_id(config.trusted_session_id)
     .with_operator_access(config.operator_access)
+    .with_recorder_limits(config.recorder_limits)
     .with_ws_timeouts(config.ws_timeouts)
     .with_turn_cap_override(config.max_turn_duration_overridden)
     .with_voice_limits(config.voice_limits)

@@ -22,9 +22,9 @@ use agent_domain::{
 };
 use agent_service::{
     build_router, AppState, ClientFrame, ClientTurnIntent, FailureControlConfig,
-    FailureControlScenario, OperatorAccess, ServerFrame, VivaServerEvent, VoiceDrainSignal,
-    VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode, VoiceWsAccess, WsTimeouts,
-    VIVA_VOICE_PROTOCOL_VERSION,
+    FailureControlScenario, OperatorAccess, RecorderLimits, ServerFrame, VivaServerEvent,
+    VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig, VoiceServerErrorCode,
+    VoiceUsageRecorder, VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -37,7 +37,7 @@ use base64::{
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
-use observe::{VoiceEvidenceEventKind, VoiceUsageEvent};
+use observe::{VoiceEvidenceEvent, VoiceEvidenceEventKind, VoiceUsageEvent};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::ErrorKind;
@@ -646,6 +646,270 @@ async fn readiness_operator_auth_keeps_live_public_and_minimal() {
     assert_eq!(parsed, serde_json::json!({ "live": true }));
     assert!(!body.contains(FIXTURE_OPERATOR_CREDENTIAL));
     assert!(!body.contains("session-secret"));
+}
+
+/// `SERVICE-005`: a long-lived process must not accumulate telemetry forever. The
+/// recorders keep at most `capacity` newest sanitized events while their counters
+/// and aggregates keep counting every event that was ever recorded.
+#[test]
+fn recorder_retention_is_bounded() {
+    const CAPACITY: usize = 257;
+    const RECORDED: u64 = 1_000_000;
+
+    let evidence = VoiceEvidenceRecorder::with_capacity(CAPACITY);
+    let usage = VoiceUsageRecorder::with_capacity(CAPACITY);
+    let per_event_usage = BrainUsage {
+        audio_input_tokens: 3,
+        text_input_tokens: 1,
+        audio_output_tokens: 4,
+        text_output_tokens: 2,
+        ..BrainUsage::default()
+    };
+    let per_event_cost = observe::CostModel::default().estimate_usd(&per_event_usage);
+
+    for index in 0..RECORDED {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            format!("deterministic_event_{index}"),
+        ));
+        usage.record(
+            None,
+            "synthetic",
+            "synthetic-viva",
+            per_event_usage.clone(),
+            1,
+            None,
+        );
+    }
+
+    let evidence_stats = evidence.stats();
+    assert_eq!(evidence_stats.capacity, CAPACITY);
+    assert_eq!(evidence_stats.retained, CAPACITY);
+    assert_eq!(evidence_stats.total_recorded, RECORDED);
+    assert_eq!(evidence_stats.dropped, RECORDED - CAPACITY as u64);
+    assert_eq!(evidence_stats.dropped, 999_743);
+
+    let retained = evidence.snapshot();
+    assert_eq!(retained.len(), CAPACITY);
+    assert_eq!(
+        retained.first().expect("oldest retained event").detail,
+        format!("deterministic_event_{}", RECORDED - CAPACITY as u64)
+    );
+    assert_eq!(
+        retained.last().expect("newest retained event").detail,
+        format!("deterministic_event_{}", RECORDED - 1)
+    );
+
+    let usage_stats = usage.stats();
+    assert_eq!(usage_stats.capacity, CAPACITY);
+    assert_eq!(usage_stats.retained, CAPACITY);
+    assert_eq!(usage_stats.total_recorded, RECORDED);
+    assert_eq!(usage_stats.dropped, 999_743);
+    assert_eq!(usage.snapshot().len(), CAPACITY);
+
+    // The aggregate counted every event, including the 999,743 already evicted.
+    let aggregate = usage.aggregate();
+    assert_eq!(aggregate.prompt_tokens, RECORDED * 4);
+    assert_eq!(aggregate.completion_tokens, RECORDED * 6);
+    assert_eq!(aggregate.total_tokens, RECORDED * 10);
+    assert_eq!(aggregate.invalid_cost_events, 0);
+    let expected_cost = per_event_cost * RECORDED as f64;
+    assert!(
+        (aggregate.estimated_cost_usd - expected_cost).abs() <= expected_cost * 1e-9,
+        "estimated cost {} drifted from {expected_cost}",
+        aggregate.estimated_cost_usd
+    );
+}
+
+/// The zero-capacity negative control: retention is off, accounting is not.
+#[test]
+fn recorder_zero_capacity_retains_nothing_and_keeps_counting() {
+    let evidence = VoiceEvidenceRecorder::with_capacity(0);
+    let usage = VoiceUsageRecorder::with_capacity(0);
+
+    for index in 0..8_u64 {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            format!("zero_capacity_event_{index}"),
+        ));
+        usage.record(
+            None,
+            "synthetic",
+            "synthetic-viva",
+            BrainUsage {
+                text_input_tokens: 5,
+                text_output_tokens: 7,
+                ..BrainUsage::default()
+            },
+            1,
+            None,
+        );
+    }
+
+    assert!(evidence.snapshot().is_empty());
+    assert!(usage.snapshot().is_empty());
+    assert_eq!(
+        (
+            evidence.stats().capacity,
+            evidence.stats().retained,
+            evidence.stats().total_recorded,
+            evidence.stats().dropped
+        ),
+        (0, 0, 8, 8)
+    );
+    assert_eq!(
+        (
+            usage.stats().capacity,
+            usage.stats().retained,
+            usage.stats().total_recorded,
+            usage.stats().dropped
+        ),
+        (0, 0, 8, 8)
+    );
+    let aggregate = usage.aggregate();
+    assert_eq!(aggregate.prompt_tokens, 40);
+    assert_eq!(aggregate.completion_tokens, 56);
+    assert_eq!(aggregate.total_tokens, 96);
+}
+
+/// Hostile strings never reach retention. `provider` and `model` are server-chosen
+/// identifiers; a signed credential, a bearer header, transcript prose, or a base64
+/// audio blob offered in their place is replaced before it can be retained.
+const HOSTILE_SIGNED_CREDENTIAL: &str = "viva1.eyJ1c2VyX2lkIjoidXNlci0xIn0.c2ln";
+const HOSTILE_AUTHORIZATION_VALUE: &str = "Bearer viva-fixture-hostile-credential";
+const HOSTILE_TRANSCRIPT_TEXT: &str = "the mitochondria is the powerhouse of the cell";
+const HOSTILE_BASE64_AUDIO: &str =
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAAAAAAAAAAAAAAA";
+
+fn hostile_recorder_values() -> [&'static str; 4] {
+    [
+        HOSTILE_SIGNED_CREDENTIAL,
+        HOSTILE_AUTHORIZATION_VALUE,
+        HOSTILE_TRANSCRIPT_TEXT,
+        HOSTILE_BASE64_AUDIO,
+    ]
+}
+
+/// The two retention boundaries make different guarantees, and each is asserted
+/// where it holds. `provider` and `model` are server-chosen identifiers, so every
+/// hostile class is replaced before retention. An evidence `detail` is
+/// server-authored prose that the shared sanitizing constructor scans for
+/// credential markers, so the credential-shaped classes are redacted there.
+/// Readiness JSON carries only counts, so none of the four ever reaches it — that
+/// half is asserted by `readiness_recorder_aggregates_carry_no_subject_material`.
+#[test]
+fn recorder_sanitizes_hostile_event_provider_and_model_values() {
+    let evidence = VoiceEvidenceRecorder::with_capacity(64);
+    let usage = VoiceUsageRecorder::with_capacity(64);
+
+    for hostile in hostile_recorder_values() {
+        evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            None,
+            hostile,
+        ));
+        usage.record(None, hostile, hostile, BrainUsage::default(), 1, None);
+    }
+
+    let evidence_json = serde_json::to_string(&evidence.snapshot()).unwrap();
+    let usage_json = serde_json::to_string(&usage.snapshot()).unwrap();
+    for hostile in [HOSTILE_SIGNED_CREDENTIAL, HOSTILE_AUTHORIZATION_VALUE] {
+        assert!(
+            !evidence_json.contains(hostile),
+            "evidence retention leaked credential-shaped material"
+        );
+    }
+    for hostile in hostile_recorder_values() {
+        assert!(
+            !usage_json.contains(hostile),
+            "usage retention leaked a hostile value"
+        );
+    }
+    for retained in usage.snapshot() {
+        assert_eq!(retained.provider, "redacted_usage_label");
+        assert_eq!(retained.model, "redacted_usage_label");
+    }
+    assert_eq!(
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| event.detail == "redacted_evidence_detail")
+            .count(),
+        2,
+        "both credential-shaped details must be redacted before retention"
+    );
+}
+
+#[tokio::test]
+async fn readiness_recorder_aggregates_carry_no_subject_material() {
+    let state = operator_auth_test_state().with_recorder_limits(RecorderLimits {
+        evidence_events: 8,
+        usage_events: 4,
+    });
+    for hostile in hostile_recorder_values() {
+        state.evidence.record(VoiceEvidenceEvent::new(
+            VoiceEvidenceEventKind::StoreCounts,
+            Some(hostile.to_owned()),
+            hostile,
+        ));
+        state.usage.record(
+            Some(hostile),
+            hostile,
+            hostile,
+            BrainUsage {
+                text_input_tokens: 2,
+                text_output_tokens: 3,
+                ..BrainUsage::default()
+            },
+            1,
+            None,
+        );
+    }
+    let app = build_router(state);
+
+    let (status, body) = operator_route_response(
+        &app,
+        "/health/brain",
+        Some(&format!("Bearer {FIXTURE_OPERATOR_CREDENTIAL}")),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["usage"]["events"], 4);
+    assert_eq!(payload["usage"]["prompt_tokens"], 8);
+    assert_eq!(payload["usage"]["completion_tokens"], 12);
+    assert_eq!(payload["usage"]["total_tokens"], 20);
+    assert_eq!(payload["usage"]["invalid_cost_events"], 0);
+    assert_eq!(payload["usage"]["retention"]["capacity"], 4);
+    assert_eq!(payload["usage"]["retention"]["retained"], 4);
+    assert_eq!(payload["usage"]["retention"]["total_recorded"], 4);
+    assert_eq!(payload["usage"]["retention"]["dropped"], 0);
+    assert_eq!(payload["evidence"]["capacity"], 8);
+    assert_eq!(payload["evidence"]["retained"], 4);
+    assert_eq!(payload["evidence"]["total_recorded"], 4);
+    assert_eq!(payload["evidence"]["dropped"], 0);
+
+    for forbidden in hostile_recorder_values() {
+        assert!(
+            !body.contains(forbidden),
+            "readiness JSON leaked a forbidden value"
+        );
+    }
+    for forbidden in [
+        "user-1",
+        "voice-session-1",
+        "biology-midterm",
+        "session-secret",
+        FIXTURE_OPERATOR_CREDENTIAL,
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "readiness JSON leaked subject or credential material"
+        );
+    }
 }
 
 #[tokio::test]

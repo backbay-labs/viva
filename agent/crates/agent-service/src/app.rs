@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, RwLock,
@@ -29,8 +29,8 @@ use uuid::Uuid;
 use crate::{
     config::{
         bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
-        FailureControlConfig, OperatorAccess, RedactedSecret, SessionTokenClaims, VoiceLimitConfig,
-        VoiceWsAccess,
+        FailureControlConfig, OperatorAccess, RecorderLimits, RedactedSecret, SessionTokenClaims,
+        VoiceLimitConfig, VoiceWsAccess,
     },
     ws::voice_ws,
 };
@@ -135,6 +135,14 @@ impl AppState {
 
     pub fn with_operator_access(mut self, operator_access: OperatorAccess) -> Self {
         self.operator_access = operator_access;
+        self
+    }
+
+    /// Rebuilds both voice recorders against the configured retention bound. It
+    /// runs at startup, before any event exists, so no retained event is lost.
+    pub fn with_recorder_limits(mut self, recorder_limits: RecorderLimits) -> Self {
+        self.evidence = VoiceEvidenceRecorder::with_capacity(recorder_limits.evidence_events);
+        self.usage = VoiceUsageRecorder::with_capacity(recorder_limits.usage_events);
         self
     }
 
@@ -998,33 +1006,190 @@ impl VoiceDrainSignal {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// `SERVICE-005`: what a caller may read about retention without walking the
+/// retained events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct RecorderStats {
+    pub capacity: usize,
+    pub retained: usize,
+    pub total_recorded: u64,
+    pub dropped: u64,
+}
+
+/// A bounded newest-wins window over recorded events. `record` is O(1) and the
+/// counters keep counting long after the window has started evicting.
+#[derive(Debug)]
+struct RetainedEvents<T> {
+    capacity: usize,
+    events: VecDeque<T>,
+    total_recorded: u64,
+    dropped: u64,
+}
+
+impl<T> RetainedEvents<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            events: VecDeque::with_capacity(capacity.min(1_024)),
+            total_recorded: 0,
+            dropped: 0,
+        }
+    }
+
+    fn record(&mut self, event: T) {
+        self.total_recorded = self.total_recorded.saturating_add(1);
+        if self.capacity == 0 {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        if self.events.len() >= self.capacity {
+            self.events.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn stats(&self) -> RecorderStats {
+        RecorderStats {
+            capacity: self.capacity,
+            retained: self.events.len(),
+            total_recorded: self.total_recorded,
+            dropped: self.dropped,
+        }
+    }
+}
+
+impl<T: Clone> RetainedEvents<T> {
+    fn snapshot(&self) -> Vec<T> {
+        self.events.iter().cloned().collect()
+    }
+}
+
+/// The O(1) usage totals. They are the only usage numbers readiness reports, so
+/// eviction can never make the service under-report what it spent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct VoiceUsageAggregate {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost_usd: f64,
+    pub invalid_cost_events: u64,
+}
+
+impl VoiceUsageAggregate {
+    fn accumulate(&mut self, event: &VoiceUsageEvent) {
+        let prompt = event
+            .text_input_tokens
+            .saturating_add(event.audio_input_tokens);
+        let completion = event
+            .text_output_tokens
+            .saturating_add(event.audio_output_tokens);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt);
+        self.completion_tokens = self.completion_tokens.saturating_add(completion);
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(prompt)
+            .saturating_add(completion);
+        if event.cost_estimate_usd.is_finite() && event.cost_estimate_usd >= 0.0 {
+            self.estimated_cost_usd += event.cost_estimate_usd;
+        } else {
+            self.invalid_cost_events = self.invalid_cost_events.saturating_add(1);
+        }
+    }
+}
+
+/// `provider` and `model` are server-chosen identifiers, never learner text. A
+/// value that is not a short identifier — a signed credential, a bearer header,
+/// transcript prose, or a base64 audio blob — is replaced by this label before it
+/// can be retained or rendered.
+const REDACTED_USAGE_LABEL: &str = "redacted_usage_label";
+const MAX_USAGE_LABEL_CHARS: usize = 64;
+
+fn sanitized_usage_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let is_identifier = trimmed.chars().count() <= MAX_USAGE_LABEL_CHARS
+        && trimmed.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        });
+    if !is_identifier {
+        return REDACTED_USAGE_LABEL.to_owned();
+    }
+    if observe::sanitize_evidence_detail(trimmed.to_owned()) != trimmed {
+        return REDACTED_USAGE_LABEL.to_owned();
+    }
+    trimmed.to_owned()
+}
+
+#[derive(Clone, Debug)]
 pub struct VoiceEvidenceRecorder {
-    events: Arc<RwLock<Vec<VoiceEvidenceEvent>>>,
+    retained: Arc<RwLock<RetainedEvents<VoiceEvidenceEvent>>>,
+}
+
+impl Default for VoiceEvidenceRecorder {
+    fn default() -> Self {
+        Self::with_capacity(RecorderLimits::default().evidence_events)
+    }
 }
 
 impl VoiceEvidenceRecorder {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            retained: Arc::new(RwLock::new(RetainedEvents::new(capacity))),
+        }
+    }
+
     pub fn record(&self, event: VoiceEvidenceEvent) {
-        self.events
+        self.retained
             .write()
             .expect("evidence recorder lock poisoned")
-            .push(event);
+            .record(event);
     }
 
     pub fn snapshot(&self) -> Vec<VoiceEvidenceEvent> {
-        self.events
+        self.retained
             .read()
             .expect("evidence recorder lock poisoned")
-            .clone()
+            .snapshot()
+    }
+
+    pub fn stats(&self) -> RecorderStats {
+        self.retained
+            .read()
+            .expect("evidence recorder lock poisoned")
+            .stats()
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
+struct VoiceUsageState {
+    retained: RetainedEvents<VoiceUsageEvent>,
+    aggregate: VoiceUsageAggregate,
+}
+
+#[derive(Clone, Debug)]
 pub struct VoiceUsageRecorder {
-    events: Arc<RwLock<Vec<VoiceUsageEvent>>>,
+    state: Arc<RwLock<VoiceUsageState>>,
+}
+
+impl Default for VoiceUsageRecorder {
+    fn default() -> Self {
+        Self::with_capacity(RecorderLimits::default().usage_events)
+    }
 }
 
 impl VoiceUsageRecorder {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(VoiceUsageState {
+                retained: RetainedEvents::new(capacity),
+                aggregate: VoiceUsageAggregate::default(),
+            })),
+        }
+    }
+
     pub fn record(
         &self,
         voice_session_id: Option<&str>,
@@ -1038,8 +1203,8 @@ impl VoiceUsageRecorder {
         let cost_model = CostModel::default();
         let mut event = usage_event(
             parsed_session_id,
-            provider,
-            model,
+            sanitized_usage_label(provider),
+            sanitized_usage_label(model),
             duration_seconds,
             usage,
             &cost_model,
@@ -1060,45 +1225,50 @@ impl VoiceUsageRecorder {
             source_retrieval_latency_ms: event.source_retrieval_latency_ms,
             source_grounded_correction_count: event.source_grounded_correction_count,
         };
-        self.events
-            .write()
-            .expect("usage recorder lock poisoned")
-            .push(event);
+        // The aggregate is updated under the same lock, before eviction, so no
+        // recorded event can be evicted without having been counted.
+        let mut state = self.state.write().expect("usage recorder lock poisoned");
+        state.aggregate.accumulate(&event);
+        state.retained.record(event);
         record
     }
 
     pub fn snapshot(&self) -> Vec<VoiceUsageEvent> {
-        self.events
+        self.state
             .read()
             .expect("usage recorder lock poisoned")
-            .clone()
+            .retained
+            .snapshot()
+    }
+
+    pub fn stats(&self) -> RecorderStats {
+        self.state
+            .read()
+            .expect("usage recorder lock poisoned")
+            .retained
+            .stats()
+    }
+
+    pub fn aggregate(&self) -> VoiceUsageAggregate {
+        self.state
+            .read()
+            .expect("usage recorder lock poisoned")
+            .aggregate
     }
 
     pub fn summary(&self) -> serde_json::Value {
-        let events = self.events.read().expect("usage recorder lock poisoned");
-        let mut text_input_tokens = 0_u64;
-        let mut text_output_tokens = 0_u64;
-        let mut audio_input_tokens = 0_u64;
-        let mut audio_output_tokens = 0_u64;
-        let mut cost_estimate_usd = 0.0_f64;
-        for event in events.iter() {
-            text_input_tokens = text_input_tokens.saturating_add(event.text_input_tokens);
-            text_output_tokens = text_output_tokens.saturating_add(event.text_output_tokens);
-            audio_input_tokens = audio_input_tokens.saturating_add(event.audio_input_tokens);
-            audio_output_tokens = audio_output_tokens.saturating_add(event.audio_output_tokens);
-            cost_estimate_usd += event.cost_estimate_usd;
-        }
+        let state = self.state.read().expect("usage recorder lock poisoned");
+        let stats = state.retained.stats();
+        let aggregate = state.aggregate;
+        drop(state);
         json!({
-            "events": events.len(),
-            "text_input_tokens": text_input_tokens,
-            "text_output_tokens": text_output_tokens,
-            "audio_input_tokens": audio_input_tokens,
-            "audio_output_tokens": audio_output_tokens,
-            "total_tokens": text_input_tokens
-                .saturating_add(text_output_tokens)
-                .saturating_add(audio_input_tokens)
-                .saturating_add(audio_output_tokens),
-            "cost_estimate_usd": cost_estimate_usd,
+            "events": stats.retained,
+            "prompt_tokens": aggregate.prompt_tokens,
+            "completion_tokens": aggregate.completion_tokens,
+            "total_tokens": aggregate.total_tokens,
+            "estimated_cost_usd": aggregate.estimated_cost_usd,
+            "invalid_cost_events": aggregate.invalid_cost_events,
+            "retention": stats,
         })
     }
 }
@@ -1259,6 +1429,7 @@ async fn brain_health(
                 },
             },
             "usage": state.usage.summary(),
+            "evidence": state.evidence.stats(),
             "status": if ready {
                 "configured"
             } else {
