@@ -4689,7 +4689,7 @@ mod live_failure_tests {
     /// are the real ones, so every failure they produce is a live failure.
     fn unreachable_live_config() -> CartesiaGeminiConfig {
         CartesiaGeminiConfig {
-            cartesia_api_key: "sk_car_live_label_probe".to_owned(),
+            cartesia_api_key: "viva-not-a-real-key-label-probe".to_owned(),
             gemini: GeminiConfig {
                 api_key: "gemini-live-label-probe".to_owned(),
                 base_url: "http://127.0.0.1:1/v1beta/models".to_owned(),
