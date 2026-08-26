@@ -2250,7 +2250,7 @@ async fn optional_postgres_replays_synthetic_fixture_when_database_url_is_set() 
     .unwrap();
 
     let mut actual = vec![read_server_frame(&mut socket).await];
-    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    send_client_frame(&mut socket, &fixture.client[0]).await;
     for _ in 0..2 {
         actual.push(read_server_frame(&mut socket).await);
     }
@@ -5892,11 +5892,6 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
     let Some(url) = spawn_server(state).await else {
         return;
     };
-    let fixture: FullSessionFixture = serde_json::from_str(include_str!(
-        "../../../fixtures/voice-protocol/synthetic-study-session.json"
-    ))
-    .unwrap();
-
     let (mut socket, _) = connect_async(url).await.unwrap();
     let ServerFrame::Ready { brain, store, .. } = read_server_frame(&mut socket).await else {
         panic!("expected ready frame");
@@ -5911,7 +5906,16 @@ async fn websocket_client_stop_close_failure_emits_durability_degraded_terminal_
             ..
         } if matches!(event.as_ref(), VivaServerEvent::SessionPhase { .. })
     ));
-    send_client_frame(&mut socket, &fixture.client[3]).await;
+    // The frozen fixture's `stop` frame predates the v5 generation binding (`W-06`),
+    // so the stop this test needs is built here rather than read from it.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Stop {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+        },
+    )
+    .await;
 
     assert_terminal_session_phase(
         read_server_frame(&mut socket).await,
@@ -9271,13 +9275,18 @@ async fn assert_streamed_audio_turn_admits_one_provider_turn(seconds: u32) {
         )),
         "the synthetic provider must transcribe exactly one assembled {seconds}s turn"
     );
-    // The assembled turn produces exactly one durable outcome. The synthetic
-    // transcript is a byte-count placeholder carrying none of the question's rubric
-    // evidence, so the honest outcome is a retryable deferral rather than a grade,
-    // and a deferred turn writes no mastery at all.
+    // `A-19.3`: the assembled turn produces exactly one durable outcome, and on this
+    // path that outcome is a retryable deferral. The synthetic runtime injects a
+    // corpus-bound evaluator that replays one checked-in `learning-core` case chosen
+    // by the response identity — it never reads the transcript at all — and this
+    // session's response id selects `deferred_insufficient_semantic_evidence`. The
+    // pin is therefore "one outcome, and it is that deferral", not a claim that the
+    // byte-count placeholder was semantically judged. A deferred turn records the
+    // attempt but writes no mastery.
     assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
     assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
     assert_eq!(count_events(&frames, BrowserEventKind::ConceptStatus), 0);
+    assert!(store.snapshot().concept_statuses.is_empty());
     assert!(frames.iter().any(|frame| matches!(
         frame,
         ServerFrame::Event { event, .. }
@@ -9490,8 +9499,9 @@ async fn streamed_audio_turns_cancel_halfway_creates_no_provider_work() {
         agent_domain::StudySessionPhase::Correction,
     )
     .await;
-    // As above: the placeholder transcript defers rather than grading, and the point
-    // of this case is that the post-cancel turn still produces exactly one outcome.
+    // As above (`A-19.3`): the corpus-bound evaluator resolves this response identity
+    // to a deferral, and the point of this case is that the post-cancel turn still
+    // produces exactly one outcome.
     assert_eq!(count_events(&frames, BrowserEventKind::AnswerEvaluated), 0);
     assert_eq!(count_events(&frames, BrowserEventKind::TurnDeferred), 1);
     assert!(frames.iter().any(|frame| matches!(
@@ -9635,12 +9645,13 @@ async fn send_client_frame(socket: &mut TestWebSocket, frame: &ClientFrame) {
 
 /// The v5 initial `session_config` frame, built from Plan 05's session fixture.
 ///
-/// The frozen unversioned full-session fixtures still carry v4 client frames, so a
-/// test that only needs to open a session builds the frame here instead of reading
-/// `fixture.client[0]`; the session payload itself is still the shared fixture.
+/// The frozen unversioned full-session fixtures still carry v4 client frames (`W-06`),
+/// so a test that only needs to open a session builds the frame here instead of
+/// reading `fixture.client[0]`; the session payload itself is still the shared
+/// fixture, and only the v5 envelope the frozen file lacks is supplied locally.
 fn fixture_session_config_frame() -> ClientFrame {
     serde_json::from_str(&session_config_json_with_token(
-        "placeholder-session-material",
+        VOICE_TEST_PLACEHOLDER_CREDENTIAL,
     ))
     .expect("v5 session config frame parses")
 }
