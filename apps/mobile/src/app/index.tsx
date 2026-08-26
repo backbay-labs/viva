@@ -141,7 +141,7 @@ export default function HomeScreen() {
             }}
             style={({ pressed }) => [
               pressed && styles.orbPressed,
-              !activeStudySetId && styles.disabled,
+              !activeStudySetId && styles.orbDormant,
             ]}
           >
             <VoiceOrb size={166} state="ready" />
@@ -234,8 +234,14 @@ const styles = StyleSheet.create({
     fontSize: 22,
     lineHeight: 27,
   },
-  disabled: {
-    opacity: 0.5,
+  // Deliberately gentler than ActionButton's 0.52. The orb is a radial
+  // gradient, so fading it toward the ground collapses the eclipse into a flat
+  // pale disc and the screen reads washed out rather than idle. 0.82 keeps the
+  // form legible while still reading a step quieter; the status pill and the
+  // dimmed CTA carry the "unavailable" message, which is where a user looks for
+  // it anyway.
+  orbDormant: {
+    opacity: 0.82,
   },
   contextChevron: {
     color: colors.inkMuted,
