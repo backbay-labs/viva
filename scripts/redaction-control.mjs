@@ -2177,6 +2177,72 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*"claim":\ "NADH\ donates\ high\-energy\ electrons\ to\ the\ electron\ transport\ chain\.",\s*$/,
     ]),
   },
+  // A-23 (2026-08-26): coordinator-applied sanction rows for Plan 11 web-API
+  // sources, generated from the audit own detection (file filter included) over
+  // the lane diff, dual-keyed. All hits verified line-by-line by the lane and
+  // re-checked at application: type/parameter declarations, verification reads,
+  // bounded-size gates, env-var NAME literals, doc prose — never values or
+  // logging. Plan 12 reconciles at 12B.
+  {
+    file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*const\ token\ =\ vivaAgentScopedCredential\(\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\*\ Least\-privilege\ service\ credential\ selection\.\ A\ scoped\ bearer\ is\ required;\ the\ legacy\ broad\s*$/,
+      /^\s*\*\ bearer\ is\ accepted\ only\ behind\ the\ explicit\ migration\ escape\ hatch\ AND\ a\ loopback\ agent\ URL\.\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "bearer_token",
+    patterns: Object.freeze([
+      /^\s*const\ bearerToken\ =\ vivaAgentScopedCredential\("session_mint"\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "secret",
+    patterns: Object.freeze([
+      /^\s*function\ signCapabilityToken\(prefix:\ string,\ claims:\ object,\ secret:\ string\):\ string\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",\s*$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET",\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*token:\ sessionToken,\s*$/,
+      /^\s*const\ claims\ =\ verifyLibraryControlTokenClaims\(input\.token\);\s*$/,
+      /^\s*token:\ string\ \|\ null;\s*$/,
+      /^\s*const\ claims\ =\ verifySessionBootstrapTokenClaims\(input\.token\);\s*$/,
+      /^\s*token:\ string;\s*$/,
+      /^\s*if\ \(Buffer\.byteLength\(input\.token,\ "utf8"\)\ >\ SESSION_ACCESS_TOKEN_MAX_BYTES\)\ \{\s*$/,
+      /^\s*token:\ input\.token,\s*$/,
+      /^\s*if\ \(Buffer\.byteLength\(input\.token,\ "utf8"\)\ >\ CAPABILITY_TOKEN_MAX_BYTES\)\ return\ null;\s*$/,
+      /^\s*function\ verifySessionBootstrapTokenClaims\(token:\ string\):\ SessionBootstrapTokenClaims\ \|\ null\ \{\s*$/,
+      /^\s*function\ verifyLibraryControlTokenClaims\(token:\ string\):\ LibraryControlTokenClaims\ \|\ null\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "viva1.",
+    patterns: Object.freeze([
+      /^\s*\*\ Ordered\ exactly\ as\ Plan\ 05\ pins\ it:\ bounded\ size,\ `viva1\.<claims>\.<signature>`\ framing,\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
