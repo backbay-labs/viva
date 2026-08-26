@@ -317,6 +317,219 @@ pub(super) fn terminal_reason_overrides_send_failure(
     )
 }
 
+/// `SERVICE-017`: drive one heartbeat-timer expiry.
+///
+/// The transport liveness probe owns its own timer and this is the only place
+/// that resets it. `None` means the session loop continues; `Some(label)` is the
+/// terminal label it breaks with. Moved out of the session loop unchanged: the
+/// same three actions, the same reset points, and the same relabelling of a
+/// completed slow-client close as a heartbeat timeout.
+pub(super) async fn drive_heartbeat_timer<S>(
+    heartbeat: &mut HeartbeatState,
+    mut heartbeat_timer: Pin<&mut Sleep>,
+    sender: &mut BoundedSender<S>,
+    session: &mut agent_domain::RealtimeSession,
+    state: &AppState,
+    voice_session_id: Option<String>,
+    terminal: &mut TerminalCloseState,
+) -> Option<&'static str>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    match heartbeat.on_timer(
+        Instant::now(),
+        state.ws_timeouts.heartbeat_interval,
+        state.ws_timeouts.pong_timeout,
+    ) {
+        HeartbeatAction::SleepUntil(deadline) => {
+            heartbeat_timer.as_mut().reset(deadline);
+            None
+        }
+        HeartbeatAction::SendPing => {
+            if let Err(error) = sender.send(Message::Ping(Vec::new().into())).await {
+                return Some(handle_outbound_write_failure(&error, session, terminal));
+            }
+            heartbeat_timer.as_mut().reset(heartbeat.next_wake());
+            None
+        }
+        HeartbeatAction::Expired => {
+            // The wire contract is Plan 05's published slow-client termination;
+            // the recorded label is `heartbeat_timeout`, so a half-open peer is
+            // never read back as a slow reader.
+            abort_realtime_session_tasks(session);
+            Some(heartbeat_expiry_terminal_label(
+                close_with_terminal_session_phase(
+                    sender,
+                    &session.input,
+                    state,
+                    voice_session_id,
+                    terminal,
+                    TerminalSessionReason::SlowClient,
+                    close_code::POLICY,
+                )
+                .await,
+            ))
+        }
+    }
+}
+
+/// `SERVICE-017`: the one owner of the terminal close a rejected client message
+/// produces.
+///
+/// Four call sites in the session loop inlined these same four arms. They are
+/// moved here unchanged — same order, same close codes, same recorded labels,
+/// same provider-task abort on the turn cap — so the mapping from a refused
+/// client message to a wire close exists exactly once. The caller keeps the
+/// `break`: this returns the terminal label, it does not decide control flow.
+///
+/// `record_session_auth_failure` deliberately stays at the call site. Only the
+/// pre-send parsing rejection records one, and folding a conditional record in
+/// here would make a decision this function does not own.
+pub(super) async fn close_for_client_message_error<S>(
+    sender: &mut BoundedSender<S>,
+    session: &mut agent_domain::RealtimeSession,
+    state: &AppState,
+    voice_session_id: Option<String>,
+    terminal: &mut TerminalCloseState,
+    error: ClientMessageError,
+) -> &'static str
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    match error {
+        ClientMessageError::Drained => {
+            close_with_terminal_session_phase(
+                sender,
+                &session.input,
+                state,
+                voice_session_id,
+                terminal,
+                TerminalSessionReason::Drained,
+                close_code::NORMAL,
+            )
+            .await
+        }
+        ClientMessageError::RateLimit => {
+            close_with_terminal_session_phase(
+                sender,
+                &session.input,
+                state,
+                voice_session_id,
+                terminal,
+                TerminalSessionReason::RateLimit,
+                close_code::POLICY,
+            )
+            .await
+        }
+        ClientMessageError::Frame(error) => {
+            let _ = send_json(sender, &ServerFrame::error(error.code, error.message)).await;
+            let _ = close_with(sender, error.close_code, error.close_reason).await;
+            error.terminal_reason
+        }
+        ClientMessageError::TurnCap => {
+            abort_realtime_session_tasks(session);
+            close_with_terminal_session_phase(
+                sender,
+                &session.input,
+                state,
+                voice_session_id,
+                terminal,
+                TerminalSessionReason::TurnCap,
+                close_code::POLICY,
+            )
+            .await
+        }
+    }
+}
+
+/// `SERVICE-017`: the one owner of the terminal close a forwarded provider
+/// outcome produces.
+///
+/// `None` means the session loop continues; `Some(label)` is the terminal label
+/// it breaks with. Three call sites inlined this same match. The arms are moved
+/// here unchanged, including the precedence between a partial-recap write
+/// failure and the terminal reason that caused it.
+///
+/// The `Ok(Rejected)` arm assigned its label before writing the Close frame and
+/// this returns it after; the label is only read once the loop has ended, so the
+/// observable order is identical.
+pub(super) async fn close_for_forward_outcome<S>(
+    context: &BrainForwardContext<'_>,
+    sender: &mut BoundedSender<S>,
+    session: &mut agent_domain::RealtimeSession,
+    terminal: &mut TerminalCloseState,
+    outcome: Result<ForwardBrainEvent, OutboundWriteError>,
+) -> Option<&'static str>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    match outcome {
+        Ok(ForwardBrainEvent::Continue) => None,
+        Ok(ForwardBrainEvent::Suppressed) => None,
+        Ok(ForwardBrainEvent::Rejected) => {
+            let _ = close_with(
+                sender,
+                close_code::POLICY,
+                "provider source authority rejected",
+            )
+            .await;
+            Some("provider_source_authority_rejected")
+        }
+        Ok(ForwardBrainEvent::DurabilityDegraded) => Some(
+            close_with_terminal_session_phase(
+                sender,
+                &session.input,
+                context.state,
+                context.voice_session_id.clone(),
+                terminal,
+                TerminalSessionReason::DurabilityDegraded,
+                close_code::ERROR,
+            )
+            .await,
+        ),
+        Ok(ForwardBrainEvent::CostBudgetExceeded) => Some(
+            close_with_terminal_session_phase(
+                sender,
+                &session.input,
+                context.state,
+                context.voice_session_id.clone(),
+                terminal,
+                TerminalSessionReason::CostBudget,
+                close_code::POLICY,
+            )
+            .await,
+        ),
+        Ok(ForwardBrainEvent::ProviderFailure {
+            reason,
+            response_id,
+        }) => {
+            if let Err(error) = send_partial_recap_for_provider_failure(
+                context,
+                reason,
+                response_id.as_deref(),
+                sender,
+            )
+            .await
+            {
+                return Some(handle_outbound_write_failure(&error, session, terminal));
+            }
+            Some(
+                close_with_terminal_session_phase(
+                    sender,
+                    &session.input,
+                    context.state,
+                    context.voice_session_id.clone(),
+                    terminal,
+                    reason,
+                    close_code::ERROR,
+                )
+                .await,
+            )
+        }
+        Err(error) => Some(handle_outbound_write_failure(&error, session, terminal)),
+    }
+}
+
 pub(super) async fn close_with_client_stop<S>(
     sender: &mut BoundedSender<S>,
     state: &AppState,

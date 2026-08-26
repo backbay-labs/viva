@@ -13,6 +13,61 @@ pub(super) fn abort_realtime_session_tasks(session: &mut agent_domain::RealtimeS
     drop(session.task_guard.take());
 }
 
+/// `SERVICE-017`: open the provider session for this socket — the selected
+/// failure-control scenario when one is bound, the real brain otherwise — and
+/// record the outcome.
+///
+/// `None` means the open failed: the degraded-durability evidence, or the
+/// provider-failure evidence, is already recorded, the terminal session phase is
+/// already emitted, and the terminal reason is already recorded, so the caller
+/// returns. Moved out of the session loop unchanged, including recording
+/// `SessionOpened` only after a successful open.
+pub(super) async fn open_provider_session<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    voice_session_id: Option<String>,
+    config: SessionConfig,
+    failure_control: Option<FailureControlScenario>,
+) -> Option<agent_domain::RealtimeSession>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let session_result = match failure_control {
+        Some(scenario) => open_failure_control_session(state, config, scenario).await,
+        None => state.brain.open(config).await,
+    };
+    match session_result {
+        Ok(session) => {
+            state.evidence.record(VoiceEvidenceEvent::new(
+                VoiceEvidenceEventKind::SessionOpened,
+                voice_session_id,
+                "session opened",
+            ));
+            Some(session)
+        }
+        Err(error) => {
+            let terminal_reason = if brain_error_is_durability_degraded(state, &error) {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::StoreCounts,
+                    voice_session_id.clone(),
+                    "durability_degraded",
+                ));
+                TerminalSessionReason::DurabilityDegraded
+            } else {
+                record_brain_open_provider_failure(state, voice_session_id.clone(), &error);
+                terminal_reason_for_brain_error(&error)
+            };
+            let close_terminal_reason =
+                close_with_terminal_session_phase_only(sender, terminal_reason, close_code::ERROR)
+                    .await;
+            let recorded_terminal_reason =
+                terminal_label_after_terminal_phase_close(terminal_reason, close_terminal_reason);
+            record_terminal(state, voice_session_id, recorded_terminal_reason).await;
+            None
+        }
+    }
+}
+
 pub(super) struct BrainForwardContext<'a> {
     pub(super) state: &'a AppState,
     pub(super) voice_session_id: Option<String>,

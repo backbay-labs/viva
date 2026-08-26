@@ -1287,6 +1287,136 @@ pub(super) const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_milli
 
 pub(super) const MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET: usize = 1;
 
+/// The three per-session capacity reservations a socket must hold for its whole
+/// life, moved out of the session loop as one unit.
+///
+/// `SERVICE-017`: the field order is load-bearing and is the reverse of the
+/// order the three leases were acquired in. The locals this replaces dropped in
+/// reverse declaration order at every early return; struct fields drop in
+/// declaration order, so declaring them backwards keeps the release order the
+/// session loop always had. The end-of-session release drops each field by name
+/// so that order is stated, not inferred.
+pub(super) struct SessionLeases {
+    pub(super) user_study_set: VoiceLimitLease,
+    pub(super) user_total: Option<VoiceLimitLease>,
+    pub(super) failure_control_identity: Option<VoiceLimitLease>,
+}
+
+/// `SERVICE-017`: acquire the failure-control identity, per-user, and
+/// user/study-set reservations in that exact order.
+///
+/// `None` means capacity was denied: this has already emitted the session-cap
+/// terminal phase, closed the socket, and recorded the terminal reason, so the
+/// caller returns. Every reservation already taken is released after that
+/// record, exactly as it was when these three locals unwound at the caller's
+/// own `return`.
+pub(super) async fn acquire_session_leases<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    session_binding: &AuthorizedClientSession,
+    failure_control: Option<FailureControlScenario>,
+) -> Option<SessionLeases>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let failure_control_identity = match (
+        failure_control,
+        state.failure_control.max_sessions_per_identity(),
+    ) {
+        (Some(_), Some(max)) => match acquire_failure_control_identity_lease_with_reconnect_grace(
+            &state.limit_state,
+            &session_binding.user_id,
+            max,
+            RECONNECT_LEASE_GRACE,
+        )
+        .await
+        {
+            Some(lease) => Some(lease),
+            None => return close_denied_session_capacity(state, sender).await,
+        },
+        _ => None,
+    };
+    let user_total = match state.voice_limits.max_user_sessions {
+        Some(max) => match acquire_user_lease_with_reconnect_grace(
+            &state.limit_state,
+            &session_binding.user_id,
+            max,
+            RECONNECT_LEASE_GRACE,
+        )
+        .await
+        {
+            Some(lease) => Some(lease),
+            None => return close_denied_session_capacity(state, sender).await,
+        },
+        None => None,
+    };
+    let user_study_set = match acquire_user_study_set_with_reconnect_grace(
+        &state.limit_state,
+        &session_binding.user_id,
+        &session_binding.study_set_id,
+        MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET,
+        RECONNECT_LEASE_GRACE,
+    )
+    .await
+    {
+        Some(lease) => lease,
+        None => return close_denied_session_capacity(state, sender).await,
+    };
+    Some(SessionLeases {
+        user_study_set,
+        user_total,
+        failure_control_identity,
+    })
+}
+
+async fn close_denied_session_capacity<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+) -> Option<SessionLeases>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let terminal_reason = close_with_terminal_session_phase_only(
+        sender,
+        TerminalSessionReason::SessionCap,
+        close_code::POLICY,
+    )
+    .await;
+    record_terminal(state, None, terminal_reason).await;
+    None
+}
+
+/// `SERVICE-017`: the provider backoff gate a new socket passes before any
+/// provider input, moved out of the session loop.
+///
+/// `false` means the socket was denied, already closed, and already recorded.
+/// The admission — and any lease it carried — is released on return, which is
+/// where the caller's `if let` block released it before.
+pub(super) async fn admit_provider_backoff<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    voice_session_id: Option<String>,
+) -> bool
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    let Some(admission) = state
+        .limit_state
+        .provider_backoff_admission(&state.voice_limits)
+    else {
+        return true;
+    };
+    record_provider_admission(state, voice_session_id.clone(), &admission);
+    let ProviderAdmissionDecision::Denied(denial) = admission.decision else {
+        return true;
+    };
+    let terminal_reason =
+        close_with_terminal_session_phase_only(sender, denial.terminal_reason, close_code::POLICY)
+            .await;
+    record_terminal(state, voice_session_id, terminal_reason).await;
+    false
+}
+
 pub(super) async fn acquire_user_lease_with_reconnect_grace(
     limits: &VoiceLimitState,
     user_id: &str,

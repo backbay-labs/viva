@@ -144,12 +144,8 @@ async fn run_voice_session<S, R>(
                 }) {
                     Ok(config) => config,
                     Err(error) => {
-                        record_session_auth_failure(&state, None, error.auth_failure_code).await;
-                        let _ =
-                            send_json(&mut sender, &ServerFrame::error(error.code, error.message))
-                                .await;
-                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                        record_terminal(&state, None, error.terminal_reason).await;
+                        close_client_frame_error_before_session(&state, &mut sender, None, error)
+                            .await;
                         return;
                     }
                 }
@@ -162,174 +158,36 @@ async fn run_voice_session<S, R>(
     };
     let session_binding = initial.session_binding.clone();
     let voice_session_id = initial.config.session_id.as_deref().map(ToOwned::to_owned);
-    let _failure_control_identity_lease = match (
+    // `SERVICE-012`: the three per-session reservations are held for the whole
+    // socket life and released only after the session and its queued provider
+    // admissions are gone, in the reverse of this acquisition order.
+    let Some(leases) = acquire_session_leases(
+        &state,
+        &mut sender,
+        &session_binding,
         initial.failure_control,
-        state.failure_control.max_sessions_per_identity(),
-    ) {
-        (Some(_), Some(max)) => match acquire_failure_control_identity_lease_with_reconnect_grace(
-            &state.limit_state,
-            &session_binding.user_id,
-            max,
-            RECONNECT_LEASE_GRACE,
-        )
-        .await
-        {
-            Some(lease) => Some(lease),
-            None => {
-                let terminal_reason = close_with_terminal_session_phase_only(
-                    &mut sender,
-                    TerminalSessionReason::SessionCap,
-                    close_code::POLICY,
-                )
-                .await;
-                record_terminal(&state, None, terminal_reason).await;
-                return;
-            }
-        },
-        _ => None,
-    };
-    let _user_total_lease = match state.voice_limits.max_user_sessions {
-        Some(max) => match acquire_user_lease_with_reconnect_grace(
-            &state.limit_state,
-            &session_binding.user_id,
-            max,
-            RECONNECT_LEASE_GRACE,
-        )
-        .await
-        {
-            Some(lease) => Some(lease),
-            None => {
-                let terminal_reason = close_with_terminal_session_phase_only(
-                    &mut sender,
-                    TerminalSessionReason::SessionCap,
-                    close_code::POLICY,
-                )
-                .await;
-                record_terminal(&state, None, terminal_reason).await;
-                return;
-            }
-        },
-        None => None,
-    };
-    let _user_study_set_lease = match acquire_user_study_set_with_reconnect_grace(
-        &state.limit_state,
-        &session_binding.user_id,
-        &session_binding.study_set_id,
-        MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET,
-        RECONNECT_LEASE_GRACE,
     )
     .await
-    {
-        Some(lease) => lease,
-        None => {
-            let terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                TerminalSessionReason::SessionCap,
-                close_code::POLICY,
-            )
-            .await;
-            record_terminal(&state, None, terminal_reason).await;
-            return;
-        }
+    else {
+        return;
     };
-    if let Some(admission) = state
-        .limit_state
-        .provider_backoff_admission(&state.voice_limits)
-    {
-        record_provider_admission(&state, voice_session_id.clone(), &admission);
-        if let ProviderAdmissionDecision::Denied(denial) = admission.decision {
-            let terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                denial.terminal_reason,
-                close_code::POLICY,
-            )
-            .await;
-            record_terminal(&state, voice_session_id, terminal_reason).await;
-            return;
-        }
+    if !admit_provider_backoff(&state, &mut sender, voice_session_id.clone()).await {
+        return;
     }
-    if let Some(claim) = initial.token_nonce_claim.take() {
-        match state.study_store.claim_session_token_nonce(claim).await {
-            Ok(()) => {}
-            Err(error) if store_error_is_durability_degraded(&state, &error) => {
-                state.evidence.record(VoiceEvidenceEvent::new(
-                    VoiceEvidenceEventKind::StoreCounts,
-                    voice_session_id.clone(),
-                    "durability_degraded",
-                ));
-                let close_terminal_reason = close_with_terminal_session_phase_only(
-                    &mut sender,
-                    TerminalSessionReason::DurabilityDegraded,
-                    close_code::ERROR,
-                )
-                .await;
-                record_terminal(
-                    &state,
-                    voice_session_id,
-                    terminal_label_after_terminal_phase_close(
-                        TerminalSessionReason::DurabilityDegraded,
-                        close_terminal_reason,
-                    ),
-                )
-                .await;
-                return;
-            }
-            Err(store_error) => {
-                let error = if nonce_claim_was_replayed(&store_error) {
-                    ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed)
-                } else {
-                    ClientFrameError::nonce_store_unavailable()
-                };
-                record_session_auth_failure(
-                    &state,
-                    voice_session_id.clone(),
-                    error.auth_failure_code,
-                )
-                .await;
-                let _ =
-                    send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-                let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                record_terminal(&state, voice_session_id, error.terminal_reason).await;
-                return;
-            }
-        }
-    }
-    // `SERVICE-004`: the single atomic nonce claim above is the last gate before
-    // any study lookup, queueing, or provider input. Moving the lookup here keeps a
-    // replayed credential from reading a study set at all.
-    let study_context = match validate_study_set_access(&state, &initial.config).await {
-        StudySetAccessResult::Allowed(study_context) => study_context,
-        StudySetAccessResult::Denied(error) => {
-            record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
-                .await;
-            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-            record_terminal(&state, voice_session_id, error.terminal_reason).await;
-            return;
-        }
-        StudySetAccessResult::DurabilityDegraded => {
-            state.evidence.record(VoiceEvidenceEvent::new(
-                VoiceEvidenceEventKind::StoreCounts,
-                voice_session_id.clone(),
-                "durability_degraded",
-            ));
-            let close_terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                TerminalSessionReason::DurabilityDegraded,
-                close_code::ERROR,
-            )
-            .await;
-            record_terminal(
-                &state,
-                voice_session_id,
-                terminal_label_after_terminal_phase_close(
-                    TerminalSessionReason::DurabilityDegraded,
-                    close_terminal_reason,
-                ),
-            )
-            .await;
-            return;
-        }
+    // `SERVICE-004`: the single atomic nonce claim is the last gate before any
+    // study lookup, queueing, or provider input, so a replayed credential never
+    // reads a study set at all. Both steps live together in `ws/preflight.rs`
+    // precisely so that order cannot drift apart.
+    let Some(study_context) = claim_nonce_and_authorize_study_set(
+        &state,
+        &mut sender,
+        voice_session_id.clone(),
+        initial.token_nonce_claim.take(),
+        &initial.config,
+    )
+    .await
+    else {
+        return;
     };
     let mut initial_config = initial.config;
     initial_config.active_concepts = server_active_concepts(&study_context);
@@ -342,41 +200,17 @@ async fn run_voice_session<S, R>(
     record_turn_cap_config(&state, voice_session_id.clone());
     let session_started_at = Instant::now();
 
-    let session_result = match failure_control {
-        Some(scenario) => open_failure_control_session(&state, initial_config, scenario).await,
-        None => state.brain.open(initial_config).await,
-    };
-    let mut session = match session_result {
-        Ok(session) => session,
-        Err(error) => {
-            let terminal_reason = if brain_error_is_durability_degraded(&state, &error) {
-                state.evidence.record(VoiceEvidenceEvent::new(
-                    VoiceEvidenceEventKind::StoreCounts,
-                    voice_session_id.clone(),
-                    "durability_degraded",
-                ));
-                TerminalSessionReason::DurabilityDegraded
-            } else {
-                record_brain_open_provider_failure(&state, voice_session_id.clone(), &error);
-                terminal_reason_for_brain_error(&error)
-            };
-            let close_terminal_reason = close_with_terminal_session_phase_only(
-                &mut sender,
-                terminal_reason,
-                close_code::ERROR,
-            )
-            .await;
-            let recorded_terminal_reason =
-                terminal_label_after_terminal_phase_close(terminal_reason, close_terminal_reason);
-            record_terminal(&state, voice_session_id, recorded_terminal_reason).await;
-            return;
-        }
-    };
-    state.evidence.record(VoiceEvidenceEvent::new(
-        VoiceEvidenceEventKind::SessionOpened,
+    let Some(mut session) = open_provider_session(
+        &state,
+        &mut sender,
         voice_session_id.clone(),
-        "session opened",
-    ));
+        initial_config,
+        failure_control,
+    )
+    .await
+    else {
+        return;
+    };
     let mut terminal_reason = "event_stream_closed";
     let mut terminal_close = TerminalCloseState::default();
     let mut cancelled_responses = CancelledResponseTracker::default();
@@ -505,40 +339,19 @@ async fn run_voice_session<S, R>(
                 break;
             }
             _ = &mut heartbeat_timer => {
-                match heartbeat.on_timer(
-                    Instant::now(),
-                    state.ws_timeouts.heartbeat_interval,
-                    state.ws_timeouts.pong_timeout,
-                ) {
-                    HeartbeatAction::SleepUntil(deadline) => {
-                        heartbeat_timer.as_mut().reset(deadline);
-                    }
-                    HeartbeatAction::SendPing => {
-                        if let Err(error) = sender.send(Message::Ping(Vec::new().into())).await {
-                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                            break;
-                        }
-                        heartbeat_timer.as_mut().reset(heartbeat.next_wake());
-                    }
-                    HeartbeatAction::Expired => {
-                        // The wire contract is Plan 05's published slow-client
-                        // termination; the recorded label is `heartbeat_timeout`,
-                        // so a half-open peer is never read back as a slow reader.
-                        abort_realtime_session_tasks(&mut session);
-                        terminal_reason = heartbeat_expiry_terminal_label(
-                            close_with_terminal_session_phase(
-                                &mut sender,
-                                &session.input,
-                                &state,
-                                voice_session_id.clone(),
-                                &mut terminal_close,
-                                TerminalSessionReason::SlowClient,
-                                close_code::POLICY,
-                            )
-                            .await,
-                        );
-                        break;
-                    }
+                if let Some(reason) = drive_heartbeat_timer(
+                    &mut heartbeat,
+                    heartbeat_timer.as_mut(),
+                    &mut sender,
+                    &mut session,
+                    &state,
+                    voice_session_id.clone(),
+                    &mut terminal_close,
+                )
+                .await
+                {
+                    terminal_reason = reason;
+                    break;
                 }
             }
             queued = &mut pending_provider_admission, if !pending_provider_admission.is_terminated() => {
@@ -619,48 +432,14 @@ async fn run_voice_session<S, R>(
                             }
                         }
                     }
-                    Err(ClientMessageError::Drained) => {
-                        terminal_reason = close_with_terminal_session_phase(
+                    Err(error) => {
+                        terminal_reason = close_for_client_message_error(
                             &mut sender,
-                            &session.input,
+                            &mut session,
                             &state,
                             voice_session_id.clone(),
                             &mut terminal_close,
-                            TerminalSessionReason::Drained,
-                            close_code::NORMAL,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::RateLimit) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::RateLimit,
-                            close_code::POLICY,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::Frame(error)) => {
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                        terminal_reason = error.terminal_reason;
-                        break;
-                    }
-                    Err(ClientMessageError::TurnCap) => {
-                        abort_realtime_session_tasks(&mut session);
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::TurnCap,
-                            close_code::POLICY,
+                            error,
                         )
                         .await;
                         break;
@@ -708,41 +487,29 @@ async fn run_voice_session<S, R>(
                     &mut incoming_audio_turn,
                 ) {
                     Ok(client_input) => client_input,
-                    Err(ClientMessageError::Drained) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::Drained,
-                            close_code::NORMAL,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::RateLimit) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::RateLimit,
-                            close_code::POLICY,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::Frame(error)) => {
-                        record_session_auth_failure(&state, voice_session_id.clone(), error.auth_failure_code)
-                            .await;
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                        terminal_reason = error.terminal_reason;
-                        break;
-                    }
+                    // Ordered before the catch-all: pre-send parsing has no turn
+                    // cap to trip, and a silent graceful close here would hide
+                    // that the invariant moved.
                     Err(ClientMessageError::TurnCap) => unreachable!("pre-send parsing cannot trip turn cap"),
+                    Err(error) => {
+                        // Only this rejection is client-attributable before the
+                        // frame is forwarded, so only this one records an auth
+                        // failure — before anything is written back.
+                        if let ClientMessageError::Frame(frame) = &error {
+                            record_session_auth_failure(&state, voice_session_id.clone(), frame.auth_failure_code)
+                                .await;
+                        }
+                        terminal_reason = close_for_client_message_error(
+                            &mut sender,
+                            &mut session,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_close,
+                            error,
+                        )
+                        .await;
+                        break;
+                    }
                 };
                 // `D-03B QUIZ_ONLY`: service policy refuses the parsed context change
                 // on the same socket. No provider input, store write, lease, or
@@ -787,48 +554,14 @@ async fn run_voice_session<S, R>(
                         Ok(action) => {
                             record_client_action(&state, voice_session_id.clone(), action);
                         }
-                        Err(ClientMessageError::Drained) => {
-                            terminal_reason = close_with_terminal_session_phase(
+                        Err(error) => {
+                            terminal_reason = close_for_client_message_error(
                                 &mut sender,
-                                &session.input,
+                                &mut session,
                                 &state,
                                 voice_session_id.clone(),
                                 &mut terminal_close,
-                                TerminalSessionReason::Drained,
-                                close_code::NORMAL,
-                            )
-                            .await;
-                            break;
-                        }
-                        Err(ClientMessageError::RateLimit) => {
-                            terminal_reason = close_with_terminal_session_phase(
-                                &mut sender,
-                                &session.input,
-                                &state,
-                                voice_session_id.clone(),
-                                &mut terminal_close,
-                                TerminalSessionReason::RateLimit,
-                                close_code::POLICY,
-                            )
-                            .await;
-                            break;
-                        }
-                        Err(ClientMessageError::Frame(error)) => {
-                            let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-                            let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                            terminal_reason = error.terminal_reason;
-                            break;
-                        }
-                        Err(ClientMessageError::TurnCap) => {
-                            abort_realtime_session_tasks(&mut session);
-                            terminal_reason = close_with_terminal_session_phase(
-                                &mut sender,
-                                &session.input,
-                                &state,
-                                voice_session_id.clone(),
-                                &mut terminal_close,
-                                TerminalSessionReason::TurnCap,
-                                close_code::POLICY,
+                                error,
                             )
                             .await;
                             break;
@@ -860,7 +593,7 @@ async fn run_voice_session<S, R>(
                             superseded_provider_turn_response_ids: &mut superseded_provider_turn_response_ids,
                             turn_cap_deadline: &mut turn_cap_deadline,
                         };
-                        match forward_ready_brain_events(
+                        let outcome = forward_ready_brain_events(
                             &mut forward_context,
                             &mut session.events,
                             &mut cancelled_responses,
@@ -868,76 +601,18 @@ async fn run_voice_session<S, R>(
                             &mut sender,
                             &mut provider_runtime,
                         )
+                        .await;
+                        if let Some(reason) = close_for_forward_outcome(
+                            &forward_context,
+                            &mut sender,
+                            &mut session,
+                            &mut terminal_close,
+                            outcome,
+                        )
                         .await
                         {
-                            Ok(ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed) => {}
-                            Ok(ForwardBrainEvent::Rejected) => {
-                                terminal_reason = "provider_source_authority_rejected";
-                                let _ = close_with(
-                                    &mut sender,
-                                    close_code::POLICY,
-                                    "provider source authority rejected",
-                                )
-                                .await;
-                                break;
-                            }
-                            Ok(ForwardBrainEvent::DurabilityDegraded) => {
-                                terminal_reason = close_with_terminal_session_phase(
-                                    &mut sender,
-                                    &session.input,
-                                    &state,
-                                    voice_session_id.clone(),
-                                    &mut terminal_close,
-                                    TerminalSessionReason::DurabilityDegraded,
-                                    close_code::ERROR,
-                                )
-                                .await;
-                                break;
-                            }
-                            Ok(ForwardBrainEvent::CostBudgetExceeded) => {
-                                terminal_reason = close_with_terminal_session_phase(
-                                    &mut sender,
-                                    &session.input,
-                                    &state,
-                                    voice_session_id.clone(),
-                                    &mut terminal_close,
-                                    TerminalSessionReason::CostBudget,
-                                    close_code::POLICY,
-                                )
-                                .await;
-                                break;
-                            }
-                            Ok(ForwardBrainEvent::ProviderFailure {
-                                reason,
-                                response_id,
-                            }) => {
-                                if let Err(error) = send_partial_recap_for_provider_failure(
-                                    &forward_context,
-                                    reason,
-                                    response_id.as_deref(),
-                                    &mut sender,
-                                )
-                                .await
-                                {
-                                    terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                                    break;
-                                }
-                                terminal_reason = close_with_terminal_session_phase(
-                                    &mut sender,
-                                    &session.input,
-                                    &state,
-                                    voice_session_id.clone(),
-                                    &mut terminal_close,
-                                    reason,
-                                    close_code::ERROR,
-                                )
-                                .await;
-                                break;
-                            }
-                            Err(error) => {
-                                terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                                break;
-                            }
+                            terminal_reason = reason;
+                            break;
                         }
                     }
                     let mut admission = if session_limits.cost_budget_exhausted(&state.voice_limits) {
@@ -1067,89 +742,39 @@ async fn run_voice_session<S, R>(
                                     session_limits: &mut session_limits,
                                     turn_bindings: &mut turn_bindings,
                                 };
-                                match drain_terminal_events(
+                                let outcome = drain_terminal_events(
                                     &mut forward_context,
                                     &mut session.events,
                                     &mut cancelled_responses,
                                     session_started_at,
                                     &mut sender,
                                 )
+                                .await;
+                                // A stop whose terminal drain could not be
+                                // written still owes the client the Close frame
+                                // its stop asked for; that is the one arm this
+                                // site does not share with the other two.
+                                if let Err(error) = &outcome {
+                                    terminal_reason = handle_outbound_write_failure(error, &mut session, &mut terminal_close);
+                                    let _ = close_with(
+                                        &mut sender,
+                                        close_code::NORMAL,
+                                        "client stop",
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                if let Some(reason) = close_for_forward_outcome(
+                                    &forward_context,
+                                    &mut sender,
+                                    &mut session,
+                                    &mut terminal_close,
+                                    outcome,
+                                )
                                 .await
                                 {
-                                    Ok(ForwardBrainEvent::Continue | ForwardBrainEvent::Suppressed) => {}
-                                    Ok(ForwardBrainEvent::Rejected) => {
-                                        terminal_reason = "provider_source_authority_rejected";
-                                        let _ = close_with(
-                                            &mut sender,
-                                            close_code::POLICY,
-                                            "provider source authority rejected",
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_close,
-                                            TerminalSessionReason::DurabilityDegraded,
-                                            close_code::ERROR,
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    Ok(ForwardBrainEvent::CostBudgetExceeded) => {
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_close,
-                                            TerminalSessionReason::CostBudget,
-                                            close_code::POLICY,
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    Ok(ForwardBrainEvent::ProviderFailure {
-                                        reason,
-                                        response_id,
-                                    }) => {
-                                        if let Err(error) = send_partial_recap_for_provider_failure(
-                                            &forward_context,
-                                            reason,
-                                            response_id.as_deref(),
-                                            &mut sender,
-                                        )
-                                        .await
-                                        {
-                                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                                            break;
-                                        }
-                                        terminal_reason = close_with_terminal_session_phase(
-                                            &mut sender,
-                                            &session.input,
-                                            &state,
-                                            voice_session_id.clone(),
-                                            &mut terminal_close,
-                                            reason,
-                                            close_code::ERROR,
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                                        let _ = close_with(
-                                            &mut sender,
-                                            close_code::NORMAL,
-                                            "client stop",
-                                        )
-                                        .await;
-                                        break;
-                                    }
+                                    terminal_reason = reason;
+                                    break;
                                 }
                                 terminal_reason = close_with_client_stop(
                                     &mut sender,
@@ -1173,48 +798,14 @@ async fn run_voice_session<S, R>(
                             _ => {}
                         }
                     }
-                    Err(ClientMessageError::Drained) => {
-                        terminal_reason = close_with_terminal_session_phase(
+                    Err(error) => {
+                        terminal_reason = close_for_client_message_error(
                             &mut sender,
-                            &session.input,
+                            &mut session,
                             &state,
                             voice_session_id.clone(),
                             &mut terminal_close,
-                            TerminalSessionReason::Drained,
-                            close_code::NORMAL,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::RateLimit) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::RateLimit,
-                            close_code::POLICY,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(ClientMessageError::Frame(error)) => {
-                        let _ = send_json(&mut sender, &ServerFrame::error(error.code, error.message)).await;
-                        let _ = close_with(&mut sender, error.close_code, error.close_reason).await;
-                        terminal_reason = error.terminal_reason;
-                        break;
-                    }
-                    Err(ClientMessageError::TurnCap) => {
-                        abort_realtime_session_tasks(&mut session);
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::TurnCap,
-                            close_code::POLICY,
+                            error,
                         )
                         .await;
                         break;
@@ -1242,7 +833,7 @@ async fn run_voice_session<S, R>(
                     superseded_provider_turn_response_ids: &mut superseded_provider_turn_response_ids,
                     turn_cap_deadline: &mut turn_cap_deadline,
                 };
-                match forward_brain_event_with_turn_accounting(
+                let outcome = forward_brain_event_with_turn_accounting(
                     &mut forward_context,
                     event,
                     &mut cancelled_responses,
@@ -1250,77 +841,18 @@ async fn run_voice_session<S, R>(
                     &mut sender,
                     &mut provider_runtime,
                 )
+                .await;
+                if let Some(reason) = close_for_forward_outcome(
+                    &forward_context,
+                    &mut sender,
+                    &mut session,
+                    &mut terminal_close,
+                    outcome,
+                )
                 .await
                 {
-                    Ok(ForwardBrainEvent::Continue) => {}
-                    Ok(ForwardBrainEvent::Suppressed) => {}
-                    Ok(ForwardBrainEvent::Rejected) => {
-                        terminal_reason = "provider_source_authority_rejected";
-                        let _ = close_with(
-                            &mut sender,
-                            close_code::POLICY,
-                            "provider source authority rejected",
-                        )
-                        .await;
-                        break;
-                    }
-                    Ok(ForwardBrainEvent::DurabilityDegraded) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::DurabilityDegraded,
-                            close_code::ERROR,
-                        )
-                        .await;
-                        break;
-                    }
-                    Ok(ForwardBrainEvent::CostBudgetExceeded) => {
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            TerminalSessionReason::CostBudget,
-                            close_code::POLICY,
-                        )
-                        .await;
-                        break;
-                    }
-                    Ok(ForwardBrainEvent::ProviderFailure {
-                        reason,
-                        response_id,
-                    }) => {
-                        if let Err(error) = send_partial_recap_for_provider_failure(
-                            &forward_context,
-                            reason,
-                            response_id.as_deref(),
-                            &mut sender,
-                        )
-                        .await
-                        {
-                            terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                            break;
-                        }
-                        terminal_reason = close_with_terminal_session_phase(
-                            &mut sender,
-                            &session.input,
-                            &state,
-                            voice_session_id.clone(),
-                            &mut terminal_close,
-                            reason,
-                            close_code::ERROR,
-                        )
-                        .await;
-                        break;
-                    }
-                    Err(error) => {
-                        terminal_reason = handle_outbound_write_failure(&error, &mut session, &mut terminal_close);
-                        break;
-                    }
+                    terminal_reason = reason;
+                    break;
                 }
             }
         }
@@ -1335,9 +867,9 @@ async fn run_voice_session<S, R>(
     // hold a lease for the length of that wait.
     drop(pending_provider_admissions);
     drop(session);
-    drop(_user_study_set_lease);
-    drop(_user_total_lease);
-    drop(_failure_control_identity_lease);
+    drop(leases.user_study_set);
+    drop(leases.user_total);
+    drop(leases.failure_control_identity);
     drop(admission);
     // A socket whose own write side already failed, or whose client is already
     // gone, has no handshake left to finish and must not wait for one.

@@ -354,6 +354,106 @@ pub(super) async fn validate_study_set_access(
     }
 }
 
+/// `SERVICE-004`/`SERVICE-017`: the single atomic nonce claim and the study-set
+/// lookup it gates, in that exact order, moved out of the session loop as one
+/// unit.
+///
+/// The order is the security property: the claim is the last gate before any
+/// study lookup, queueing, or provider input, so a replayed credential never
+/// reads a study set at all. Returns the authorized study context, or `None`
+/// when the socket has already emitted its error/terminal frames, closed, and
+/// recorded its terminal reason — the caller then returns.
+pub(super) async fn claim_nonce_and_authorize_study_set<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    voice_session_id: Option<String>,
+    token_nonce_claim: Option<SessionTokenNonceClaim>,
+    config: &SessionConfig,
+) -> Option<serde_json::Value>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    if let Some(claim) = token_nonce_claim {
+        match state.study_store.claim_session_token_nonce(claim).await {
+            Ok(()) => {}
+            Err(error) if store_error_is_durability_degraded(state, &error) => {
+                close_durability_degraded_before_session(state, sender, voice_session_id).await;
+                return None;
+            }
+            Err(store_error) => {
+                let error = if nonce_claim_was_replayed(&store_error) {
+                    ClientFrameError::session_auth_failed(SessionAuthFailureCode::Replayed)
+                } else {
+                    ClientFrameError::nonce_store_unavailable()
+                };
+                close_client_frame_error_before_session(state, sender, voice_session_id, error)
+                    .await;
+                return None;
+            }
+        }
+    }
+    match validate_study_set_access(state, config).await {
+        StudySetAccessResult::Allowed(study_context) => Some(study_context),
+        StudySetAccessResult::Denied(error) => {
+            close_client_frame_error_before_session(state, sender, voice_session_id, error).await;
+            None
+        }
+        StudySetAccessResult::DurabilityDegraded => {
+            close_durability_degraded_before_session(state, sender, voice_session_id).await;
+            None
+        }
+    }
+}
+
+/// Emit and record a pre-session rejection: the typed error frame, the Close
+/// frame it names, and the terminal reason it records — in that order, with the
+/// auth-failure record first, exactly as every pre-session rejection did inline.
+pub(super) async fn close_client_frame_error_before_session<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    voice_session_id: Option<String>,
+    error: ClientFrameError,
+) where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    record_session_auth_failure(state, voice_session_id.clone(), error.auth_failure_code).await;
+    let _ = send_json(sender, &ServerFrame::error(error.code, error.message)).await;
+    let _ = close_with(sender, error.close_code, error.close_reason).await;
+    record_terminal(state, voice_session_id, error.terminal_reason).await;
+}
+
+/// Record the degraded-durability evidence, emit the terminal session phase, and
+/// record the label the close produced. Never a client-attributable failure, so
+/// no auth-failure record and no typed error frame.
+pub(super) async fn close_durability_degraded_before_session<S>(
+    state: &AppState,
+    sender: &mut BoundedSender<S>,
+    voice_session_id: Option<String>,
+) where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    state.evidence.record(VoiceEvidenceEvent::new(
+        VoiceEvidenceEventKind::StoreCounts,
+        voice_session_id.clone(),
+        "durability_degraded",
+    ));
+    let close_terminal_reason = close_with_terminal_session_phase_only(
+        sender,
+        TerminalSessionReason::DurabilityDegraded,
+        close_code::ERROR,
+    )
+    .await;
+    record_terminal(
+        state,
+        voice_session_id,
+        terminal_label_after_terminal_phase_close(
+            TerminalSessionReason::DurabilityDegraded,
+            close_terminal_reason,
+        ),
+    )
+    .await;
+}
+
 /// A reused nonce is the uniqueness race `PortErrorKind::Conflict` names. Matching
 /// the store's diagnostic text instead would silently stop detecting replays the
 /// moment a store reworded it.
