@@ -7,12 +7,27 @@ export const colors = {
   sheet: "#FFFCF7",
   sheetRaised: "#FFFDF9",
   inkStrong: "#271A30",
-  inkMuted: "#766B7E",
+  // Was #766B7E, which measured 2.55:1 on the vellum's darkest excursion and
+  // 4.64:1 on its brightest — failing WCAG AA at both ends, and already failing
+  // on the flat canvas before the atmosphere existed. Darkened to clear 4.5:1
+  // at the darkest. See ./contrast.ts and the atmosphere spec §11.
+  inkMuted: "#4E4753",
   plumVivid: "#6E429B",
   plumNight: "#351A47",
   plumLine: "#DFD0EB",
   sageDeep: "#667C61",
   ochre: "#B77831",
+  copper: "#B06A3B",
+  prussian: "#3C5A78",
+  // Text-safe counterparts. Ornament values above stay as they are for
+  // hairlines, keylines, sparks and rules; anything that renders as TEXT uses
+  // the *Ink value. A component picks a role, never a hex.
+  sageInk: "#3F4D3C",
+  ochreInk: "#65421B",
+  goldInk: "#574727",
+  copperInk: "#693F23",
+  prussianInk: "#324C65",
+  plumInk: "#5C3782",
   hairline: "rgba(39, 26, 48, 0.11)",
   hairlineSoft: "rgba(39, 26, 48, 0.065)",
   pressedInk: "#1D1224",
