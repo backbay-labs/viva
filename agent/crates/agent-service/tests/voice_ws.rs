@@ -6552,6 +6552,163 @@ async fn websocket_preflight_rejects_new_sessions_after_drain_begins() {
     }));
 }
 
+/// The loopback peer every test socket actually connects from. Forwarding headers
+/// name other addresses; none of them may ever key a lease.
+const TEST_PEER_IP: &str = "127.0.0.1";
+
+async fn wait_for_released_ip_lease(limits: &agent_service::VoiceLimitState, ip: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if limits.ip_lease_count(ip).is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "IP lease for {ip} was still held at {:?}",
+        limits.ip_lease_count(ip)
+    );
+}
+
+/// `SERVICE-003`: the per-IP cap keys off the socket peer. A direct client that
+/// varies `X-Forwarded-For` gets one bucket, not one bucket per spoofed value.
+#[tokio::test]
+async fn ip_cap_holds_when_forwarded_headers_vary() {
+    let state = test_state(8).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let limits = state.limit_state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let mut sockets = Vec::new();
+    for spoofed in ["198.51.100.1", "198.51.100.2"] {
+        let mut request = url.as_str().into_client_request().unwrap();
+        request.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_str(spoofed).expect("header value is valid"),
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("the direct peer is under its cap");
+        assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+        sockets.push(socket);
+    }
+
+    let mut over_cap = url.as_str().into_client_request().unwrap();
+    over_cap
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.3"));
+    let error = connect_async(over_cap)
+        .await
+        .expect_err("a forwarding header must not buy a third lease for one peer");
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        other => panic!("expected HTTP 429 from the per-IP cap, got {other:?}"),
+    }
+
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(2));
+    for spoofed in ["198.51.100.1", "198.51.100.2", "198.51.100.3", "unknown"] {
+        assert_eq!(
+            limits.ip_lease_count(spoofed),
+            None,
+            "a forwarding header must never key a per-IP lease"
+        );
+    }
+
+    for mut socket in sockets {
+        socket.close(None).await.unwrap();
+        let _ = read_server_frames_until_close(&mut socket).await;
+    }
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+}
+
+/// Every server-owned exit releases the peer's lease and removes its entry.
+#[tokio::test]
+async fn ip_cap_releases_peer_lease_on_every_exit() {
+    // 1. Ordinary disconnect.
+    let state = test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let limits = state.limit_state.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    assert_eq!(limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+    wait_for_released_ip_lease(&limits, TEST_PEER_IP).await;
+
+    // 2. Preflight rejection takes no lease at all.
+    let capacity_state = test_state(1).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(1),
+        ..VoiceLimitConfig::default()
+    });
+    let capacity_limits = capacity_state.limit_state.clone();
+    let Some(capacity_url) = spawn_server(capacity_state).await else {
+        return;
+    };
+    let (mut held, _) = connect_async(capacity_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut held).await, ServerFrame::ready());
+    let rejected = connect_async(capacity_url.as_str())
+        .await
+        .expect_err("the peer is at its cap");
+    assert!(matches!(
+        rejected,
+        tokio_tungstenite::tungstenite::Error::Http(_)
+    ));
+    assert_eq!(capacity_limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    held.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut held).await;
+    wait_for_released_ip_lease(&capacity_limits, TEST_PEER_IP).await;
+
+    // 3. A server-owned first-frame timeout.
+    let timeout_state = test_state(4)
+        .with_voice_limits(VoiceLimitConfig {
+            max_ip_sessions: Some(2),
+            ..VoiceLimitConfig::default()
+        })
+        .with_ws_timeouts(WsTimeouts {
+            first_frame: Duration::from_millis(25),
+            ..WsTimeouts::default()
+        });
+    let timeout_limits = timeout_state.limit_state.clone();
+    let Some(timeout_url) = spawn_server(timeout_state).await else {
+        return;
+    };
+    let (mut silent, _) = connect_async(timeout_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut silent).await, ServerFrame::ready());
+    let _ = read_server_frames_until_close(&mut silent).await;
+    wait_for_released_ip_lease(&timeout_limits, TEST_PEER_IP).await;
+
+    // 4. Drain.
+    let drain_state = test_state(4).with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        ..VoiceLimitConfig::default()
+    });
+    let drain_limits = drain_state.limit_state.clone();
+    let drain_signal = drain_state.drain_signal.clone();
+    let Some(drain_url) = spawn_server(drain_state).await else {
+        return;
+    };
+    let (mut draining, _) = connect_async(drain_url.as_str()).await.unwrap();
+    assert_eq!(read_server_frame(&mut draining).await, ServerFrame::ready());
+    assert_eq!(drain_limits.ip_lease_count(TEST_PEER_IP), Some(1));
+    drain_signal.begin_drain();
+    // The drained terminal phase is observed at the next client frame today; the
+    // lease must be gone once the socket ends, whatever ends it.
+    send_client_frame(&mut draining, &fixture_session_config_frame()).await;
+    let _ = read_server_frames_until_close(&mut draining).await;
+    wait_for_released_ip_lease(&drain_limits, TEST_PEER_IP).await;
+}
+
 #[tokio::test]
 async fn websocket_preflight_enforces_ip_session_cap_and_releases_after_close() {
     let state = test_state(4).with_voice_limits(VoiceLimitConfig {
@@ -9997,7 +10154,12 @@ async fn spawn_server(state: AppState) -> Option<String> {
     let addr = listener.local_addr().unwrap();
     let app = build_router(state);
     let handle: JoinHandle<()> = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     drop(handle);
     Some(format!("ws://{addr}/ws"))

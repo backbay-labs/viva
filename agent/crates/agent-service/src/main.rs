@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
     .with_trusted_session_id(config.trusted_session_id)
     .with_operator_access(config.operator_access)
     .with_recorder_limits(config.recorder_limits)
+    .with_trusted_proxies(config.trusted_proxies)
     .with_ws_timeouts(config.ws_timeouts)
     .with_turn_cap_override(config.max_turn_duration_overridden)
     .with_voice_limits(config.voice_limits)
@@ -44,9 +46,12 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "viva agent listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(drain_signal))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(drain_signal))
+    .await?;
     Ok(())
 }
 

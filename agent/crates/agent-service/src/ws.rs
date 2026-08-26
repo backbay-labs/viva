@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::HashSet,
+    net::{IpAddr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +16,7 @@ use agent_domain::{
 use axum::{
     extract::{
         ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -40,7 +41,7 @@ use crate::{
     },
     config::{
         bac_510_max_turn_duration, FailureControlScenario, RedactedSecret, SessionAuthFailureCode,
-        SessionTokenClaims, VoiceLimitConfig, VoiceWsAccessError,
+        SessionTokenClaims, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccessError,
     },
     protocol::{
         ClientFrame, ClientTurnIntent, ServerFrame, VivaServerEvent, VoiceServerErrorCode,
@@ -53,35 +54,117 @@ const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_LEASE_GRACE: Duration = Duration::from_millis(250);
 const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET: usize = 1;
+/// `SERVICE-003`: the longest forwarding chain a trusted proxy may present. The
+/// count is checked before a hop vector or a session permit is allocated.
+const MAX_FORWARDED_HOPS: usize = 32;
+
+/// Why an upgrade could not be given a client address. Every variant is coarse
+/// and carries no header value, hop, or derived address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ClientIpError {
+    #[error("forwarding chain is missing")]
+    MissingForwardedChain,
+    #[error("forwarding chain is malformed")]
+    MalformedForwardedChain,
+    #[error("forwarding chain names no untrusted client")]
+    AllForwardedHopsTrusted,
+    #[error("forwarding chain has too many hops")]
+    TooManyForwardedHops,
+}
+
+/// The HTTP rejection an unaccepted upgrade returns.
+#[derive(Debug)]
+pub struct VoiceWsRejection {
+    status: StatusCode,
+    body: serde_json::Value,
+}
+
+impl VoiceWsRejection {
+    fn new(status: StatusCode, body: serde_json::Value) -> Self {
+        Self { status, body }
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl IntoResponse for VoiceWsRejection {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+/// `SERVICE-003`: derive the client address from the socket peer, and only behind
+/// a configured trusted proxy from the forwarding chain.
+///
+/// An untrusted direct peer's forwarding headers are ignored outright, so a
+/// spoofed `X-Forwarded-For` cannot open a second rate-limit bucket. A trusted
+/// peer must present a syntactically valid chain; the scan runs right to left,
+/// skips configured trusted hops, and takes the first untrusted one. `X-Real-IP`
+/// is never consulted and there is no `unknown` bucket to fall into.
+fn client_ip_key(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    trusted: &TrustedProxyConfig,
+) -> Result<IpAddr, ClientIpError> {
+    if !trusted.trusts(peer.ip()) {
+        return Ok(peer.ip());
+    }
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ClientIpError::MissingForwardedChain)?;
+    if forwarded.split(',').count() > MAX_FORWARDED_HOPS {
+        return Err(ClientIpError::TooManyForwardedHops);
+    }
+    let mut hops = Vec::with_capacity(MAX_FORWARDED_HOPS.min(forwarded.split(',').count()));
+    for hop in forwarded.split(',') {
+        let hop = hop.trim();
+        if hop.is_empty() {
+            return Err(ClientIpError::MalformedForwardedChain);
+        }
+        hops.push(
+            hop.parse::<IpAddr>()
+                .map_err(|_| ClientIpError::MalformedForwardedChain)?,
+        );
+    }
+    hops.iter()
+        .rev()
+        .find(|hop| !trusted.trusts(**hop))
+        .copied()
+        .ok_or(ClientIpError::AllForwardedHopsTrusted)
+}
 
 pub async fn voice_ws(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> Response {
-    let admission = match validate_ws_preflight(&state, &headers) {
-        Ok(permit) => permit,
-        Err(error) => return error.into_response(),
-    };
+) -> Result<Response, VoiceWsRejection> {
+    let admission = validate_ws_preflight(&state, peer, &headers)?;
     let request_origin = request_origin(&headers).unwrap_or_default();
 
-    ws.protocols(["viva-voice"])
-        .on_upgrade(move |socket| handle_socket(socket, state, admission, request_origin))
+    Ok(ws
+        .protocols(["viva-voice"])
+        .on_upgrade(move |socket| handle_socket(socket, state, admission, request_origin)))
 }
 
 fn validate_ws_preflight(
     state: &AppState,
+    peer: SocketAddr,
     headers: &HeaderMap,
-) -> Result<VoiceAdmission, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<VoiceAdmission, VoiceWsRejection> {
     if state.drain_signal.is_draining() {
         state.evidence.record(VoiceEvidenceEvent::new(
             VoiceEvidenceEventKind::PreflightRejected,
             None,
             "server draining",
         ));
-        return Err((
+        return Err(VoiceWsRejection::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "voice session draining" })),
+            json!({ "error": "voice session draining" }),
         ));
     }
     if let Err(error) = state.ws_access.validate_headers(headers) {
@@ -92,6 +175,25 @@ fn validate_ws_preflight(
         ));
         return Err(ws_access_error(error));
     }
+    // The client address is settled before any resource is acquired, so a chain
+    // this deployment cannot attribute never costs a session permit.
+    let ip_key = match state.voice_limits.max_ip_sessions {
+        Some(_) => match client_ip_key(peer, headers, &state.trusted_proxies) {
+            Ok(ip) => Some(ip.to_string()),
+            Err(error) => {
+                state.evidence.record(VoiceEvidenceEvent::new(
+                    VoiceEvidenceEventKind::PreflightRejected,
+                    None,
+                    error.to_string(),
+                ));
+                return Err(VoiceWsRejection::new(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "voice session client address is not attributable" }),
+                ));
+            }
+        },
+        None => None,
+    };
     let permit = state
         .session_slots
         .clone()
@@ -102,14 +204,13 @@ fn validate_ws_preflight(
                 None,
                 "capacity exceeded",
             ));
-            (
+            VoiceWsRejection::new(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({ "error": "voice session capacity exceeded" })),
+                json!({ "error": "voice session capacity exceeded" }),
             )
         })?;
-    let ip_key = session_ip_key(headers);
-    let ip_lease = match state.voice_limits.max_ip_sessions {
-        Some(max) => match state.limit_state.try_acquire_ip(&ip_key, max) {
+    let ip_lease = match (state.voice_limits.max_ip_sessions, ip_key) {
+        (Some(max), Some(ip_key)) => match state.limit_state.try_acquire_ip(&ip_key, max) {
             Some(lease) => Some(lease),
             None => {
                 state.evidence.record(VoiceEvidenceEvent::new(
@@ -117,13 +218,13 @@ fn validate_ws_preflight(
                     None,
                     "ip capacity exceeded",
                 ));
-                return Err((
+                return Err(VoiceWsRejection::new(
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({ "error": "voice session IP capacity exceeded" })),
+                    json!({ "error": "voice session IP capacity exceeded" }),
                 ));
             }
         },
-        None => None,
+        _ => None,
     };
     state.evidence.record(VoiceEvidenceEvent::new(
         VoiceEvidenceEventKind::PreflightAccepted,
@@ -188,24 +289,6 @@ async fn acquire_with_reconnect_grace(
         }
     }
     None
-}
-
-fn session_ip_key(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or("unknown")
-        .to_owned()
 }
 
 fn request_origin(headers: &HeaderMap) -> Option<String> {
@@ -4324,14 +4407,14 @@ where
         .await
 }
 
-fn ws_access_error(error: VoiceWsAccessError) -> (StatusCode, Json<serde_json::Value>) {
+fn ws_access_error(error: VoiceWsAccessError) -> VoiceWsRejection {
     let status = match error {
         VoiceWsAccessError::OriginDenied => StatusCode::FORBIDDEN,
         VoiceWsAccessError::MissingBearer | VoiceWsAccessError::InvalidBearer => {
             StatusCode::UNAUTHORIZED
         }
     };
-    (status, Json(json!({ "error": error.to_string() })))
+    VoiceWsRejection::new(status, json!({ "error": error.to_string() }))
 }
 
 #[cfg(test)]
@@ -5620,8 +5703,9 @@ mod tests {
             1,
         );
         let headers = HeaderMap::new();
-        match validate_ws_preflight(&auth_state, &headers) {
-            Err((status, _)) => assert_eq!(status, StatusCode::UNAUTHORIZED),
+        let peer = client_ip_test_peer("198.51.100.7");
+        match validate_ws_preflight(&auth_state, peer, &headers) {
+            Err(rejection) => assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED),
             Ok(_) => panic!("expected bearer rejection"),
         }
 
@@ -5637,8 +5721,8 @@ mod tests {
         );
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("http://evil.test"));
-        match validate_ws_preflight(&origin_state, &headers) {
-            Err((status, _)) => assert_eq!(status, StatusCode::FORBIDDEN),
+        match validate_ws_preflight(&origin_state, peer, &headers) {
+            Err(rejection) => assert_eq!(rejection.status(), StatusCode::FORBIDDEN),
             Ok(_) => panic!("expected origin rejection"),
         }
 
@@ -5653,8 +5737,8 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .unwrap();
-        match validate_ws_preflight(&capacity_state, &HeaderMap::new()) {
-            Err((status, _)) => assert_eq!(status, StatusCode::TOO_MANY_REQUESTS),
+        match validate_ws_preflight(&capacity_state, peer, &HeaderMap::new()) {
+            Err(rejection) => assert_eq!(rejection.status(), StatusCode::TOO_MANY_REQUESTS),
             Ok(_) => panic!("expected capacity rejection"),
         }
     }
@@ -6313,5 +6397,187 @@ mod tests {
                 .expect_err("a scoped cancel without an assembly is a protocol error");
             assert_eq!(error, ClientFrameError::invalid_audio_frame());
         }
+    }
+    fn client_ip_test_peer(address: &str) -> SocketAddr {
+        SocketAddr::new(address.parse().expect("test peer address"), 44_321)
+    }
+
+    fn client_ip_test_headers(forwarded_for: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(forwarded_for) = forwarded_for {
+            headers.insert(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_str(forwarded_for).expect("header value"),
+            );
+        }
+        headers
+    }
+
+    fn client_ip_trusted_proxies() -> crate::config::TrustedProxyConfig {
+        crate::config::TrustedProxyConfig::parse("10.0.0.0/8,2001:db8::/32")
+            .expect("test CIDR list parses")
+    }
+
+    /// `SERVICE-003`: the client address is derived from the socket peer and, only
+    /// behind a configured trusted proxy, from the rightmost untrusted forwarded
+    /// hop. There is no `unknown` bucket and no left-most-header trust.
+    #[test]
+    fn client_ip_key_derives_from_peer_and_trusted_hops() {
+        let trusted = client_ip_trusted_proxies();
+        let untrusted_peer = client_ip_test_peer("198.51.100.7");
+        let trusted_peer = client_ip_test_peer("10.1.2.3");
+        let long_chain = |hops: usize| {
+            (0..hops)
+                .map(|index| format!("198.51.100.{}", index % 200 + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let accepted: Vec<(&str, SocketAddr, Option<String>, &str)> = vec![
+            (
+                "direct attacker spoofing a forwarding header",
+                untrusted_peer,
+                Some("203.0.113.9".to_owned()),
+                "198.51.100.7",
+            ),
+            (
+                "untrusted peer supplying a valid-looking chain",
+                untrusted_peer,
+                Some("203.0.113.9, 10.0.0.4, 10.0.0.5".to_owned()),
+                "198.51.100.7",
+            ),
+            (
+                "untrusted peer with no forwarding header",
+                untrusted_peer,
+                None,
+                "198.51.100.7",
+            ),
+            (
+                "trusted proxy with client, trusted, trusted",
+                trusted_peer,
+                Some("203.0.113.9, 10.0.0.4, 10.0.0.5".to_owned()),
+                "203.0.113.9",
+            ),
+            (
+                "trusted proxy with a rightmost-untrusted mixed chain",
+                trusted_peer,
+                Some("203.0.113.9, 198.51.100.4, 10.0.0.5".to_owned()),
+                "198.51.100.4",
+            ),
+            (
+                "trusted proxy with a single untrusted hop",
+                trusted_peer,
+                Some("2001:db9::1".to_owned()),
+                "2001:db9::1",
+            ),
+            (
+                "trusted proxy with exactly 32 hops",
+                trusted_peer,
+                Some(long_chain(32)),
+                "198.51.100.32",
+            ),
+        ];
+
+        for (name, peer, forwarded_for, expected) in accepted {
+            let headers = client_ip_test_headers(forwarded_for.as_deref());
+            assert_eq!(
+                client_ip_key(peer, &headers, &trusted),
+                Ok(expected.parse::<IpAddr>().expect("expected address")),
+                "{name}"
+            );
+        }
+
+        let rejected: Vec<(&str, SocketAddr, Option<String>, ClientIpError)> = vec![
+            (
+                "trusted proxy with no forwarding header",
+                trusted_peer,
+                None,
+                ClientIpError::MissingForwardedChain,
+            ),
+            (
+                "trusted proxy with a malformed IPv4 hop",
+                trusted_peer,
+                Some("203.0.113.999".to_owned()),
+                ClientIpError::MalformedForwardedChain,
+            ),
+            (
+                "trusted proxy with a malformed IPv6 hop",
+                trusted_peer,
+                Some("2001:db9::zz".to_owned()),
+                ClientIpError::MalformedForwardedChain,
+            ),
+            (
+                "trusted proxy with an empty element",
+                trusted_peer,
+                Some("203.0.113.9, , 10.0.0.5".to_owned()),
+                ClientIpError::MalformedForwardedChain,
+            ),
+            (
+                "trusted proxy with an empty chain",
+                trusted_peer,
+                Some(String::new()),
+                ClientIpError::MalformedForwardedChain,
+            ),
+            (
+                "trusted proxy with an address:port hop",
+                trusted_peer,
+                Some("203.0.113.9:443".to_owned()),
+                ClientIpError::MalformedForwardedChain,
+            ),
+            (
+                "trusted proxy with an all-trusted chain",
+                trusted_peer,
+                Some("10.0.0.3, 10.0.0.4, 2001:db8::9".to_owned()),
+                ClientIpError::AllForwardedHopsTrusted,
+            ),
+            (
+                "trusted proxy with 33 hops",
+                trusted_peer,
+                Some(long_chain(33)),
+                ClientIpError::TooManyForwardedHops,
+            ),
+        ];
+
+        for (name, peer, forwarded_for, expected) in rejected {
+            let headers = client_ip_test_headers(forwarded_for.as_deref());
+            assert_eq!(
+                client_ip_key(peer, &headers, &trusted),
+                Err(expected),
+                "{name}"
+            );
+        }
+    }
+
+    /// With no configured trusted proxy the forwarding header is ignored outright.
+    #[test]
+    fn client_ip_key_ignores_forwarding_headers_without_trusted_proxies() {
+        let trusted = crate::config::TrustedProxyConfig::default();
+        let peer = client_ip_test_peer("10.1.2.3");
+        let headers = client_ip_test_headers(Some("203.0.113.9, 10.0.0.4"));
+
+        assert_eq!(
+            client_ip_key(peer, &headers, &trusted),
+            Ok("10.1.2.3".parse::<IpAddr>().expect("peer address"))
+        );
+    }
+
+    /// `X-Real-IP` is never consulted, in either peer position.
+    #[test]
+    fn client_ip_key_never_consults_x_real_ip() {
+        let trusted = client_ip_trusted_proxies();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-real-ip",
+            axum::http::HeaderValue::from_static("203.0.113.9"),
+        );
+
+        assert_eq!(
+            client_ip_key(client_ip_test_peer("198.51.100.7"), &headers, &trusted),
+            Ok("198.51.100.7".parse::<IpAddr>().expect("peer address"))
+        );
+        assert_eq!(
+            client_ip_key(client_ip_test_peer("10.1.2.3"), &headers, &trusted),
+            Err(ClientIpError::MissingForwardedChain)
+        );
     }
 }

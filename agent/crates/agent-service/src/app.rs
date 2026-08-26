@@ -30,7 +30,7 @@ use crate::{
     config::{
         bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
         FailureControlConfig, OperatorAccess, RecorderLimits, RedactedSecret, SessionTokenClaims,
-        VoiceLimitConfig, VoiceWsAccess,
+        TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
     },
     ws::voice_ws,
 };
@@ -46,6 +46,7 @@ pub struct AppState {
     pub trusted_session_sequence: Arc<AtomicU64>,
     pub ws_access: VoiceWsAccess,
     pub operator_access: OperatorAccess,
+    pub trusted_proxies: TrustedProxyConfig,
     pub session_slots: Arc<Semaphore>,
     pub ws_timeouts: WsTimeouts,
     pub turn_cap_override: bool,
@@ -91,6 +92,7 @@ impl AppState {
             trusted_session_sequence: Arc::new(AtomicU64::new(0)),
             ws_access,
             operator_access: OperatorAccess::default(),
+            trusted_proxies: TrustedProxyConfig::default(),
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             ws_timeouts: WsTimeouts::default(),
             turn_cap_override: false,
@@ -135,6 +137,11 @@ impl AppState {
 
     pub fn with_operator_access(mut self, operator_access: OperatorAccess) -> Self {
         self.operator_access = operator_access;
+        self
+    }
+
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxyConfig) -> Self {
+        self.trusted_proxies = trusted_proxies;
         self
     }
 
@@ -268,6 +275,18 @@ impl VoiceLimitState {
 
     pub fn try_acquire_ip(&self, ip: &str, max: usize) -> Option<VoiceLimitLease> {
         self.try_acquire(VoiceLimitKind::Ip, ip, max)
+    }
+
+    /// `SERVICE-003`: server-owned proof of per-IP lease accounting. `None` means
+    /// the key holds no lease at all — releasing the last lease removes the entry,
+    /// so a client close frame is never what a test reads.
+    pub fn ip_lease_count(&self, ip: &str) -> Option<usize> {
+        self.active
+            .lock()
+            .expect("voice limit state lock poisoned")
+            .ips
+            .get(ip)
+            .copied()
     }
 
     pub(crate) async fn try_admit_provider_turn(
