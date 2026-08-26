@@ -392,13 +392,16 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
     token: sessionToken,
   });
   if (!verification.ok) {
-    if (verification.reason === "unavailable") {
+    const reason = verification.reason;
+    if (reason === "unavailable") {
       return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
     }
-    return sessionAuthTerminalJsonError(
-      authFailureCodeForAccessTokenRejection(verification.reason),
-      logContext,
-    );
+    // BAC-510 keeps the identity-binding terminal visible as its own emitter at the route,
+    // separate from the structural/signature/time rejections the mapper covers.
+    if (reason === "binding_mismatch") {
+      return sessionAuthTerminalJsonError("identity_mismatch", logContext);
+    }
+    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(reason), logContext);
   }
 
   const limit = guardMintRateLimit(request, userId, studySetId, logContext);
@@ -1437,17 +1440,19 @@ function sessionAuthFailureProfile(
   };
 }
 
-function authFailureCodeForAccessTokenRejection(
-  reason: VivaSessionAccessTokenRejection,
+/**
+ * Maps a closed token rejection to the operator auth-failure code BAC-510 observes. The name is
+ * pinned by the release observability gate in `scripts/provider-failure-observability.test.mjs`,
+ * which asserts this exact call shape at the refresh terminal; keep both in step.
+ *
+ * `binding_mismatch` is excluded on purpose: BAC-510 wants the identity-binding terminal emitted
+ * from its own call site, so routing one through here is a type error rather than a silently
+ * lost emitter.
+ */
+function authFailureCodeForTokenReason(
+  reason: Exclude<VivaSessionAccessTokenRejection, "binding_mismatch">,
 ): Exclude<VivaSessionAuthFailureCode, "expired"> {
-  switch (reason) {
-    case "binding_mismatch":
-      return "identity_mismatch";
-    case "invalid_signature":
-      return "invalid_signature";
-    default:
-      return "malformed";
-  }
+  return reason === "invalid_signature" ? "invalid_signature" : "malformed";
 }
 
 function sessionAuthTerminalJsonError(
