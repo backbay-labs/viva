@@ -6,6 +6,8 @@ import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   resetVivaSessionMintRateLimitsForTests,
   type SessionTokenClaims,
+  signVivaLibraryControlToken,
+  signVivaSessionBootstrapToken,
   VIVA_SESSION_AUTH_FAILURE_PROFILES,
   type VivaSessionRouteFailureClass,
   type VivaSessionRouteOutcome,
@@ -26,7 +28,11 @@ const originalEnv = {
   NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL,
   VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
   VIVA_AGENT_HTTP_URL: process.env.VIVA_AGENT_HTTP_URL,
+  VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN: process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN,
+  VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN,
   VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,
+  VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN,
+  VIVA_ALLOW_LEGACY_AGENT_REST_BEARER: process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER,
   VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET:
     process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET,
   VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,
@@ -37,6 +43,7 @@ const originalEnv = {
   VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET,
   VIVA_VOICE_SESSION_TOKEN_SECRET: process.env.VIVA_VOICE_SESSION_TOKEN_SECRET,
   VIVA_VOICE_WS_BEARER_TOKEN: process.env.VIVA_VOICE_WS_BEARER_TOKEN,
+  VIVA_WEB_CANONICAL_ORIGIN: process.env.VIVA_WEB_CANONICAL_ORIGIN,
 };
 
 // Fixture credentials: long enough to satisfy the recorded strength floor and
@@ -45,6 +52,11 @@ const STRONG_SESSION_SECRET = "viva-fixture-session-signing-key-0001";
 const STRONG_PREVIOUS_SESSION_SECRET = "viva-fixture-session-previous-key-0001";
 const STRONG_ROTATED_SESSION_SECRET = "viva-fixture-session-rotated-key-0001";
 const STRONG_BOOTSTRAP_SECRET = "viva-fixture-bootstrap-signing-key-01";
+const STRONG_PREVIOUS_BOOTSTRAP_SECRET = "viva-fixture-bootstrap-previous-key-1";
+const CANONICAL_WEB_ORIGIN = "https://web.example";
+const SCOPED_SESSION_MINT_BEARER = "viva-fixture-agent-session-mint-bearer";
+const SCOPED_LIBRARY_READ_BEARER = "viva-fixture-agent-library-read-bearer";
+const SCOPED_LIBRARY_DELETE_BEARER = "viva-fixture-agent-library-delete-bearer";
 
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
@@ -53,6 +65,11 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+    delete process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER;
+    process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN = SCOPED_SESSION_MINT_BEARER;
+    process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = SCOPED_LIBRARY_READ_BEARER;
+    process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = SCOPED_LIBRARY_DELETE_BEARER;
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL_WEB_ORIGIN;
     process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = STRONG_BOOTSTRAP_SECRET;
     delete process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET;
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
@@ -110,8 +127,8 @@ describe("Viva same-origin session API", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=synthetic-user");
     const headers = new Headers(calls[0]?.init?.headers);
-    expect(headers.get("authorization")).toBe("Bearer viva-fixture-legacy-rest-bearer");
-    expect(headers.get("origin")).toBe("https://web.example");
+    expect(headers.get("authorization")).toBe(`Bearer ${SCOPED_SESSION_MINT_BEARER}`);
+    expect(headers.get("origin")).toBe(CANONICAL_WEB_ORIGIN);
     expect(body).toEqual({
       failure_class: null,
       session: {
@@ -970,12 +987,7 @@ describe("Viva web credential configuration", () => {
   beforeEach(() => {
     console.warn = () => {};
     resetVivaSessionMintRateLimitsForTests();
-    process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
-    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
-    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = STRONG_BOOTSTRAP_SECRET;
-    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
-    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
-    process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
+    applyCanonicalOriginTestEnv();
   });
 
   afterEach(() => {
@@ -1120,6 +1132,476 @@ describe("Viva web credential configuration", () => {
     });
   });
 });
+
+describe("Viva canonical origin authority", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    applyCanonicalOriginTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("start and refresh fail closed before fetch when no canonical origin is configured", async () => {
+    const calls: string[] = [];
+    delete process.env.VIVA_WEB_CANONICAL_ORIGIN;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    const start = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const startBody = (await start.json()) as VivaSessionRouteFailureClass;
+    const refresh = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", {
+        session_id: "server-session",
+        session_token: signedSessionToken(sessionTokenClaims({ nonce: "no-canonical-nonce" })),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const refreshBody = (await refresh.json()) as VivaSessionRouteFailureClass;
+
+    expect(start.status).toBe(503);
+    expect(startBody).toEqual({
+      error: "viva_session_agent_unavailable",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(refresh.status).toBe(503);
+    expect(refreshBody).toEqual({
+      error: "viva_session_refresh_unavailable",
+      failure_class: "session_bootstrap_failed",
+      token_refresh_outcome: "failed",
+    });
+    expect(start.headers.get("cache-control")).toBe("no-store");
+    expect(calls).toEqual([]);
+  });
+
+  test("canonical origin rejects credentials, path, query, fragment, insecure public http, and non-origin text", async () => {
+    const rejected = [
+      "https://viva:hunter2@web.example",
+      "https://web.example/library",
+      "https://web.example/",
+      "https://web.example?user_id=synthetic-user",
+      "https://web.example#fragment",
+      "http://web.example",
+      "web.example",
+      "not an origin",
+      "https://web.example:443/path?q=1#f",
+    ];
+    const observed: number[] = [];
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    for (const value of rejected) {
+      resetVivaSessionMintRateLimitsForTests();
+      process.env.VIVA_WEB_CANONICAL_ORIGIN = value;
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const body = (await response.json()) as VivaSessionRouteFailureClass;
+      observed.push(response.status);
+      expect(JSON.stringify(body)).not.toContain(value);
+    }
+
+    expect(observed).toEqual(rejected.map(() => 503));
+    expect(calls).toEqual([]);
+  });
+
+  test("canonical origin accepts https and loopback http origins only", () => {
+    const accepted = [
+      "https://web.example",
+      "https://web.example:8443",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://127.10.0.4:3000",
+      "http://[::1]:3000",
+    ];
+
+    for (const value of accepted) {
+      process.env.VIVA_WEB_CANONICAL_ORIGIN = value;
+      const token = signVivaSessionBootstrapToken({
+        sessionId: null,
+        studySetId: "biology-midterm",
+        userId: "synthetic-user",
+      });
+      expect(decodedCapabilityClaims(token).origin).toBe(value);
+    }
+  });
+
+  test("canonical origin binds SSR-style capability minting with no origin argument", () => {
+    const bootstrap = signVivaSessionBootstrapToken({
+      sessionId: null,
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    });
+    const control = signVivaLibraryControlToken({
+      scope: "study_set_delete",
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    });
+
+    const bootstrapClaims = decodedCapabilityClaims(bootstrap);
+    const controlClaims = decodedCapabilityClaims(control);
+    expect(bootstrapClaims.origin).toBe(CANONICAL_WEB_ORIGIN);
+    expect(controlClaims.origin).toBe(CANONICAL_WEB_ORIGIN);
+    expect(typeof bootstrapClaims.origin).toBe("string");
+    expect(typeof controlClaims.origin).toBe("string");
+    expect(Object.keys(bootstrapClaims).sort()).toEqual([
+      "expires_at",
+      "nonce",
+      "origin",
+      "purpose",
+      "session_id",
+      "study_set_id",
+      "user_id",
+    ]);
+    expect(Object.keys(controlClaims).sort()).toEqual([
+      "expires_at",
+      "nonce",
+      "origin",
+      "purpose",
+      "scope",
+      "study_set_id",
+      "user_id",
+      "voice_session_id",
+    ]);
+  });
+
+  test("canonical origin cannot be moved by Origin, Host, Forwarded, or X-Forwarded-Proto spoofs", async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const spoofHeaders = {
+      forwarded: "for=203.0.113.7;host=evil.example;proto=http",
+      host: "evil.example",
+      "x-forwarded-host": "evil.example",
+      "x-forwarded-proto": "http",
+    };
+    const accepted = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), spoofHeaders),
+    );
+    resetVivaSessionMintRateLimitsForTests();
+    const spoofedOrigin = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload(), {
+        ...spoofHeaders,
+        origin: "https://evil.example",
+      }),
+    );
+    const spoofedBody = (await spoofedOrigin.json()) as VivaSessionRouteFailureClass;
+
+    expect(accepted.status).toBe(200);
+    expect(new Headers(calls[0]?.init?.headers).get("origin")).toBe(CANONICAL_WEB_ORIGIN);
+    expect(spoofedOrigin.status).toBe(403);
+    expect(spoofedBody).toEqual({
+      error: "cross_origin_session_request",
+      failure_class: "access_denied",
+      token_refresh_outcome: "blocked",
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("canonical origin accepts a bootstrap capability minted under the previous signing key", async () => {
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET = STRONG_PREVIOUS_BOOTSTRAP_SECRET;
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
+      )) as typeof fetch;
+
+    const rotated = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        session_bootstrap_token: signedSessionBootstrapToken(
+          { session_id: null, study_set_id: "biology-midterm", user_id: "synthetic-user" },
+          STRONG_PREVIOUS_BOOTSTRAP_SECRET,
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    resetVivaSessionMintRateLimitsForTests();
+    const unrelated = await startSession(
+      sessionRequest("/api/viva-session/start", {
+        session_bootstrap_token: signedSessionBootstrapToken(
+          { session_id: null, study_set_id: "biology-midterm", user_id: "synthetic-user" },
+          "viva-fixture-unrelated-signing-secret-000",
+        ),
+        study_set_id: "biology-midterm",
+        user_id: "synthetic-user",
+      }),
+    );
+    const unrelatedBody = (await unrelated.json()) as VivaSessionRouteFailureClass;
+
+    expect(rotated.status).toBe(200);
+    expect(unrelated.status).toBe(403);
+    expect(unrelatedBody).toEqual({
+      error: "session_bootstrap_capability_required",
+      failure_class: "access_denied",
+      token_refresh_outcome: "blocked",
+    });
+  });
+
+  test("canonical origin rejects every malformed bootstrap capability with one coarse body", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+    const baseClaims = {
+      expires_at: Math.floor(Date.now() / 1000) + 300,
+      nonce: "bootstrap-nonce",
+      origin: CANONICAL_WEB_ORIGIN,
+      purpose: "viva_session_bootstrap",
+      session_id: null,
+      study_set_id: "biology-midterm",
+      user_id: "synthetic-user",
+    };
+    const hostile: Array<{ label: string; token: string }> = [
+      {
+        label: "padded claims segment",
+        token: capabilityTokenFromJson(JSON.stringify(baseClaims), { padClaims: true }),
+      },
+      {
+        label: "padded signature segment",
+        token: capabilityTokenFromJson(JSON.stringify(baseClaims), { padSignature: true }),
+      },
+      {
+        label: "duplicate claim",
+        token: capabilityTokenFromJson(
+          `{"expires_at":${baseClaims.expires_at},"nonce":"a","nonce":"b","origin":"${CANONICAL_WEB_ORIGIN}","purpose":"viva_session_bootstrap","session_id":null,"study_set_id":"biology-midterm","user_id":"synthetic-user"}`,
+        ),
+      },
+      {
+        label: "unknown claim",
+        token: capabilityTokenFromJson(JSON.stringify({ ...baseClaims, role: "admin" })),
+      },
+      {
+        label: "null origin",
+        token: capabilityTokenFromJson(JSON.stringify({ ...baseClaims, origin: null })),
+      },
+      {
+        label: "missing origin",
+        token: capabilityTokenFromJson(
+          JSON.stringify({
+            expires_at: baseClaims.expires_at,
+            nonce: baseClaims.nonce,
+            purpose: baseClaims.purpose,
+            session_id: null,
+            study_set_id: baseClaims.study_set_id,
+            user_id: baseClaims.user_id,
+          }),
+        ),
+      },
+      {
+        label: "foreign origin",
+        token: capabilityTokenFromJson(
+          JSON.stringify({ ...baseClaims, origin: "https://evil.example" }),
+        ),
+      },
+      {
+        label: "invalid purpose",
+        token: capabilityTokenFromJson(
+          JSON.stringify({ ...baseClaims, purpose: "viva_library_control" }),
+        ),
+      },
+      {
+        label: "non-safe-integer expiry",
+        token: capabilityTokenFromJson(JSON.stringify({ ...baseClaims, expires_at: 1.5e18 })),
+      },
+      {
+        label: "string expiry",
+        token: capabilityTokenFromJson(
+          JSON.stringify({ ...baseClaims, expires_at: `${baseClaims.expires_at}` }),
+        ),
+      },
+      {
+        label: "empty nonce",
+        token: capabilityTokenFromJson(JSON.stringify({ ...baseClaims, nonce: "" })),
+      },
+    ];
+
+    const observed: Array<{ label: string; status: number; body: unknown }> = [];
+    for (const entry of hostile) {
+      resetVivaSessionMintRateLimitsForTests();
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", {
+          session_bootstrap_token: entry.token,
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+      );
+      observed.push({ body: await response.json(), label: entry.label, status: response.status });
+    }
+
+    expect(observed).toEqual(
+      hostile.map((entry) => ({
+        body: {
+          error: "session_bootstrap_capability_required",
+          failure_class: "access_denied",
+          token_refresh_outcome: "blocked",
+        },
+        label: entry.label,
+        status: 403,
+      })),
+    );
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("Viva scoped service credential selection", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionMintRateLimitsForTests();
+    applyCanonicalOriginTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionMintRateLimitsForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("start uses the session mint scope and never another scope", async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const authorization = new Headers(calls[0]?.init?.headers).get("authorization");
+
+    expect(response.status).toBe(200);
+    expect(authorization).toBe(`Bearer ${SCOPED_SESSION_MINT_BEARER}`);
+    expect(authorization).not.toContain(SCOPED_LIBRARY_READ_BEARER);
+    expect(authorization).not.toContain(SCOPED_LIBRARY_DELETE_BEARER);
+    expect(authorization).not.toContain("viva-fixture-legacy-rest-bearer");
+  });
+
+  test("public start fails when its scoped service credential is missing even with the legacy REST bearer present", async () => {
+    const calls: string[] = [];
+    delete process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN;
+    process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+    process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER = "1";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await response.json()) as VivaSessionRouteFailureClass;
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      error: "viva_session_agent_unavailable",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("legacy REST bearer is loopback-only and requires the explicit escape hatch", async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    delete process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN;
+    process.env.VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL_WEB_ORIGIN;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init });
+      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+    }) as typeof fetch;
+
+    const withoutEscapeHatch = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const withoutBody = (await withoutEscapeHatch.json()) as VivaSessionRouteFailureClass;
+
+    resetVivaSessionMintRateLimitsForTests();
+    process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER = "1";
+    const loopbackAllowed = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+
+    resetVivaSessionMintRateLimitsForTests();
+    process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+    const publicRejected = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const publicBody = (await publicRejected.json()) as VivaSessionRouteFailureClass;
+
+    expect(withoutEscapeHatch.status).toBe(503);
+    expect(withoutBody.error).toBe("viva_session_agent_unavailable");
+    expect(loopbackAllowed.status).toBe(200);
+    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(
+      "Bearer viva-fixture-legacy-rest-bearer",
+    );
+    expect(publicRejected.status).toBe(503);
+    expect(publicBody.error).toBe("viva_session_agent_unavailable");
+    expect(calls).toHaveLength(1);
+  });
+});
+
+function applyCanonicalOriginTestEnv() {
+  process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+  process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
+  process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
+  delete process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER;
+  process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN = SCOPED_SESSION_MINT_BEARER;
+  process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = SCOPED_LIBRARY_READ_BEARER;
+  process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = SCOPED_LIBRARY_DELETE_BEARER;
+  process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL_WEB_ORIGIN;
+  process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = STRONG_BOOTSTRAP_SECRET;
+  delete process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET;
+  process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user";
+  process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+  process.env.VIVA_SESSION_BOOTSTRAP_TIMEOUT_MS = "10000";
+  process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "20";
+  delete process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET;
+  process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
+}
+
+function decodedCapabilityClaims(token: string | null): Record<string, unknown> {
+  if (!token) throw new Error("capability token must be minted for this fixture");
+  const segment = token.split(".")[1] ?? "";
+  return JSON.parse(Buffer.from(segment, "base64url").toString("utf8")) as Record<string, unknown>;
+}
+
+// Independent local minting of hostile bootstrap capabilities: never reuses the production
+// signer or verifier, and never copies a real credential.
+function capabilityTokenFromJson(
+  claimsJson: string,
+  options: { padClaims?: boolean; padSignature?: boolean } = {},
+): string {
+  const claimsPart = Buffer.from(claimsJson, "utf8").toString("base64url");
+  const signedClaims = options.padClaims ? `${claimsPart}=` : claimsPart;
+  const payload = `viva-bootstrap1.${signedClaims}`;
+  const signature = createHmac("sha256", STRONG_BOOTSTRAP_SECRET)
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${options.padSignature ? `${signature}=` : signature}`;
+}
 
 function planFiveFixtureSecretBytes(): Uint8Array {
   return new Uint8Array(Buffer.from(planFiveSessionTokenVectors.fake_secret_base64, "base64"));

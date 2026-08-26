@@ -2,9 +2,12 @@ import { type NextRequest, NextResponse } from "next/server";
 import {
   attachVivaLibraryControlTokensToLibrarySnapshot,
   attachVivaSessionBootstrapTokensToLibrarySnapshot,
+  isVivaCanonicalMutatingRequest,
   isVivaLibraryControlToken,
   type VivaLibraryControlScope,
   verifyVivaLibraryControlToken,
+  vivaAgentScopedCredential,
+  vivaCanonicalWebOrigin,
 } from "../../viva-session/shared";
 
 export const dynamic = "force-dynamic";
@@ -38,6 +41,9 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     return vivaLibraryProxyJsonError(503, "viva_agent_unavailable");
   }
   const { path = [] } = await context.params;
+  if (!vivaCanonicalWebOrigin()) {
+    return libraryConfigUnavailableResponse(request.method, path);
+  }
   const upstream = new URL(
     `${trimTrailingSlash(agentBaseUrl)}/${path.map(encodeURIComponent).join("/")}`,
   );
@@ -46,6 +52,8 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const controlTarget = libraryControlRouteTarget(request.method, path);
   const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
   if (controlGuard) return controlGuard;
+  const originGuard = guardDestructiveRequestOrigin(request, controlTarget);
+  if (originGuard) return originGuard;
 
   const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
   if (!serverBearer.ok) return serverBearer.response;
@@ -82,9 +90,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
           await cancelResponseBody(response);
           return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
         }
-        const preserved = await browserSafeLibraryResponse(response, path, {
-          origin: vivaLibraryProxyOrigin(request),
-        });
+        const preserved = await browserSafeLibraryResponse(response, path, {});
         if (timedOut) {
           return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
         }
@@ -106,7 +112,6 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     if (contentType) responseHeaders.set("content-type", contentType);
     responseHeaders.set("cache-control", "no-store");
     const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
-      origin: vivaLibraryProxyOrigin(request),
       snapshotFilter: browserLibrarySnapshotFilter(request, path),
     });
     return new NextResponse(responseBody, {
@@ -128,6 +133,24 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Missing/weak canonical origin or scoped service credential: one route-specific `*_unavailable`
+ * 503 that never names the environment variable, its value, or the upstream URL.
+ */
+function libraryConfigUnavailableResponse(method: string, path: string[]): NextResponse {
+  if (isBrowserLibrarySnapshotRequest(method, path)) {
+    return libraryPreLoopJsonError(
+      503,
+      "viva_library_auth_unavailable",
+      "pre_loop_ingestion_unavailable",
+    );
+  }
+  if (method === "DELETE" && libraryControlRouteTarget(method, path)) {
+    return vivaLibraryProxyJsonError(503, "viva_library_control_unavailable");
+  }
+  return vivaLibraryProxyJsonError(503, "viva_library_proxy_unavailable");
 }
 
 function libraryPreLoopJsonError(
@@ -277,21 +300,17 @@ function vivaLibraryProxyHeaders(
   }
   const contentType = request.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
-  const origin = vivaLibraryProxyOrigin(request);
+  const origin = vivaLibraryProxyOrigin();
   if (origin) headers.set("origin", origin);
   return headers;
 }
 
-function vivaLibraryProxyOrigin(request: NextRequest): string | null {
-  const origin = request.headers.get("origin");
-  if (origin) return origin;
-  const host = request.headers.get("host");
-  if (host) {
-    const protocol =
-      request.headers.get("x-forwarded-proto") ?? request.nextUrl.protocol.slice(0, -1);
-    return `${protocol}://${host}`;
-  }
-  return request.nextUrl.origin;
+/**
+ * The proxy's outbound origin is the configured canonical web origin and nothing else. An
+ * `Origin`, `Host`, `Forwarded`, or `X-Forwarded-Proto` header can never move it.
+ */
+function vivaLibraryProxyOrigin(): string | null {
+  return vivaCanonicalWebOrigin();
 }
 
 function serverBearerForBrowserLibraryRequest(
@@ -324,21 +343,18 @@ function serverBearerForBrowserLibraryRequest(
       response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
     };
   }
-  const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  const token = vivaAgentScopedCredential(
+    sameOriginControlRequest ? "library_delete" : "library_read",
+  );
   if (!token) {
     return {
       ok: false,
-      response: libraryPreLoopJsonError(
-        503,
-        "viva_library_auth_unavailable",
-        "pre_loop_ingestion_unavailable",
-      ),
+      response: libraryConfigUnavailableResponse(request.method, path),
     };
   }
   if (sameOriginControlRequest) {
     const userId = request.nextUrl.searchParams.get("user_id")?.trim() || "";
     const verification = verifyVivaLibraryControlToken({
-      origin: vivaLibraryProxyOrigin(request),
       scope: controlTarget?.scope ?? "study_set_delete",
       studySetId: controlTarget?.studySetId ?? "",
       token: controlToken ?? "",
@@ -422,6 +438,19 @@ function guardAllowedLibraryControlRoute(
   return null;
 }
 
+/**
+ * Destructive routes must be exactly same-origin. A missing or foreign `Origin`, or a
+ * cross-site fetch, returns the same coarse capability error as a forged capability.
+ */
+function guardDestructiveRequestOrigin(
+  request: NextRequest,
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
+  if (request.method !== "DELETE" || !controlTarget) return null;
+  if (isVivaCanonicalMutatingRequest(request)) return null;
+  return vivaLibraryProxyJsonError(403, "viva_library_control_capability_required");
+}
+
 function libraryControlRouteTarget(
   method: string,
   path: string[],
@@ -469,7 +498,6 @@ async function browserSafeLibraryResponseBody(
   path: string[],
   contentType: string | null,
   options: {
-    origin: string | null;
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
   },
 ): Promise<ArrayBuffer | string> {
@@ -486,14 +514,12 @@ async function browserSafeLibraryResponseBody(
       const withBootstrapTokens = options.snapshotFilter
         ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
             allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            origin: options.origin,
             userId: options.snapshotFilter.userId,
           })
         : filtered;
       const withControlTokens = options.snapshotFilter
         ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
             allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            origin: options.origin,
             userId: options.snapshotFilter.userId,
           })
         : withBootstrapTokens;
@@ -509,7 +535,6 @@ async function browserSafeLibraryResponse(
   response: Response,
   path: string[],
   options: {
-    origin: string | null;
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
   },
 ): Promise<NextResponse> {

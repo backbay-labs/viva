@@ -146,7 +146,7 @@ type SessionAccessTokenVerificationDetail =
 type SessionBootstrapTokenClaims = {
   expires_at: number;
   nonce: string;
-  origin: string | null;
+  origin: string;
   purpose: "viva_session_bootstrap";
   session_id: string | null;
   study_set_id: string;
@@ -158,13 +158,27 @@ export type VivaLibraryControlScope = "session_history_delete" | "study_set_dele
 type LibraryControlTokenClaims = {
   expires_at: number;
   nonce: string;
-  origin: string | null;
+  origin: string;
   purpose: "viva_library_control";
   scope: VivaLibraryControlScope;
   study_set_id: string;
   user_id: string;
   voice_session_id: string | null;
 };
+
+type CanonicalWebOrigin = { origin: string };
+
+/**
+ * Exactly one scoped agent credential per browser-facing capability. The legacy broad bearer
+ * is migration input only and can never stand in for one of these on public traffic.
+ */
+export type AgentCredentialScope = "library_read" | "session_mint" | "library_delete";
+
+const AGENT_SCOPE_ENV = {
+  library_read: "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+  session_mint: "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+  library_delete: "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+} as const;
 
 type VivaLibraryAction =
   | {
@@ -212,6 +226,27 @@ const SESSION_ACCESS_TOKEN_MAX_BYTES = 4_096;
 const SESSION_ACCESS_TOKEN_SIGNATURE_BYTES = 32;
 const SESSION_ACCESS_TOKEN_MAX_CLAIM_DEPTH = 8;
 const WEB_SECRET_MIN_BYTES = 32;
+const WEB_OPAQUE_CREDENTIAL_MAX_BYTES = 512;
+const CAPABILITY_TOKEN_MAX_BYTES = 4_096;
+const SESSION_BOOTSTRAP_CLAIM_KEYS: ReadonlySet<string> = new Set([
+  "expires_at",
+  "nonce",
+  "origin",
+  "purpose",
+  "session_id",
+  "study_set_id",
+  "user_id",
+]);
+const LIBRARY_CONTROL_CLAIM_KEYS: ReadonlySet<string> = new Set([
+  "expires_at",
+  "nonce",
+  "origin",
+  "purpose",
+  "scope",
+  "study_set_id",
+  "user_id",
+  "voice_session_id",
+]);
 const SESSION_ACCESS_TOKEN_CLAIM_KEYS = new Set([
   "user_id",
   "study_set_id",
@@ -305,7 +340,6 @@ export async function handleVivaSessionStart(request: NextRequest) {
 
   const minted = await mintSessionFromLibrary({
     actionName,
-    origin: requestOrigin(request),
     route: "start",
     sessionId: sessionId ?? undefined,
     studySetId,
@@ -362,7 +396,6 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
 
   const minted = await mintSessionFromLibrary({
     actionName: "resume",
-    origin: requestOrigin(request),
     route: "refresh",
     sessionId,
     studySetId,
@@ -386,50 +419,52 @@ export function resetVivaSessionMintRateLimitsForTests() {
 }
 
 export function signVivaSessionBootstrapToken(input: {
-  origin?: string | null;
   sessionId?: string | null;
   studySetId: string;
   userId: string;
 }): string | null {
   const secret = sessionBootstrapSecret();
-  if (!secret) return null;
+  const canonical = canonicalWebOrigin();
+  if (!secret || !canonical.ok) return null;
   const claims: SessionBootstrapTokenClaims = {
     expires_at: Math.floor(Date.now() / 1000) + SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS,
     nonce: randomUUID(),
-    origin: input.origin?.trim() || null,
+    origin: canonical.value.origin,
     purpose: SESSION_BOOTSTRAP_TOKEN_PURPOSE,
     session_id: input.sessionId?.trim() || null,
     study_set_id: input.studySetId,
     user_id: input.userId,
   };
-  const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
-  const payload = `${SESSION_BOOTSTRAP_TOKEN_PREFIX}.${claimsPart}`;
-  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
-  return `${payload}.${signature}`;
+  return signCapabilityToken(SESSION_BOOTSTRAP_TOKEN_PREFIX, claims, secret);
 }
 
 export function signVivaLibraryControlToken(input: {
-  origin?: string | null;
   scope: VivaLibraryControlScope;
   studySetId: string;
   userId: string;
   voiceSessionId?: string | null;
 }): string | null {
   const secret = sessionBootstrapSecret();
-  if (!secret) return null;
+  const canonical = canonicalWebOrigin();
+  if (!secret || !canonical.ok) return null;
   const claims: LibraryControlTokenClaims = {
     expires_at: Math.floor(Date.now() / 1000) + SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS,
     nonce: randomUUID(),
-    origin: input.origin?.trim() || null,
+    origin: canonical.value.origin,
     purpose: LIBRARY_CONTROL_TOKEN_PURPOSE,
     scope: input.scope,
     study_set_id: input.studySetId,
     user_id: input.userId,
     voice_session_id: input.voiceSessionId?.trim() || null,
   };
+  return signCapabilityToken(LIBRARY_CONTROL_TOKEN_PREFIX, claims, secret);
+}
+
+/** Capabilities are always signed with the active key; the previous key is verify-only. */
+function signCapabilityToken(prefix: string, claims: object, secret: string): string {
   const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
-  const payload = `${LIBRARY_CONTROL_TOKEN_PREFIX}.${claimsPart}`;
-  const signature = createHmac("sha256", secret).update(payload).digest("base64url");
+  const payload = `${prefix}.${claimsPart}`;
+  const signature = createHmac("sha256", utf8Bytes(secret)).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
 
@@ -438,24 +473,20 @@ export function isVivaLibraryControlToken(token: string | null | undefined): boo
 }
 
 export function verifyVivaLibraryControlToken(input: {
-  origin?: string | null;
   scope: VivaLibraryControlScope;
   studySetId: string;
   token: string;
   userId: string;
   voiceSessionId?: string | null;
 }): "invalid" | "missing_secret" | "valid" {
-  const secret = sessionBootstrapSecret();
-  if (!secret) return "missing_secret";
-  const claims = verifyLibraryControlTokenClaims(input.token, secret);
+  if (!bootstrapCapabilityVerificationKeys() || !canonicalWebOrigin().ok) return "missing_secret";
+  const claims = verifyLibraryControlTokenClaims(input.token);
   if (
     !claims ||
-    claims.purpose !== LIBRARY_CONTROL_TOKEN_PURPOSE ||
     claims.scope !== input.scope ||
     claims.user_id !== input.userId ||
     claims.study_set_id !== input.studySetId ||
-    claims.voice_session_id !== (input.voiceSessionId?.trim() || null) ||
-    (claims.origin && claims.origin !== input.origin)
+    claims.voice_session_id !== (input.voiceSessionId?.trim() || null)
   ) {
     return "invalid";
   }
@@ -466,7 +497,6 @@ export function attachVivaSessionBootstrapTokensToLibrarySnapshot(
   value: unknown,
   options: {
     allowedStudySetIds?: ReadonlySet<string> | null;
-    origin?: string | null;
     userId: string;
   },
 ): unknown {
@@ -483,7 +513,6 @@ export function attachVivaLibraryControlTokensToLibrarySnapshot(
   value: unknown,
   options: {
     allowedStudySetIds?: ReadonlySet<string> | null;
-    origin?: string | null;
     userId: string;
   },
 ): unknown {
@@ -505,7 +534,9 @@ function guardSameOrigin(
   request: NextRequest,
   logContext: VivaSessionRouteLogContext,
 ): NextResponse | null {
-  const expectedOrigin = requestOrigin(request);
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return sessionConfigUnavailableResponse(logContext);
+  const expectedOrigin = canonical.value.origin;
   const origin = request.headers.get("origin")?.trim();
   const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
   if (!origin || origin !== expectedOrigin) {
@@ -570,14 +601,12 @@ function guardSessionBootstrapCapability(
       route: input.route,
     });
   }
-  const claims = verifySessionBootstrapTokenClaims(input.token, requirement.secret);
+  const claims = verifySessionBootstrapTokenClaims(input.token);
   if (
     !claims ||
-    claims.purpose !== SESSION_BOOTSTRAP_TOKEN_PURPOSE ||
     claims.user_id !== input.userId ||
     claims.study_set_id !== input.studySetId ||
-    claims.session_id !== input.sessionId ||
-    (claims.origin && claims.origin !== requestOrigin(request))
+    claims.session_id !== input.sessionId
   ) {
     return sessionJsonError(403, "session_bootstrap_capability_required", "blocked", {
       action: input.action,
@@ -646,7 +675,6 @@ async function readSessionPayload(
 
 async function mintSessionFromLibrary(input: {
   actionName: "resume" | "start";
-  origin: string;
   route: VivaSessionRouteName;
   sessionId?: string;
   studySetId: string;
@@ -662,9 +690,11 @@ async function mintSessionFromLibrary(input: {
   | { ok: false; response: NextResponse<VivaSessionRouteFailureClass> }
 > {
   const agentBaseUrl = serverAgentBaseUrl();
-  const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  const bearerToken = vivaAgentScopedCredential("session_mint");
+  const canonical = canonicalWebOrigin();
+  const canonicalOrigin = canonical.ok ? canonical.value.origin : null;
   const logContext = { action: input.actionName, route: input.route } as const;
-  if (!agentBaseUrl || !bearerToken) {
+  if (!agentBaseUrl || !bearerToken || !canonicalOrigin) {
     return {
       ok: false,
       response: sessionPreLoopJsonError(
@@ -705,7 +735,7 @@ async function mintSessionFromLibrary(input: {
       cache: "no-store",
       headers: {
         authorization: `Bearer ${bearerToken}`,
-        origin: input.origin,
+        origin: canonicalOrigin,
       },
       method: "GET",
       signal: controller.signal,
@@ -1216,6 +1246,88 @@ function validatedSecret(name: string, options: { maxBytes?: number } = {}): str
 }
 
 /**
+ * The single canonical web-origin authority. Nothing in this lane derives an origin from an
+ * `Origin`, `Host`, `Forwarded`, or `X-Forwarded-Proto` header, so no request header can move
+ * the origin a capability is bound to.
+ */
+function canonicalWebOrigin():
+  | { ok: true; value: CanonicalWebOrigin }
+  | { ok: false; reason: "missing" | "invalid" | "insecure_public" } {
+  const raw = process.env.VIVA_WEB_CANONICAL_ORIGIN?.trim();
+  if (!raw) return { ok: false, reason: "missing" };
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { ok: false, reason: "invalid" };
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return { ok: false, reason: "invalid" };
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    return { ok: false, reason: "invalid" };
+  }
+  if (url.origin === "null" || url.origin !== raw) return { ok: false, reason: "invalid" };
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname)) {
+    return { ok: false, reason: "insecure_public" };
+  }
+  return { ok: true, value: { origin: url.origin } };
+}
+
+/** Canonical origin for route handlers outside this module; null when unconfigured or weak. */
+export function vivaCanonicalWebOrigin(): string | null {
+  const canonical = canonicalWebOrigin();
+  return canonical.ok ? canonical.value.origin : null;
+}
+
+/** Mutating browser routes require an exact canonical `Origin` and a same-origin fetch site. */
+export function isVivaCanonicalMutatingRequest(request: NextRequest): boolean {
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return false;
+  const origin = request.headers.get("origin")?.trim();
+  if (!origin || origin !== canonical.value.origin) return false;
+  const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
+  return !fetchSite || fetchSite === "same-origin";
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === "localhost" || host === "[::1]" || host === "::1") return true;
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const parsed = octets.slice(1).map((value) => Number.parseInt(value, 10));
+  return parsed.every((value) => value >= 0 && value <= 255) && parsed[0] === 127;
+}
+
+function isLoopbackAgentUrl(value: string | null): boolean {
+  if (!value) return false;
+  try {
+    return isLoopbackHostname(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Least-privilege service credential selection. A scoped bearer is required; the legacy broad
+ * bearer is accepted only behind the explicit migration escape hatch AND a loopback agent URL.
+ */
+export function vivaAgentScopedCredential(scope: AgentCredentialScope): string | null {
+  const scoped = validatedSecret(AGENT_SCOPE_ENV[scope], {
+    maxBytes: WEB_OPAQUE_CREDENTIAL_MAX_BYTES,
+  });
+  return scoped ?? legacyAgentRestBearer();
+}
+
+function legacyAgentRestBearer(): string | null {
+  if (process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER?.trim() !== "1") return null;
+  if (!isLoopbackAgentUrl(serverAgentBaseUrl())) return null;
+  const raw = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
+  if (!raw) return null;
+  return Buffer.byteLength(raw, "utf8") <= WEB_OPAQUE_CREDENTIAL_MAX_BYTES ? raw : null;
+}
+
+/**
  * Active plus verify-only previous HMAC keys, converted to UTF-8 bytes exactly once after
  * validation. An explicitly present but weak previous key fails configuration rather than
  * silently falling back to the active key alone.
@@ -1328,6 +1440,26 @@ function sessionAuthTerminalJsonError(
     logFailureClass: "session_auth_failure",
     logTokenRefreshOutcome: terminalAuthLogTokenRefreshOutcome(operatorCode),
   });
+}
+
+/**
+ * Route-specific 503 for a missing/weak canonical origin or scoped service credential.
+ * Never names the environment variable or reflects its value.
+ */
+function sessionConfigUnavailableResponse(
+  logContext: VivaSessionRouteLogContext,
+): NextResponse<VivaSessionRouteFailureClass> {
+  if (logContext.route === "refresh") {
+    return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
+  }
+  return sessionPreLoopJsonError(
+    503,
+    "viva_session_agent_unavailable",
+    "failed",
+    "session_bootstrap_unavailable",
+    PRE_LOOP_SESSION_TERMINAL_REASON,
+    logContext,
+  );
 }
 
 function sessionPreLoopJsonError(
@@ -1470,10 +1602,6 @@ function deploymentSha(): string | null {
   return null;
 }
 
-function requestOrigin(request: NextRequest): string {
-  return request.nextUrl?.origin ?? new URL(request.url).origin;
-}
-
 function clientIp(request: NextRequest): string {
   const metadataIp = (request as { ip?: unknown }).ip;
   if (typeof metadataIp === "string" && metadataIp.trim()) return metadataIp.trim();
@@ -1499,8 +1627,8 @@ function serverAgentBaseUrl(): string | null {
 
 function sessionBootstrapRequirement(): { required: boolean; secret: string | null } {
   const agentBaseUrl = serverAgentBaseUrl();
-  const bearerToken = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
-  if (!agentBaseUrl || !bearerToken) {
+  const mintCredential = vivaAgentScopedCredential("session_mint");
+  if (!agentBaseUrl || !mintCredential) {
     return { required: false, secret: null };
   }
   return { required: true, secret: sessionBootstrapSecret() };
@@ -1514,143 +1642,161 @@ function sessionBootstrapSecret(): string | null {
   return validatedSecret("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET");
 }
 
-function verifySessionBootstrapTokenClaims(
-  token: string,
-  secret: string,
-): SessionBootstrapTokenClaims | null {
-  const parts = token.split(".");
-  if (parts.length !== 3 || parts[0] !== SESSION_BOOTSTRAP_TOKEN_PREFIX) return null;
-  const claimsPart = parts[1] ?? "";
-  const signaturePart = parts[2] ?? "";
-  const signedPayload = `${SESSION_BOOTSTRAP_TOKEN_PREFIX}.${claimsPart}`;
-  let providedSignature: Buffer;
-  try {
-    providedSignature = Buffer.from(signaturePart, "base64url");
-  } catch {
-    return null;
-  }
-  const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest();
-  if (
-    providedSignature.length !== expectedSignature.length ||
-    !timingSafeEqual(providedSignature, expectedSignature)
-  ) {
-    return null;
-  }
-  try {
-    const record = JSON.parse(Buffer.from(claimsPart, "base64url").toString("utf8")) as unknown;
-    if (!isRecord(record)) return null;
-    const expiresAt = numberClaim(record.expires_at);
-    const nonce = requiredString(record.nonce);
-    const purpose = record.purpose === SESSION_BOOTSTRAP_TOKEN_PURPOSE ? record.purpose : null;
-    const studySetId = requiredString(record.study_set_id);
-    const userId = requiredString(record.user_id);
-    const sessionId =
-      record.session_id === null || record.session_id === undefined
-        ? null
-        : requiredString(record.session_id);
-    const origin =
-      record.origin === null || record.origin === undefined ? null : requiredString(record.origin);
-    if (
-      expiresAt === null ||
-      expiresAt <= Math.floor(Date.now() / 1000) ||
-      !nonce ||
-      !purpose ||
-      !studySetId ||
-      !userId ||
-      (record.session_id !== null && record.session_id !== undefined && !sessionId) ||
-      (record.origin !== null && record.origin !== undefined && !origin)
-    ) {
-      return null;
-    }
-    return {
-      expires_at: expiresAt,
-      nonce,
-      origin,
-      purpose,
-      session_id: sessionId,
-      study_set_id: studySetId,
-      user_id: userId,
-    };
-  } catch {
-    return null;
-  }
+/**
+ * Bootstrap/control capability verification keys: active plus verify-only previous. Signing
+ * always uses the active key (see `signCapabilityToken`).
+ */
+function bootstrapCapabilityVerificationKeys(): Uint8Array[] | null {
+  return rotatingHmacKeys(
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET",
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET",
+  );
 }
 
-function verifyLibraryControlTokenClaims(
-  token: string,
-  secret: string,
-): LibraryControlTokenClaims | null {
-  const parts = token.split(".");
-  if (parts.length !== 3 || parts[0] !== LIBRARY_CONTROL_TOKEN_PREFIX) return null;
-  const claimsPart = parts[1] ?? "";
-  const signaturePart = parts[2] ?? "";
-  const signedPayload = `${LIBRARY_CONTROL_TOKEN_PREFIX}.${claimsPart}`;
-  let providedSignature: Buffer;
+/**
+ * Shared strict capability decoding. Reuses the Task 2 bounded canonical segment decoder and
+ * duplicate-key scanner, then enforces the exact top-level key set for the capability kind.
+ * Every structural, signature, or key-set failure returns null so callers can map them onto a
+ * single coarse public error.
+ */
+function verifySignedCapabilityClaims(input: {
+  token: string;
+  prefix: string;
+  allowedKeys: ReadonlySet<string>;
+}): Record<string, unknown> | null {
+  if (Buffer.byteLength(input.token, "utf8") > CAPABILITY_TOKEN_MAX_BYTES) return null;
+  const segments = input.token.split(".");
+  if (segments.length !== 3 || segments[0] !== input.prefix) return null;
+  const claimsSegment = segments[1] ?? "";
+  const signatureSegment = segments[2] ?? "";
+  const claimsBytes = decodeCanonicalBase64Url(claimsSegment);
+  const signatureBytes = decodeCanonicalBase64Url(signatureSegment);
+  if (!claimsBytes || !signatureBytes) return null;
+  if (signatureBytes.length !== SESSION_ACCESS_TOKEN_SIGNATURE_BYTES) return null;
+
+  const keys = bootstrapCapabilityVerificationKeys();
+  if (!keys) return null;
+  const signedPayload = `${input.prefix}.${claimsSegment}`;
+  const matched = keys.some((secretBytes) => {
+    const expected = createHmac("sha256", secretBytes).update(signedPayload).digest();
+    return expected.length === signatureBytes.length && timingSafeEqual(signatureBytes, expected);
+  });
+  if (!matched) return null;
+
+  let claimsText: string;
   try {
-    providedSignature = Buffer.from(signaturePart, "base64url");
+    claimsText = new TextDecoder("utf-8", { fatal: true }).decode(claimsBytes);
   } catch {
     return null;
   }
-  const expectedSignature = createHmac("sha256", secret).update(signedPayload).digest();
+  if (!scanJsonForDuplicateObjectKeys(claimsText).ok) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(claimsText) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const actual = Object.keys(parsed);
+  if (actual.length !== input.allowedKeys.size) return null;
+  if (actual.some((key) => !input.allowedKeys.has(key))) return null;
+  return parsed;
+}
+
+function verifySessionBootstrapTokenClaims(token: string): SessionBootstrapTokenClaims | null {
+  const record = verifySignedCapabilityClaims({
+    allowedKeys: SESSION_BOOTSTRAP_CLAIM_KEYS,
+    prefix: SESSION_BOOTSTRAP_TOKEN_PREFIX,
+    token,
+  });
+  if (!record) return null;
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return null;
+  const expiresAt = safeUnixTimestampClaim(record.expires_at);
+  const nonce = nonEmptyClaimString(record.nonce);
+  const origin = nonEmptyClaimString(record.origin);
+  const studySetId = nonEmptyClaimString(record.study_set_id);
+  const userId = nonEmptyClaimString(record.user_id);
+  const sessionId = record.session_id === null ? null : nonEmptyClaimString(record.session_id);
   if (
-    providedSignature.length !== expectedSignature.length ||
-    !timingSafeEqual(providedSignature, expectedSignature)
+    expiresAt === null ||
+    expiresAt <= Math.floor(Date.now() / 1000) ||
+    nonce === null ||
+    origin === null ||
+    origin !== canonical.value.origin ||
+    record.purpose !== SESSION_BOOTSTRAP_TOKEN_PURPOSE ||
+    studySetId === null ||
+    userId === null ||
+    (record.session_id !== null && sessionId === null)
   ) {
     return null;
   }
-  try {
-    const record = JSON.parse(Buffer.from(claimsPart, "base64url").toString("utf8")) as unknown;
-    if (!isRecord(record)) return null;
-    const expiresAt = numberClaim(record.expires_at);
-    const nonce = requiredString(record.nonce);
-    const purpose = record.purpose === LIBRARY_CONTROL_TOKEN_PURPOSE ? record.purpose : null;
-    const scope =
-      record.scope === "session_history_delete" || record.scope === "study_set_delete"
-        ? record.scope
-        : null;
-    const studySetId = requiredString(record.study_set_id);
-    const userId = requiredString(record.user_id);
-    const voiceSessionId =
-      record.voice_session_id === null || record.voice_session_id === undefined
-        ? null
-        : requiredString(record.voice_session_id);
-    const origin =
-      record.origin === null || record.origin === undefined ? null : requiredString(record.origin);
-    if (
-      expiresAt === null ||
-      expiresAt <= Math.floor(Date.now() / 1000) ||
-      !nonce ||
-      !purpose ||
-      !scope ||
-      !studySetId ||
-      !userId ||
-      (record.voice_session_id !== null &&
-        record.voice_session_id !== undefined &&
-        !voiceSessionId) ||
-      (record.origin !== null && record.origin !== undefined && !origin)
-    ) {
-      return null;
-    }
-    return {
-      expires_at: expiresAt,
-      nonce,
-      origin,
-      purpose,
-      scope,
-      study_set_id: studySetId,
-      user_id: userId,
-      voice_session_id: voiceSessionId,
-    };
-  } catch {
+  return {
+    expires_at: expiresAt,
+    nonce,
+    origin,
+    purpose: SESSION_BOOTSTRAP_TOKEN_PURPOSE,
+    session_id: sessionId,
+    study_set_id: studySetId,
+    user_id: userId,
+  };
+}
+
+function verifyLibraryControlTokenClaims(token: string): LibraryControlTokenClaims | null {
+  const record = verifySignedCapabilityClaims({
+    allowedKeys: LIBRARY_CONTROL_CLAIM_KEYS,
+    prefix: LIBRARY_CONTROL_TOKEN_PREFIX,
+    token,
+  });
+  if (!record) return null;
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return null;
+  const expiresAt = safeUnixTimestampClaim(record.expires_at);
+  const nonce = nonEmptyClaimString(record.nonce);
+  const origin = nonEmptyClaimString(record.origin);
+  const studySetId = nonEmptyClaimString(record.study_set_id);
+  const userId = nonEmptyClaimString(record.user_id);
+  const scope =
+    record.scope === "session_history_delete" || record.scope === "study_set_delete"
+      ? record.scope
+      : null;
+  const voiceSessionId =
+    record.voice_session_id === null ? null : nonEmptyClaimString(record.voice_session_id);
+  if (
+    expiresAt === null ||
+    expiresAt <= Math.floor(Date.now() / 1000) ||
+    nonce === null ||
+    origin === null ||
+    origin !== canonical.value.origin ||
+    record.purpose !== LIBRARY_CONTROL_TOKEN_PURPOSE ||
+    scope === null ||
+    studySetId === null ||
+    userId === null ||
+    (record.voice_session_id !== null && voiceSessionId === null)
+  ) {
     return null;
   }
+  // `voice_session_id` is null only for study-set deletion; session history deletion must
+  // name the session it is allowed to remove.
+  if (scope === "study_set_delete" ? voiceSessionId !== null : voiceSessionId === null) {
+    return null;
+  }
+  return {
+    expires_at: expiresAt,
+    nonce,
+    origin,
+    purpose: LIBRARY_CONTROL_TOKEN_PURPOSE,
+    scope,
+    study_set_id: studySetId,
+    user_id: userId,
+    voice_session_id: voiceSessionId,
+  };
 }
 
 function attachVivaSessionBootstrapTokensToStudySet(
   value: unknown,
   options: {
     allowedStudySetIds?: ReadonlySet<string> | null;
-    origin?: string | null;
     userId: string;
   },
 ): unknown {
@@ -1670,13 +1816,11 @@ function attachVivaSessionBootstrapTokensToStudySet(
     actions: {
       ...value.actions,
       resume: attachVivaSessionBootstrapTokenToAction(value.actions.resume, {
-        origin: options.origin,
         sessionId: sessionIdFromAction(value.actions.resume),
         studySetId: id,
         userId: options.userId,
       }),
       start: attachVivaSessionBootstrapTokenToAction(value.actions.start, {
-        origin: options.origin,
         sessionId: null,
         studySetId: id,
         userId: options.userId,
@@ -1689,7 +1833,6 @@ function attachVivaLibraryControlTokenToStudySetDelete(
   value: unknown,
   options: {
     allowedStudySetIds?: ReadonlySet<string> | null;
-    origin?: string | null;
     userId: string;
   },
 ): unknown {
@@ -1709,7 +1852,6 @@ function attachVivaLibraryControlTokenToStudySetDelete(
     actions: {
       ...value.actions,
       delete: attachVivaLibraryControlTokenToAction(value.actions.delete, {
-        origin: options.origin,
         scope: "study_set_delete",
         studySetId: id,
         userId: options.userId,
@@ -1723,7 +1865,6 @@ function attachVivaLibraryControlTokenToSessionDelete(
   value: unknown,
   options: {
     allowedStudySetIds?: ReadonlySet<string> | null;
-    origin?: string | null;
     userId: string;
   },
 ): unknown {
@@ -1740,7 +1881,6 @@ function attachVivaLibraryControlTokenToSessionDelete(
     return value;
   }
   const token = signVivaLibraryControlToken({
-    origin: options.origin,
     scope: "session_history_delete",
     studySetId,
     userId: options.userId,
@@ -1763,7 +1903,6 @@ function attachVivaLibraryControlTokenToSessionDelete(
 function attachVivaLibraryControlTokenToAction(
   value: unknown,
   input: {
-    origin?: string | null;
     scope: VivaLibraryControlScope;
     studySetId: string;
     userId: string;
@@ -1778,7 +1917,6 @@ function attachVivaLibraryControlTokenToAction(
 function attachVivaSessionBootstrapTokenToAction(
   value: unknown,
   input: {
-    origin?: string | null;
     sessionId: string | null;
     studySetId: string;
     userId: string;
