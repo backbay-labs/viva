@@ -12,7 +12,7 @@
  *   node apps/mobile/scripts/bake-vellum.mjs
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, statSync, unlinkSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -93,78 +93,90 @@ mkdirSync(OUT_DIR, { recursive: true });
 const browser = await chromium.launch({
   args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
 });
-const page = await browser.newPage({ viewport: { width: WIDTH, height: HEIGHT } });
 const errors = [];
-page.on("console", (message) => {
-  if (/SHADER|LINK/.test(message.text())) errors.push(message.text());
-});
+try {
+  const page = await browser.newPage({ viewport: { width: WIDTH, height: HEIGHT } });
+  page.on("console", (message) => {
+    if (/SHADER|LINK/.test(message.text())) errors.push(message.text());
+  });
 
-await page.setContent(
-  `<style>html,body{margin:0;overflow:hidden}canvas{display:block}</style>` +
-    `<canvas id="c" width="${WIDTH}" height="${HEIGHT}"></canvas>`,
-);
+  await page.setContent(
+    `<style>html,body{margin:0;overflow:hidden}canvas{display:block}</style>` +
+      `<canvas id="c" width="${WIDTH}" height="${HEIGHT}"></canvas>`,
+  );
 
-await page.evaluate(
-  ({ width, height, fragment, ground, phase }) => {
-    const canvas = document.getElementById("c");
-    const gl = canvas.getContext("webgl", { antialias: false, alpha: false });
-    const compile = (type, source) => {
-      const shader = gl.createShader(type);
-      gl.shaderSource(shader, source);
-      gl.compileShader(shader);
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        console.log(`SHADER: ${gl.getShaderInfoLog(shader)}`);
+  await page.evaluate(
+    ({ width, height, fragment, ground, phase }) => {
+      const canvas = document.getElementById("c");
+      const gl = canvas.getContext("webgl", { antialias: false, alpha: false });
+      const compile = (type, source) => {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.log(`SHADER: ${gl.getShaderInfoLog(shader)}`);
+        }
+        return shader;
+      };
+      const program = gl.createProgram();
+      gl.attachShader(
+        program,
+        compile(gl.VERTEX_SHADER, "attribute vec2 aPos;void main(){gl_Position=vec4(aPos,0.,1.);}"),
+      );
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.log(`LINK: ${gl.getProgramInfoLog(program)}`);
       }
-      return shader;
-    };
-    const program = gl.createProgram();
-    gl.attachShader(
-      program,
-      compile(gl.VERTEX_SHADER, "attribute vec2 aPos;void main(){gl_Position=vec4(aPos,0.,1.);}"),
-    );
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      console.log(`LINK: ${gl.getProgramInfoLog(program)}`);
-    }
-    gl.useProgram(program);
+      gl.useProgram(program);
 
-    const buffer = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const attribute = gl.getAttribLocation(program, "aPos");
-    gl.enableVertexAttribArray(attribute);
-    gl.vertexAttribPointer(attribute, 2, gl.FLOAT, false, 0, 0);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const attribute = gl.getAttribLocation(program, "aPos");
+      gl.enableVertexAttribArray(attribute);
+      gl.vertexAttribPointer(attribute, 2, gl.FLOAT, false, 0, 0);
 
-    const at = (name) => gl.getUniformLocation(program, name);
-    gl.viewport(0, 0, width, height);
-    gl.uniform2f(at("uRes"), width, height);
-    const t1 = phase / 38;
-    const t2 = phase / 47;
-    gl.uniform2f(at("uD1"), Math.sin(t1 * 6.2831) * 0.375, Math.cos(t1 * 6.2831) * 0.275);
-    gl.uniform2f(at("uD2"), Math.cos(t2 * 6.2831) * 0.36, Math.sin(t2 * 6.2831) * 0.51);
-    gl.uniform1f(at("uMat"), ground.material);
-    gl.uniform1f(at("uDrama"), ground.drama);
-    gl.uniform1f(at("uWarm"), ground.warmth);
-    gl.uniform1f(at("uScale"), ground.leafScale);
-    gl.uniform1f(at("uGrain"), ground.grain);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
-  },
-  { width: WIDTH, height: HEIGHT, fragment: FRAGMENT, ground: GROUND, phase: PHASE },
-);
+      const at = (name) => gl.getUniformLocation(program, name);
+      gl.viewport(0, 0, width, height);
+      gl.uniform2f(at("uRes"), width, height);
+      const t1 = phase / 38;
+      const t2 = phase / 47;
+      gl.uniform2f(at("uD1"), Math.sin(t1 * 6.2831) * 0.375, Math.cos(t1 * 6.2831) * 0.275);
+      gl.uniform2f(at("uD2"), Math.cos(t2 * 6.2831) * 0.36, Math.sin(t2 * 6.2831) * 0.51);
+      gl.uniform1f(at("uMat"), ground.material);
+      gl.uniform1f(at("uDrama"), ground.drama);
+      gl.uniform1f(at("uWarm"), ground.warmth);
+      gl.uniform1f(at("uScale"), ground.leafScale);
+      gl.uniform1f(at("uGrain"), ground.grain);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    },
+    { width: WIDTH, height: HEIGHT, fragment: FRAGMENT, ground: GROUND, phase: PHASE },
+  );
 
-await page.locator("#c").screenshot({ path: OUT_PNG });
-await browser.close();
-
-if (errors.length > 0) {
-  throw new Error(`shader failed to build:\n${errors.join("\n")}`);
+  await page.locator("#c").screenshot({ path: OUT_PNG });
+} finally {
+  await browser.close();
 }
 
-execFileSync("cwebp", ["-q", String(QUALITY), OUT_PNG, "-o", OUT_WEBP, "-quiet"]);
-unlinkSync(OUT_PNG);
+const TMP_WEBP = `${OUT_WEBP}.tmp`;
 
-const kb = statSync(OUT_WEBP).size / 1024;
-console.log(`baked ${WIDTH}x${HEIGHT} @ q${QUALITY} -> ${OUT_WEBP} (${kb.toFixed(0)} KB)`);
-if (kb > 420) {
-  throw new Error(`plate is ${kb.toFixed(0)} KB, over the 420 KB budget`);
+try {
+  if (errors.length > 0) {
+    throw new Error(`shader failed to build:\n${errors.join("\n")}`);
+  }
+  execFileSync("cwebp", ["-q", String(QUALITY), OUT_PNG, "-o", TMP_WEBP, "-quiet"]);
+
+  const kb = statSync(TMP_WEBP).size / 1024;
+  if (kb > 420) {
+    throw new Error(
+      `plate is ${kb.toFixed(0)} KB, over the 420 KB budget — committed asset left untouched`,
+    );
+  }
+
+  renameSync(TMP_WEBP, OUT_WEBP);
+  console.log(`baked ${WIDTH}x${HEIGHT} @ q${QUALITY} -> ${OUT_WEBP} (${kb.toFixed(0)} KB)`);
+} finally {
+  rmSync(OUT_PNG, { force: true });
+  rmSync(TMP_WEBP, { force: true });
 }
