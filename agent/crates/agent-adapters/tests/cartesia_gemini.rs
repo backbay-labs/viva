@@ -5614,3 +5614,1232 @@ fn adapter_pcm16_fixture_helper_rejects_odd_byte_length() {
         "agent-domain must not grow a fixtures feature for this helper"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 (`ADAPTER-11`): frozen characterization traces.
+//
+// These are deliberately GREEN characterization, not fabricated RED tests. They
+// exist to prove that the responsibility extraction that follows changes no
+// event order, payload, provider request, fallback choice, retry policy,
+// timeout/cancel/close behaviour, outcome projection, or public construction.
+//
+// No trace snapshots a raw provider string: identities, typed classifications,
+// bounded allowlisted metadata, and counts only.
+// ---------------------------------------------------------------------------
+
+/// One canonical line per emitted domain event.
+fn canonical_event_line(event: &BrainEvent) -> String {
+    match event {
+        BrainEvent::SessionPhase { phase } => format!("session_phase:{phase:?}"),
+        BrainEvent::TerminalSessionPhase {
+            phase,
+            terminal_reason,
+        } => format!("terminal_session_phase:{phase:?}:{terminal_reason:?}"),
+        BrainEvent::QuestionStarted {
+            response_id,
+            question,
+        } => format!(
+            "question_started:{response_id}:{}:{}:criteria={}",
+            question.question_id,
+            question.concept_id,
+            question.rubric.criteria.len()
+        ),
+        BrainEvent::TranscriptDelta { response_id, .. } => {
+            format!("transcript_delta:{response_id}")
+        }
+        BrainEvent::TranscriptFinal {
+            response_id,
+            confidence,
+            ..
+        } => format!(
+            "transcript_final:{response_id}:confidence={}",
+            confidence.map_or_else(|| "none".to_owned(), |value| format!("{value}"))
+        ),
+        BrainEvent::ResponseTranscriptDelta { response_id, .. } => {
+            format!("response_transcript_delta:{response_id}")
+        }
+        BrainEvent::ResponseTextStarted { response_id } => {
+            format!("response_text_started:{response_id}")
+        }
+        BrainEvent::AnswerEvaluated {
+            response_id,
+            evaluation,
+        } => format!(
+            "answer_evaluated:{response_id}:{}:label={}:status={:?}:confidence={}:source={}",
+            evaluation.question_id,
+            evaluation.label,
+            evaluation.concept_status,
+            evaluation.confidence_score,
+            evaluation.source.source_id
+        ),
+        BrainEvent::TurnDeferred {
+            response_id,
+            question_id,
+            reason,
+            can_retry_same_question,
+        } => format!(
+            "turn_deferred:{response_id}:{question_id}:{reason:?}:retry={can_retry_same_question}"
+        ),
+        BrainEvent::SourceReference {
+            response_id,
+            source,
+        } => format!("source_reference:{response_id}:{}", source.source_id),
+        BrainEvent::ConceptStatus {
+            response_id,
+            concept_id,
+            status,
+        } => format!("concept_status:{response_id}:{concept_id}={status:?}"),
+        BrainEvent::ManuscriptIntent {
+            response_id,
+            intent,
+        } => format!(
+            "manuscript_intent:{response_id}:{}",
+            manuscript_kind(intent)
+        ),
+        BrainEvent::AudioDelta { response_id, frame } => format!(
+            "audio_delta:{response_id}:bytes={}",
+            frame.pcm16_bytes().len()
+        ),
+        BrainEvent::ResponseAudio { response_id, frame } => format!(
+            "response_audio:{response_id}:bytes={}",
+            frame.pcm16_bytes().len()
+        ),
+        BrainEvent::RecapReady { response_id, recap } => format!(
+            "recap_ready:{response_id}:concepts={}:moments={}:deferred={}",
+            recap.concepts.len(),
+            recap.source_moments.len(),
+            recap.deferred_turns
+        ),
+        BrainEvent::ResponseStarted { response_id } => format!("response_started:{response_id}"),
+        BrainEvent::ResponseCompleted { response_id } => {
+            format!("response_completed:{response_id}")
+        }
+        BrainEvent::ResponseCancelledFor { response_id } => format!("cancellation:{response_id}"),
+        BrainEvent::ResponseCancelled => "cancellation:session".to_owned(),
+        BrainEvent::ResponseToolProposal {
+            response_id,
+            proposal,
+        } => format!("tool_proposal:{response_id}:{}", proposal.name()),
+        BrainEvent::ProviderFallbackActivated {
+            response_id,
+            provider,
+            from_model,
+            to_model,
+            reason,
+            failure,
+        } => format!(
+            "provider_fallback:{response_id}:{provider}:{from_model}->{to_model}:{reason}:{}",
+            failure
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), canonical_failure_line)
+        ),
+        BrainEvent::Error(error) => format!(
+            "error:{}",
+            error
+                .failure
+                .as_ref()
+                .map_or_else(|| "untyped".to_owned(), canonical_failure_line)
+        ),
+        BrainEvent::Usage(usage) => format!(
+            "usage:text_in={}:text_out={}:corrections={}",
+            usage.text_input_tokens,
+            usage.text_output_tokens,
+            usage.source_grounded_correction_count
+        ),
+        BrainEvent::InputSpeechStarted => "input_speech_started".to_owned(),
+        BrainEvent::InputSpeechStopped => "input_speech_stopped".to_owned(),
+        BrainEvent::SpeechIntent(_) => "speech_intent".to_owned(),
+        BrainEvent::Transcript(_) => "transcript".to_owned(),
+        // `BrainEvent` is `#[non_exhaustive]`. A variant this crate does not
+        // know is a trace hole, so it is named loudly rather than swallowed.
+        other => panic!("unclassified domain event in the frozen trace: {other:?}"),
+    }
+}
+
+/// A typed failure rendered by its classification only. `metadata()` is Plan
+/// 06-sanitized and Task 6-allowlisted, so it carries closed adapter tokens
+/// rather than provider prose.
+fn canonical_failure_line(failure: &agent_domain::BrainProviderFailure) -> String {
+    format!(
+        "class={:?}:stage={:?}:terminal={:?}:retry={}:provider={}:metadata={}",
+        failure.failure_class(),
+        failure.stage(),
+        failure.terminal_reason(),
+        failure.retry_eligible(),
+        failure.provider(),
+        failure.metadata()
+    )
+}
+
+fn manuscript_kind(intent: &ManuscriptIntent) -> String {
+    match intent {
+        ManuscriptIntent::Scene {
+            register, emphasis, ..
+        } => format!("scene:{register:?}:{emphasis:?}"),
+        ManuscriptIntent::Entity {
+            entity_id,
+            entity_kind,
+            register,
+            emphasis,
+        } => format!("entity:{entity_id}:{entity_kind:?}:{register:?}:{emphasis:?}"),
+        ManuscriptIntent::Marginalia {
+            marginalia_id,
+            anchor_entity_id,
+            register,
+            emphasis,
+        } => format!("marginalia:{marginalia_id}:{anchor_entity_id}:{register:?}:{emphasis:?}"),
+    }
+}
+
+fn canonical_event_trace(events: &[BrainEvent]) -> Vec<String> {
+    events.iter().map(canonical_event_line).collect()
+}
+
+#[tokio::test]
+async fn two_turn_live_orchestration_trace_is_stable_across_extraction() {
+    // (a) The frozen voice fixture drives both turns: the store answers with the
+    //     fixture's own questions and resolutions, so this trace is the
+    //     orchestration the fixture publishes.
+    let (_, fixture_events) =
+        two_turn_fixture_projection("VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION", "fake").await;
+    assert_eq!(
+        canonical_event_trace(&fixture_events),
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-fixture-1:concept-fixture-1:criteria=1",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-1:entity:nadh:Concept:Correcting:Marked",
+            "source_reference:response-1:src-lecture-5-slide-18",
+            "answer_evaluated:response-1:q-fixture-1:label=mostly correct:status=Strong:confidence=0.9:source=src-lecture-5-slide-18",
+            "concept_status:response-1:concept-fixture-1=Strong",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "audio_delta:response-1:bytes=4",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-1",
+            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
+            "cancellation:response-1",
+            "question_started:response-2:q-fixture-2:concept-fixture-2:criteria=1",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-2:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-2:entity:nadh:Concept:Correcting:Marked",
+            "turn_deferred:response-2:q-fixture-2:EvaluatorUnavailable:retry=true",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-2",
+            "session_phase:Recap",
+        ],
+        "{fixture_events:?}"
+    );
+
+    // (b) The frozen learning-core corpus drives both turns through the seeded
+    //     study store: the same orchestration, with the corpus's own rotation
+    //     choosing each turn's verdict.
+    let store = learning_ready_store();
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime.open(fixture_session_config()).await.unwrap();
+    let mut learning_events = vec![next_event(&mut session).await];
+    for answer in ["first corpus answer", "second corpus answer"] {
+        session
+            .input
+            .send(BrainInput::Text(answer.to_owned()))
+            .await
+            .unwrap();
+        while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+            let completed = matches!(event, BrainEvent::ResponseCompleted { .. });
+            learning_events.push(event);
+            if completed {
+                break;
+            }
+        }
+    }
+    session.input.send(BrainInput::Stop).await.ok();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+        learning_events.push(event);
+    }
+    drop(session);
+    assert_eq!(
+        canonical_event_trace(&learning_events),
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-oxidative-phosphorylation-nadh:concept-oxidative-phosphorylation:criteria=2",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-1:entity:nadh:Concept:Correcting:Marked",
+            "source_reference:response-1:src-lecture-5-slide-18",
+            "answer_evaluated:response-1:q-oxidative-phosphorylation-nadh:label=strong:status=Strong:confidence=0.9:source=src-lecture-5-slide-18",
+            "concept_status:response-1:concept-oxidative-phosphorylation=Strong",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "audio_delta:response-1:bytes=4",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-1",
+            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
+            "cancellation:response-1",
+            "question_started:response-2:q-oxidative-phosphorylation-atp:concept-oxidative-phosphorylation:criteria=2",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-2:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-2:entity:nadh:Concept:Correcting:Marked",
+            "source_reference:response-2:src-lecture-5-slide-18",
+            "answer_evaluated:response-2:q-oxidative-phosphorylation-atp:label=strong:status=Strong:confidence=0.9:source=src-lecture-5-slide-18",
+            "concept_status:response-2:concept-oxidative-phosphorylation=Strong",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "audio_delta:response-2:bytes=4",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-2",
+            "recap_ready:response-2:concepts=1:moments=2:deferred=0",
+            "session_phase:Recap",
+        ],
+        "{learning_events:?}"
+    );
+}
+
+/// A loopback HTTP/1.1 responder that answers every request with one canned
+/// status and body. It exists so a live composition can be driven into a typed
+/// HTTP failure without a network or a key.
+struct LoopbackHttpServer {
+    base_url: String,
+    requests: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl LoopbackHttpServer {
+    async fn start(status_line: &'static str, body: &'static str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is available");
+        let port = listener.local_addr().expect("bound address").port();
+        let requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let served = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut scratch = [0_u8; 4096];
+                    let mut buffer = Vec::new();
+                    loop {
+                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        match stream.read(&mut scratch).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&scratch[..read]),
+                        }
+                    }
+                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            requests,
+        }
+    }
+
+    fn requests(&self) -> u32 {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A loopback WebSocket endpoint that completes the upgrade and then closes with
+/// a fixed code and a hostile reason. It drives a typed provider close without a
+/// network or a key.
+struct LoopbackClosingWebSocket {
+    url: String,
+    connections: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl LoopbackClosingWebSocket {
+    async fn start(close_code: u16, reason: &'static str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is available");
+        let port = listener.local_addr().expect("bound address").port();
+        let connections = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let accepted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let accepted = Arc::clone(&accepted);
+                tokio::spawn(async move {
+                    use futures_util::{SinkExt, StreamExt};
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Take the client's whole turn first — the audio frames and
+                    // the close command — so the hang-up lands on a connected
+                    // socket rather than on a half-written request.
+                    while let Some(Ok(message)) = socket.next().await {
+                        if message.is_text() {
+                            break;
+                        }
+                    }
+                    let _ = socket
+                        .send(tokio_tungstenite::tungstenite::Message::Close(Some(
+                            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                code: close_code.into(),
+                                reason: reason.into(),
+                            },
+                        )))
+                        .await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        Self {
+            url: format!("ws://127.0.0.1:{port}"),
+            connections,
+        }
+    }
+
+    fn connections(&self) -> u32 {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A live composition that reaches only loopback endpoints. It is a live
+/// *runtime*, not a live *provider*: no key is real and no request leaves the
+/// machine.
+fn loopback_live_config(
+    gemini_base_url: &str,
+    ink_url: &str,
+    sonic_url: &str,
+) -> CartesiaGeminiConfig {
+    CartesiaGeminiConfig {
+        cartesia_api_key: "cartesia-loopback-key".to_owned(),
+        gemini: GeminiConfig {
+            api_key: "gemini-loopback-key".to_owned(),
+            base_url: gemini_base_url.to_owned(),
+            fallback_model_ids: Vec::new(),
+            ..GeminiConfig::default()
+        },
+        ink: InkConfig {
+            websocket_url: ink_url.to_owned(),
+            ..InkConfig::default()
+        },
+        sonic: SonicConfig {
+            websocket_url: sonic_url.to_owned(),
+            ..SonicConfig::default()
+        },
+        live_runtime_enabled: true,
+        cartesia_zero_data_retention_enabled: true,
+        gemini_zero_data_retention_approved: true,
+        ..CartesiaGeminiConfig::default()
+    }
+}
+
+/// Drive one turn to its first terminal marker and return everything emitted.
+async fn drain_turn(session: &mut RealtimeSession, input: BrainInput) -> Vec<BrainEvent> {
+    session.input.send(input).await.expect("input accepted");
+    let mut events = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(10), session.events.recv()).await {
+        let terminal = matches!(
+            event,
+            BrainEvent::ResponseCompleted { .. } | BrainEvent::Error(_)
+        );
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    events
+}
+
+#[tokio::test]
+async fn evaluated_deferred_cancel_and_error_projection_trace_is_stable() {
+    // 1. One evaluated outcome, projected from the persisted Plan 04 record.
+    let evaluated = run_fixture_outcome_turn(Arc::new(FixtureOutcomeStore::new(
+        learning_core_question(),
+        learning_core_sources(),
+        learning_core_turn_outcome("evaluated_optional_contradiction_is_shaky"),
+    )))
+    .await;
+    assert_eq!(
+        canonical_event_trace(&evaluated),
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-etc-electron-flow:concept-electron-transport-chain:criteria=4",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-1:entity:nadh:Concept:Correcting:Marked",
+            "source_reference:response-1:src-lec5-slide-18",
+            "answer_evaluated:response-1:q-etc-electron-flow:label=mostly correct:status=Strong:confidence=0.9:source=src-lec5-slide-18",
+            "concept_status:response-1:concept-electron-transport-chain=Strong",
+            "concept_status:response-1:concept-proton-gradient=Shaky",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "audio_delta:response-1:bytes=4",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-1",
+            "recap_ready:response-1:concepts=2:moments=3:deferred=0",
+        ],
+        "{evaluated:?}"
+    );
+
+    // 2. One durable deferred outcome: a recovery signal with no learner fact,
+    //    no speech, and no graded recap.
+    let deferred = run_fixture_outcome_turn(Arc::new(FixtureOutcomeStore::new(
+        learning_core_question(),
+        learning_core_sources(),
+        learning_core_turn_outcome("deferred_insufficient_semantic_evidence"),
+    )))
+    .await;
+    assert_eq!(
+        canonical_event_trace(&deferred),
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-etc-electron-flow:concept-electron-transport-chain:criteria=4",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "manuscript_intent:response-1:entity:nadh:Concept:Correcting:Marked",
+            "turn_deferred:response-1:q-etc-electron-flow:InsufficientSemanticEvidence:retry=true",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-1",
+        ],
+        "{deferred:?}"
+    );
+
+    // 3. One barge-in: the replaced response is cancelled and its audio is
+    //    suppressed before the replacement turn starts.
+    let (store, session_config) = fixture_store_and_session().await;
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime
+        .open_scripted_session(session_config, FakeSessionScenario::BargeInDuringSonicAudio)
+        .expect("the scripted session opens");
+    let mut barge_in = Vec::new();
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        barge_in.push(next_event(&mut session).await);
+    }
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            5_u8, 6, 7, 8,
+        ])))
+        .await
+        .unwrap();
+    barge_in.push(next_event(&mut session).await);
+    barge_in.extend(remaining_events(&mut session).await);
+    drop(session);
+    assert_eq!(
+        canonical_event_trace(&barge_in),
+        vec![
+            "input_speech_started",
+            "transcript_final:fake-cartesia-gemini-session-response-1:confidence=none",
+            "usage:text_in=20:text_out=10:corrections=1",
+            "cancellation:fake-cartesia-gemini-session-response-1",
+        ],
+        "{barge_in:?}"
+    );
+
+    // 4. One typed HTTP failure, from a live composition talking to a loopback
+    //    endpoint that refuses the credential.
+    let refusing = LoopbackHttpServer::start(
+        "401 Unauthorized",
+        r#"{"error":{"status":"UNAUTHENTICATED","message":"loopback-http-marker"}}"#,
+    )
+    .await;
+    let brain = CartesiaGeminiBrain::new(
+        loopback_live_config(&refusing.base_url, "ws://127.0.0.1:1", "ws://127.0.0.1:1"),
+        learning_ready_store(),
+    );
+    let mut session = brain
+        .open(fixture_session_config())
+        .await
+        .expect("an explicit live runtime opens without a network");
+    let mut http_failure = vec![
+        next_event(&mut session).await,
+        next_event(&mut session).await,
+    ];
+    http_failure
+        .extend(drain_turn(&mut session, BrainInput::Text("a live answer".to_owned())).await);
+    drop(session);
+    assert!(
+        refusing.requests() >= 1,
+        "the live turn reached the endpoint"
+    );
+    let http_trace = canonical_event_trace(&http_failure);
+    assert_eq!(
+        http_trace,
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-oxidative-phosphorylation-nadh:concept-oxidative-phosphorylation:criteria=2",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "error:class=ProviderAuthFailure:stage=Gemini:terminal=ProviderAuthFailed:retry=false:provider=gemini:metadata=stage=gemini error_kind=gemini_http_auth http_status=401 retry_eligible=false retry_after_ms=1000 retry_after_source=default body_status=unknown",
+        ],
+        "{http_failure:?}"
+    );
+    assert!(
+        !http_trace.join("|").contains("loopback-http-marker"),
+        "the provider body never reaches the trace: {http_trace:?}"
+    );
+
+    // 5. One typed WebSocket close, from a live composition whose speech-to-text
+    //    endpoint accepts the upgrade and then hangs up.
+    let closing = LoopbackClosingWebSocket::start(1011, "loopback-close-marker").await;
+    let brain = CartesiaGeminiBrain::new(
+        loopback_live_config(&refusing.base_url, &closing.url, "ws://127.0.0.1:1"),
+        learning_ready_store(),
+    );
+    let mut session = brain
+        .open(fixture_session_config())
+        .await
+        .expect("an explicit live runtime opens without a network");
+    let mut ws_failure = vec![
+        next_event(&mut session).await,
+        next_event(&mut session).await,
+    ];
+    ws_failure.extend(
+        drain_turn(
+            &mut session,
+            BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4])),
+        )
+        .await,
+    );
+    drop(session);
+    assert_eq!(closing.connections(), 1);
+    let ws_trace = canonical_event_trace(&ws_failure);
+    assert_eq!(
+        ws_trace,
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-oxidative-phosphorylation-nadh:concept-oxidative-phosphorylation:criteria=2",
+            "input_speech_started",
+            "session_phase:Listening",
+            "error:class=MalformedStream:stage=Provider:terminal=ProviderMalformedStream:retry=true:provider=cartesia:metadata=stage=cartesia_ink error_kind=cartesia_ink_ws_closed ws_close_code=1011 retry_eligible=true",
+        ],
+        "{ws_failure:?}"
+    );
+    assert!(
+        !ws_trace.join("|").contains("loopback-close-marker"),
+        "the provider close reason never reaches the trace: {ws_trace:?}"
+    );
+}
+
+/// A recording loopback stand-in for Gemini.
+///
+/// It answers the first request with `429` so the bounded fallback policy has
+/// to promote a model, then serves the evaluator's bounded JSON answer and both
+/// tool-loop passes. It records only the request ordinal, the model named in the
+/// path, and the status it returned.
+struct RecordingGeminiEndpoint {
+    base_url: String,
+    calls: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl RecordingGeminiEndpoint {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is available");
+        let port = listener.local_addr().expect("bound address").port();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    serve_recording_gemini(stream, recorded).await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            calls,
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, u16)> {
+        self.calls
+            .lock()
+            .expect("gemini record lock poisoned")
+            .clone()
+    }
+}
+
+async fn serve_recording_gemini(
+    mut stream: tokio::net::TcpStream,
+    calls: Arc<Mutex<Vec<(String, u16)>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = Vec::new();
+    let mut scratch = [0_u8; 8192];
+    loop {
+        let head_end = loop {
+            if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            match stream.read(&mut scratch).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffer.extend_from_slice(&scratch[..read]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let content_length = head
+            .to_ascii_lowercase()
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        while buffer.len() < head_end + content_length {
+            match stream.read(&mut scratch).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buffer.extend_from_slice(&scratch[..read]),
+            }
+        }
+        let body =
+            String::from_utf8_lossy(&buffer[head_end..head_end + content_length]).to_string();
+        buffer.drain(..head_end + content_length);
+
+        // `POST /{model}:streamGenerateContent?alt=sse HTTP/1.1`
+        let model = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.rsplit('/').next())
+            .and_then(|tail| tail.split(':').next())
+            .unwrap_or("unknown")
+            .to_owned();
+
+        let first_call = {
+            let mut record = calls.lock().expect("gemini record lock poisoned");
+            let first = record.is_empty();
+            record.push((model.clone(), if first { 429 } else { 200 }));
+            first
+        };
+
+        let (status_line, payload) = if first_call {
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"loopback-rate-marker"}}"#
+                    .to_owned(),
+            )
+        } else if body.contains("responseMimeType") {
+            // The evaluator's bounded JSON answer: criterion verdicts only.
+            let decision = json!({
+                "kind": "evaluated",
+                "assessments": [
+                    { "criterion_id": "crit-oxphos-donor", "assessment": "satisfied", "confidence": 0.9 },
+                    { "criterion_id": "crit-oxphos-gradient", "assessment": "satisfied", "confidence": 0.88 },
+                ],
+                "concise_feedback": "Both required claims held.",
+                "retry_prompt": null,
+            })
+            .to_string();
+            (
+                "200 OK",
+                format!(
+                    "data: {}\n\n",
+                    json!({ "candidates": [{ "content": { "parts": [{ "text": decision }] } }] })
+                ),
+            )
+        } else if body.contains("functionResponse") {
+            (
+                "200 OK",
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "candidates": [{ "content": { "parts": [{ "text": "That holds up. Next question." }] } }],
+                        "usageMetadata": { "promptTokenCount": 17, "candidatesTokenCount": 6 },
+                    })
+                ),
+            )
+        } else {
+            (
+                "200 OK",
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "candidates": [{ "content": { "parts": [{ "functionCall": {
+                            "id": "call-eval-1",
+                            "name": "evaluate_spoken_answer",
+                            "args": {
+                                "study_set_id": "biology-midterm",
+                                "voice_session_id": "voice-session-1",
+                                "question_id": "q-oxidative-phosphorylation-nadh",
+                                "answer_text": "NADH donates electrons to the chain and pumps protons.",
+                            },
+                        } }] } }],
+                        "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 3 },
+                    })
+                ),
+            )
+        };
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        if stream.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = stream.flush().await;
+    }
+}
+
+/// A recording loopback stand-in for Cartesia Ink.
+struct RecordingInkEndpoint {
+    url: String,
+    record: Arc<Mutex<InkRecord>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct InkRecord {
+    connections: u32,
+    audio_frames: u32,
+    close_commands: u32,
+}
+
+impl RecordingInkEndpoint {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is available");
+        let port = listener.local_addr().expect("bound address").port();
+        let record = Arc::new(Mutex::new(InkRecord::default()));
+        let served = Arc::clone(&record);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    use futures_util::{SinkExt, StreamExt};
+                    use tokio_tungstenite::tungstenite::Message;
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    served.lock().expect("ink record lock poisoned").connections += 1;
+                    while let Some(Ok(message)) = socket.next().await {
+                        match message {
+                            Message::Binary(_) => {
+                                served
+                                    .lock()
+                                    .expect("ink record lock poisoned")
+                                    .audio_frames += 1;
+                            }
+                            Message::Text(_) => {
+                                served
+                                    .lock()
+                                    .expect("ink record lock poisoned")
+                                    .close_commands += 1;
+                                let event = json!({
+                                    "type": "turn.end",
+                                    "text": "NADH donates electrons to the chain and pumps protons.",
+                                    "confidence": null,
+                                });
+                                let _ = socket.send(Message::text(event.to_string())).await;
+                                let _ = socket.flush().await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            url: format!("ws://127.0.0.1:{port}"),
+            record,
+        }
+    }
+
+    fn record(&self) -> InkRecord {
+        self.record
+            .lock()
+            .expect("ink record lock poisoned")
+            .clone()
+    }
+}
+
+/// A recording loopback stand-in for Cartesia Sonic.
+///
+/// It records the shape of every write — context id, whether the context stays
+/// open, and whether the write was the documented cancel — and answers the
+/// finalizer with one audio chunk and `done`.
+struct RecordingSonicEndpoint {
+    url: String,
+    record: Arc<Mutex<SonicRecord>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SonicRecord {
+    connections: u32,
+    writes: Vec<String>,
+}
+
+impl RecordingSonicEndpoint {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port is available");
+        let port = listener.local_addr().expect("bound address").port();
+        let record = Arc::new(Mutex::new(SonicRecord::default()));
+        let served = Arc::clone(&record);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    use futures_util::{SinkExt, StreamExt};
+                    use tokio_tungstenite::tungstenite::Message;
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    served
+                        .lock()
+                        .expect("sonic record lock poisoned")
+                        .connections += 1;
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let context_id = value["context_id"].as_str().unwrap_or("none").to_owned();
+                        let line = if value["cancel"].as_bool().unwrap_or(false) {
+                            format!("cancel:{context_id}")
+                        } else {
+                            format!(
+                                "generate:{context_id}:continue={}:transcript={}",
+                                value["continue"].as_bool().unwrap_or(false),
+                                if value["transcript"].as_str().unwrap_or("").is_empty() {
+                                    "empty"
+                                } else {
+                                    "present"
+                                }
+                            )
+                        };
+                        let finalizer = line.starts_with("generate:")
+                            && !value["continue"].as_bool().unwrap_or(false);
+                        served
+                            .lock()
+                            .expect("sonic record lock poisoned")
+                            .writes
+                            .push(line);
+                        if finalizer {
+                            let chunk = json!({
+                                "type": "chunk",
+                                "context_id": context_id,
+                                "data": "AQIDBA==",
+                            });
+                            let done = json!({ "type": "done", "context_id": context_id });
+                            let _ = socket.send(Message::text(chunk.to_string())).await;
+                            let _ = socket.send(Message::text(done.to_string())).await;
+                            let _ = socket.flush().await;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            // Sonic's endpoint builder appends its query to the configured URL
+            // verbatim, so the loopback stand-in publishes a real path.
+            url: format!("ws://127.0.0.1:{port}/tts/websocket"),
+            record,
+        }
+    }
+
+    fn record(&self) -> SonicRecord {
+        self.record
+            .lock()
+            .expect("sonic record lock poisoned")
+            .clone()
+    }
+}
+
+#[tokio::test]
+async fn primary_fallback_ink_and_sonic_call_trace_is_stable() {
+    let gemini = RecordingGeminiEndpoint::start().await;
+    let ink = RecordingInkEndpoint::start().await;
+    let sonic = RecordingSonicEndpoint::start().await;
+
+    let mut config = loopback_live_config(&gemini.base_url, &ink.url, &sonic.url);
+    config.gemini.fallback_model_ids = vec!["gemini-3.5-flash-lite".to_owned()];
+    let brain = CartesiaGeminiBrain::new(config, learning_ready_store());
+    let mut session = brain
+        .open(fixture_session_config())
+        .await
+        .expect("an explicit live runtime opens without a network");
+
+    let mut events = vec![
+        next_event(&mut session).await,
+        next_event(&mut session).await,
+    ];
+    events.extend(
+        drain_turn(
+            &mut session,
+            BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![1_u8, 2, 3, 4])),
+        )
+        .await,
+    );
+    session.input.send(BrainInput::Stop).await.ok();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+        events.push(event);
+    }
+    drop(session);
+
+    // The provider-call trace: stage, attempt ordinal, selected model, the Ink
+    // turn's frames, and the Sonic context's continuation and finalizer.
+    let gemini_calls = gemini
+        .calls()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (model, status))| format!("gemini:attempt={}:{model}:{status}", index + 1))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gemini_calls,
+        vec![
+            "gemini:attempt=1:gemini-3.5-flash:429",
+            "gemini:attempt=2:gemini-3.5-flash-lite:200",
+            "gemini:attempt=3:gemini-3.5-flash:200",
+            "gemini:attempt=4:gemini-3.5-flash-lite:200",
+        ],
+        "{events:?}"
+    );
+    assert_eq!(
+        ink.record(),
+        InkRecord {
+            connections: 1,
+            audio_frames: 1,
+            close_commands: 1,
+        }
+    );
+    assert_eq!(
+        sonic.record(),
+        SonicRecord {
+            connections: 1,
+            writes: vec![
+                "generate:response-1:continue=true:transcript=present".to_owned(),
+                "generate:response-1:continue=false:transcript=empty".to_owned(),
+            ],
+        },
+        "{events:?}"
+    );
+
+    // The domain projection the same run produced. The fallback promotion is
+    // reported to the learner's session as a typed event, once.
+    assert_eq!(
+        canonical_event_trace(&events),
+        vec![
+            "session_phase:Ready",
+            "question_started:response-1:q-oxidative-phosphorylation-nadh:concept-oxidative-phosphorylation:criteria=2",
+            "input_speech_started",
+            "session_phase:Listening",
+            "transcript_final:response-1:confidence=none",
+            "input_speech_stopped",
+            "session_phase:Thinking",
+            "provider_fallback:response-1:gemini:gemini-3.5-flash->gemini-3.5-flash-lite:primary_429:class=QuotaRateFailure:stage=Gemini:terminal=ProviderRateLimited:retry=true:provider=gemini:metadata=stage=gemini error_kind=gemini_http_rate_limited http_status=429 retry_eligible=true reset_hint=none retry_after_ms=1000 retry_after_source=default body_status=resource_exhausted",
+            "source_reference:response-1:src-lecture-5-slide-18",
+            "answer_evaluated:response-1:q-oxidative-phosphorylation-nadh:label=strong:status=Strong:confidence=0.88:source=src-lecture-5-slide-18",
+            "concept_status:response-1:concept-oxidative-phosphorylation=Strong",
+            "usage:text_in=28:text_out=9:corrections=1",
+            "audio_delta:response-1:bytes=4",
+            "session_phase:Feedback",
+            "session_phase:Correction",
+            "response_completed:response-1",
+            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
+            "session_phase:Recap",
+        ],
+        "{events:?}"
+    );
+}
+
+/// One forbidden responsibility edge: a module that must not name a marker.
+struct ForbiddenEdge {
+    rule: &'static str,
+    modules: &'static [&'static str],
+    markers: &'static [&'static str],
+}
+
+/// The post-extraction ownership contract from Task 11 Step 3, written as the
+/// edges that must not exist.
+const ADAPTER_FORBIDDEN_EDGES: [ForbiddenEdge; 5] = [
+    ForbiddenEdge {
+        rule: "projection-owns-no-transport",
+        modules: &["projection.rs"],
+        markers: &[
+            "reqwest",
+            "tokio_tungstenite",
+            "InkSocket",
+            "SonicSocket",
+            "GeminiSse",
+        ],
+    },
+    ForbiddenEdge {
+        rule: "projection-builds-no-request",
+        modules: &["projection.rs"],
+        markers: &[
+            "into_client_request",
+            "HeaderValue",
+            "streamGenerateContent",
+        ],
+    },
+    ForbiddenEdge {
+        rule: "transports-emit-no-domain-event-or-outcome",
+        modules: &["llm.rs", "stt.rs", "tts.rs"],
+        markers: &["BrainEvent", "StudySessionState", "TurnOutcome"],
+    },
+    ForbiddenEdge {
+        rule: "runner-decodes-no-provider-frame",
+        modules: &["runner.rs"],
+        markers: &[
+            "parse_ink",
+            "parse_sonic",
+            "parse_sse",
+            "streamGenerateContent",
+            "websocket_endpoint",
+            "authorization",
+        ],
+    },
+    ForbiddenEdge {
+        rule: "session-parses-no-provider-json",
+        modules: &["session.rs"],
+        markers: &[
+            "parse_ink",
+            "parse_sonic",
+            "parse_gemini_sse",
+            "GeminiSseDecoder",
+        ],
+    },
+];
+
+/// Report every forbidden edge an explicit module/source map contains.
+fn adapter_dependency_violations(map: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for edge in &ADAPTER_FORBIDDEN_EDGES {
+        for (module, body) in map {
+            if !edge.modules.contains(&module.as_str()) {
+                continue;
+            }
+            for marker in edge.markers {
+                if body.contains(marker) {
+                    violations.push(format!("{}: {module} names `{marker}`", edge.rule));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// The real `cartesia_gemini` module map, by file name.
+fn adapter_module_map() -> Vec<(String, String)> {
+    let directory = repository_root().join("agent/crates/agent-adapters/src/cartesia_gemini");
+    let mut map = Vec::new();
+    for entry in std::fs::read_dir(&directory).expect("the cartesia_gemini module tree is readable")
+    {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a module file name")
+            .to_owned();
+        let body = std::fs::read_to_string(&path).expect("a module file reads");
+        map.push((name, body));
+    }
+    map.sort_by(|left, right| left.0.cmp(&right.0));
+    map
+}
+
+#[test]
+fn adapter_module_dependency_direction_is_enforced() {
+    // Negative controls first: one deliberately mutated source map per
+    // forbidden edge, each of which must be rejected. Without these the rule
+    // engine could be vacuous.
+    for edge in &ADAPTER_FORBIDDEN_EDGES {
+        for marker in edge.markers {
+            let mutated = edge
+                .modules
+                .iter()
+                .map(|module| {
+                    (
+                        (*module).to_owned(),
+                        format!("fn moved() {{ let _ = {marker}; }}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let violations = adapter_dependency_violations(&mutated);
+            assert_eq!(
+                violations.len(),
+                edge.modules.len(),
+                "{}: `{marker}` must be rejected in every module the rule covers",
+                edge.rule
+            );
+            assert!(
+                violations
+                    .iter()
+                    .all(|violation| violation.starts_with(edge.rule)),
+                "{violations:?}"
+            );
+        }
+    }
+    // A clean map is accepted, so rejection means something.
+    let clean = ADAPTER_FORBIDDEN_EDGES
+        .iter()
+        .flat_map(|edge| edge.modules.iter())
+        .map(|module| ((*module).to_owned(), "fn moved() {}".to_owned()))
+        .collect::<Vec<_>>();
+    assert!(adapter_dependency_violations(&clean).is_empty());
+
+    // Then the real modules. Before the extraction lands, `session.rs` and
+    // `projection.rs` do not exist and the rules run only against the map
+    // above; the branch is asserted explicitly so it can never be taken
+    // silently once they do exist.
+    let map = adapter_module_map();
+    let extracted = ["session.rs", "projection.rs"]
+        .iter()
+        .all(|module| map.iter().any(|(name, _)| name == module));
+    if extracted {
+        assert!(
+            adapter_dependency_violations(&map).is_empty(),
+            "{:?}",
+            adapter_dependency_violations(&map)
+        );
+    } else {
+        assert!(
+            !map.iter()
+                .any(|(name, _)| name == "session.rs" || name == "projection.rs"),
+            "the extraction is half-landed: {:?}",
+            map.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+}
