@@ -5,7 +5,7 @@ import type { NextRequest } from "next/server";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   guardVivaSessionProjectionAdmission,
-  resetVivaSessionMintRateLimitsForTests,
+  resetVivaSessionSecurityStoreForTests,
   type SessionTokenClaims,
   signVivaLibraryControlToken,
   signVivaSessionBootstrapToken,
@@ -73,7 +73,7 @@ const SESSION_SECURITY_STORE_CREDENTIAL = "viva-fixture-session-security-store-c
 describe("Viva same-origin session API", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
     process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
@@ -96,7 +96,7 @@ describe("Viva same-origin session API", () => {
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -475,7 +475,7 @@ describe("Viva same-origin session API", () => {
     );
     const sameIpBody = (await sameIpDifferentIdentity.json()) as VivaSessionRouteFailureClass;
 
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const third = await startSession(sessionRequest("/api/viva-session/start", requestBody));
     const sameIdentityDifferentIp = await startSession(
       sessionRequest("/api/viva-session/start", requestBody, {
@@ -1004,14 +1004,14 @@ describe("Plan 05 session-token vectors", () => {
 describe("Viva web credential configuration", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
   });
 
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -1154,14 +1154,14 @@ describe("Viva web credential configuration", () => {
 describe("Viva canonical origin authority", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
   });
 
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -1225,7 +1225,7 @@ describe("Viva canonical origin authority", () => {
     }) as typeof fetch;
 
     for (const value of rejected) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       process.env.VIVA_WEB_CANONICAL_ORIGIN = value;
       const response = await startSession(
         sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1315,7 +1315,7 @@ describe("Viva canonical origin authority", () => {
     const accepted = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload(), spoofHeaders),
     );
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const spoofedOrigin = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload(), {
         ...spoofHeaders,
@@ -1353,7 +1353,7 @@ describe("Viva canonical origin authority", () => {
         user_id: "synthetic-user",
       }),
     );
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const unrelated = await startSession(
       sessionRequest("/api/viva-session/start", {
         session_bootstrap_token: signedSessionBootstrapToken(
@@ -1456,7 +1456,7 @@ describe("Viva canonical origin authority", () => {
 
     const observed: Array<{ label: string; status: number; body: unknown }> = [];
     for (const entry of hostile) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       const response = await startSession(
         sessionRequest("/api/viva-session/start", {
           session_bootstrap_token: entry.token,
@@ -1485,14 +1485,14 @@ describe("Viva canonical origin authority", () => {
 describe("Viva scoped service credential selection", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
   });
 
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -1556,13 +1556,13 @@ describe("Viva scoped service credential selection", () => {
     );
     const withoutBody = (await withoutEscapeHatch.json()) as VivaSessionRouteFailureClass;
 
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     process.env.VIVA_ALLOW_LEGACY_AGENT_REST_BEARER = "1";
     const loopbackAllowed = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
 
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
     const publicRejected = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1596,7 +1596,7 @@ describe("Viva scoped service credential selection", () => {
     const weakValues = ["short-mint-bearer", "changeme", `viva-${"m".repeat(600)}`];
     const observed: Array<{ error: string; status: number }> = [];
     for (const weak of weakValues) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       process.env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN = weak;
       const response = await startSession(
         sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1615,7 +1615,7 @@ describe("Viva scoped service credential selection", () => {
 describe("Viva trusted proxy and atomic shared rate admission", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
     applySharedSecurityStoreTestEnv();
   });
@@ -1623,7 +1623,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -1745,7 +1745,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
 
     const observed: Array<{ error: string; status: number }> = [];
     for (const testCase of cases) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       restoreEnv("VIVA_SESSION_TRUSTED_PROXY_HOPS", testCase.hops);
       const response = await startSession(
         sessionRequest("/api/viva-session/start", sessionStartPayload(), testCase.headers ?? {}, {
@@ -1757,7 +1757,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     }
 
     // Positive control on the identical fixture: a declared chain admits and does reach the store.
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
     const admitted = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload(), {
@@ -1785,7 +1785,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     const rejected = ["0", "121", "-1", "12.5", "twelve", "1e2", "+12", "0x0c"];
     const observed: Array<{ error: string; status: number }> = [];
     for (const value of rejected) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = value;
       const response = await startSession(
         sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1798,7 +1798,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     // renders an unset variable as the empty string, and every other env read here agrees.
     const blankDefaults: number[] = [];
     for (const blank of ["", "   "]) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = blank;
       const response = await startSession(
         sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1806,7 +1806,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
       blankDefaults.push(response.status);
     }
 
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     delete process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE;
     const defaulted = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -1882,7 +1882,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
 describe("Viva shared security store adapters", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
     applySharedSecurityStoreTestEnv();
   });
@@ -1890,7 +1890,7 @@ describe("Viva shared security store adapters", () => {
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -2407,13 +2407,13 @@ describe("Viva shared security store adapters", () => {
     const rejectedLimits = ["0", "601", "-3", "60.5", "sixty"];
     const observed: Array<{ body: unknown; status: number | undefined }> = [];
     for (const value of rejectedLimits) {
-      resetVivaSessionMintRateLimitsForTests();
+      resetVivaSessionSecurityStoreForTests();
       process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE = value;
       const response = await guardVivaSessionProjectionAdmission(projectionRequest(), identity);
       observed.push({ body: await response?.json(), status: response?.status });
     }
 
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     delete process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE;
     const defaulted = await guardVivaSessionProjectionAdmission(projectionRequest(), identity);
 
@@ -2442,7 +2442,7 @@ describe("Viva shared security store adapters", () => {
 describe("Viva session body byte cap", () => {
   beforeEach(() => {
     console.warn = () => {};
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     applyCanonicalOriginTestEnv();
     applySharedSecurityStoreTestEnv();
   });
@@ -2450,7 +2450,7 @@ describe("Viva session body byte cap", () => {
   afterEach(() => {
     console.warn = originalConsoleWarn;
     globalThis.fetch = originalFetch;
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
   });
 
@@ -2464,7 +2464,7 @@ describe("Viva session body byte cap", () => {
     const atLimit = await startSession(
       streamingSessionRequest(paddedSessionPayload(16 * 1024), [4096, 1, 8191, 4096]),
     );
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const overLimit = await startSession(
       streamingSessionRequest(paddedSessionPayload(16 * 1024 + 1), [4096, 1, 8191, 4097]),
     );
@@ -2512,9 +2512,9 @@ describe("Viva session body byte cap", () => {
     const lying = await startSession(
       streamingSessionRequest(oversized, [8192, 8193], { "content-length": "42" }),
     );
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const absent = await startSession(streamingSessionRequest(oversized, [8192, 8193]));
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const declaredTooLarge = await startSession(
       streamingSessionRequest(paddedSessionPayload(1024), [1024], {
         "content-length": String(64 * 1024),
@@ -2562,7 +2562,7 @@ describe("Viva session body byte cap", () => {
     const success = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
-    resetVivaSessionMintRateLimitsForTests();
+    resetVivaSessionSecurityStoreForTests();
     const rejected = await startSession(
       streamingSessionRequest(paddedSessionPayload(16 * 1024 + 1), [16385]),
     );
@@ -2574,6 +2574,102 @@ describe("Viva session body byte cap", () => {
     }
   });
 });
+
+/**
+ * Task 7 (`WEBAPI-009`), store half. The route half lives in `viva-library-proxy.test.ts`; this
+ * suite pins the shared-store transaction primitive the route depends on, so a store that checks
+ * and then inserts in two operations is caught here rather than only at the route.
+ */
+describe("Viva destructive capability store contract", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionSecurityStoreForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionSecurityStoreForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("one-time delete consumption is atomic, scope-bound, and expiry-bound in the shared store", async () => {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("fixture requires a selectable bounded security store");
+    const store = selection.store;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const studySetScope = {
+      kind: "study_set" as const,
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    };
+
+    const first = await store.revokeSession({
+      capabilityExpiresAt: nowSeconds + 300,
+      capabilityHash: destructiveCapabilityHash("capability-one"),
+      nowSeconds,
+      operation: "consume_delete_and_revoke",
+      purpose: "study_set_delete",
+      scope: studySetScope,
+    });
+    const replay = await store.revokeSession({
+      capabilityExpiresAt: nowSeconds + 300,
+      capabilityHash: destructiveCapabilityHash("capability-one"),
+      nowSeconds,
+      operation: "consume_delete_and_revoke",
+      purpose: "study_set_delete",
+      scope: studySetScope,
+    });
+    const expired = await store.revokeSession({
+      capabilityExpiresAt: nowSeconds,
+      capabilityHash: destructiveCapabilityHash("capability-expired"),
+      nowSeconds,
+      operation: "consume_delete_and_revoke",
+      purpose: "study_set_delete",
+      scope: studySetScope,
+    });
+    const wrongScope = await store.revokeSession({
+      capabilityExpiresAt: nowSeconds + 300,
+      capabilityHash: destructiveCapabilityHash("capability-wrong-scope"),
+      nowSeconds,
+      operation: "consume_delete_and_revoke",
+      purpose: "study_set_delete",
+      scope: {
+        identity: {
+          sessionId: "server-session",
+          studySetId: "biology-midterm",
+          userId: "synthetic-user",
+        },
+        kind: "session",
+      },
+    });
+    const raced = await Promise.all(
+      [0, 1].map(() =>
+        store.revokeSession({
+          capabilityExpiresAt: nowSeconds + 300,
+          capabilityHash: destructiveCapabilityHash("capability-raced"),
+          nowSeconds,
+          operation: "consume_delete_and_revoke",
+          purpose: "study_set_delete",
+          scope: studySetScope,
+        }),
+      ),
+    );
+
+    expect(first).toEqual({ ok: true });
+    expect(replay).toEqual({ ok: false, reason: "replayed" });
+    expect(expired).toEqual({ ok: false, reason: "expired" });
+    expect(wrongScope).toEqual({ ok: false, reason: "scope_mismatch" });
+    expect(raced.filter((outcome) => outcome.ok)).toHaveLength(1);
+    expect(raced.filter((outcome) => !outcome.ok)).toEqual([{ ok: false, reason: "replayed" }]);
+  });
+});
+
+function destructiveCapabilityHash(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
 
 function applyCanonicalOriginTestEnv() {
   process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";

@@ -1,7 +1,14 @@
 import * as bunTest from "bun:test";
+import { createHash } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { DELETE, GET, POST } from "../app/api/viva-library/[[...path]]/route";
-import { signVivaLibraryControlToken, WEB_API_BODY_LIMITS } from "../app/api/viva-session/shared";
+import {
+  resetVivaSessionSecurityStoreForTests,
+  type SessionSecurityStore,
+  signVivaLibraryControlToken,
+  vivaSessionSecurityStore,
+  WEB_API_BODY_LIMITS,
+} from "../app/api/viva-session/shared";
 
 const { afterEach, beforeEach, describe, expect, test } = bunTest as typeof bunTest & {
   afterEach: (fn: () => void) => void;
@@ -2539,6 +2546,388 @@ describe("Viva library proxy credential stripping", () => {
   }
 });
 
+/**
+ * Task 7 (`WEBAPI-009`). A destructive control capability is one-time, and "one time" is only
+ * true if the shared store owns the transaction. Every case here drives the real catch-all route
+ * against the real bounded store adapter; nothing is asserted from source text.
+ */
+describe("Viva library destructive capability consumption", () => {
+  const CANONICAL = "http://localhost:3000";
+  const PUBLIC_CANONICAL = "https://web.example";
+  const SCOPED_LIBRARY_READ_BEARER = "viva-fixture-agent-library-read-bearer";
+  const SCOPED_LIBRARY_DELETE_BEARER = "viva-fixture-agent-library-delete-bearer";
+  const BOOTSTRAP_SECRET = "viva-fixture-bootstrap-signing-key-01";
+  const STORE_ORIGIN = "https://session-store.example";
+  const STORE_CREDENTIAL = "viva-fixture-session-security-store-cred";
+  const trackedEnv = [
+    "NODE_ENV",
+    "VIVA_AGENT_HTTP_URL",
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_AGENT_REST_BEARER_TOKEN",
+    "VIVA_SESSION_ALLOWED_STUDY_SET_IDS",
+    "VIVA_SESSION_ALLOWED_USER_IDS",
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET",
+    "VIVA_SESSION_SECURITY_STORE_MODE",
+    "VIVA_SESSION_SECURITY_STORE_REST_TOKEN",
+    "VIVA_SESSION_SECURITY_STORE_REST_URL",
+    "VIVA_WEB_CANONICAL_ORIGIN",
+    "VIVA_WEB_SINGLE_INSTANCE",
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of trackedEnv) savedEnv.set(name, process.env[name]);
+    resetVivaSessionSecurityStoreForTests();
+    process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
+    process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = SCOPED_LIBRARY_READ_BEARER;
+    process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = SCOPED_LIBRARY_DELETE_BEARER;
+    delete process.env.VIVA_AGENT_REST_BEARER_TOKEN;
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = BOOTSTRAP_SECRET;
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_MODE;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+    delete process.env.VIVA_WEB_SINGLE_INSTANCE;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    resetVivaSessionSecurityStoreForTests();
+    for (const [name, value] of savedEnv) restoreEnv(name, value);
+    savedEnv.clear();
+  });
+
+  test("one-time delete capability reaches the agent once and replays as the coarse 403", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = recordingAgentFetch(calls);
+    const token = studySetDeleteToken();
+
+    const first = await studySetDelete(token);
+    const second = await studySetDelete(token);
+    const replayBody = await second.json();
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(403);
+    expect(replayBody).toEqual({ error: "viva_library_control_capability_required" });
+    expect(calls).toEqual(["http://agent.test/study-sets/biology-midterm?user_id=user-1"]);
+  });
+
+  test("concurrent DELETE requests spending one capability reach the agent exactly once", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = recordingAgentFetch(calls);
+    const token = studySetDeleteToken();
+
+    const responses = await Promise.all([studySetDelete(token), studySetDelete(token)]);
+    const statuses = responses.map((response) => response.status).sort();
+    const loser = responses.find((response) => response.status === 403);
+
+    expect(statuses).toEqual([200, 403]);
+    expect(await loser?.json()).toEqual({ error: "viva_library_control_capability_required" });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("session deletion revokes only the matching session refresh record", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = recordingAgentFetch(calls);
+    const store = memoryStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    await issueRefreshRecord(store, "refresh-session-a", "session-a", nowSeconds);
+    await issueRefreshRecord(store, "refresh-session-b", "session-b", nowSeconds);
+
+    const response = await sessionDelete(sessionDeleteToken("session-a"), "session-a");
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(await refreshOutcome(store, "refresh-session-a", "session-a", nowSeconds)).toEqual({
+      ok: false,
+      reason: "revoked",
+    });
+    expect(await refreshOutcome(store, "refresh-session-b", "session-b", nowSeconds)).toMatchObject(
+      {
+        ok: true,
+      },
+    );
+  });
+
+  test("study-set deletion revokes every refresh record under the verified user and study set", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = recordingAgentFetch(calls);
+    const store = memoryStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    await issueRefreshRecord(store, "refresh-session-a", "session-a", nowSeconds);
+    await issueRefreshRecord(store, "refresh-session-b", "session-b", nowSeconds);
+    await issueRefreshRecord(store, "refresh-other-set", "session-c", nowSeconds, {
+      studySetId: "chemistry-final",
+    });
+
+    const response = await studySetDelete(studySetDeleteToken());
+
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(await refreshOutcome(store, "refresh-session-a", "session-a", nowSeconds)).toEqual({
+      ok: false,
+      reason: "revoked",
+    });
+    expect(await refreshOutcome(store, "refresh-session-b", "session-b", nowSeconds)).toEqual({
+      ok: false,
+      reason: "revoked",
+    });
+    expect(
+      await refreshOutcome(store, "refresh-other-set", "session-c", nowSeconds, {
+        studySetId: "chemistry-final",
+      }),
+    ).toMatchObject({ ok: true });
+  });
+
+  test("deletion revokes refresh authority before the upstream DELETE and keeps it revoked after an upstream failure", async () => {
+    const store = memoryStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    await issueRefreshRecord(store, "refresh-session-a", "session-a", nowSeconds);
+    const observedDuringUpstream: unknown[] = [];
+    globalThis.fetch = (async () => {
+      // Observed from inside the upstream call: revocation must already have committed.
+      observedDuringUpstream.push(
+        await refreshOutcome(store, "refresh-session-a", "session-a", nowSeconds),
+      );
+      return new Response(JSON.stringify({ error: "agent_exploded" }), {
+        headers: { "content-type": "application/json" },
+        status: 500,
+      });
+    }) as typeof fetch;
+
+    const response = await studySetDelete(studySetDeleteToken());
+
+    expect(observedDuringUpstream).toEqual([{ ok: false, reason: "revoked" }]);
+    // A control-route upstream failure is relayed after stripping; there is no rollback of the
+    // revocation, and the capability stays spent.
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "agent_exploded" });
+    expect(await refreshOutcome(store, "refresh-session-a", "session-a", nowSeconds)).toEqual({
+      ok: false,
+      reason: "revoked",
+    });
+  });
+
+  test("one-time delete fails closed with 503 when the shared store cannot commit and never deletes upstream", async () => {
+    const agentCalls: string[] = [];
+    const storeCalls: string[] = [];
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = PUBLIC_CANONICAL;
+    process.env.VIVA_AGENT_HTTP_URL = "https://agent.example";
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = STORE_CREDENTIAL;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(STORE_ORIGIN)) {
+        storeCalls.push(url);
+        return new Response("{}", { status: 500 });
+      }
+      agentCalls.push(url);
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    }) as typeof fetch;
+    const token = studySetDeleteToken();
+
+    const response = await studySetDelete(token, { origin: PUBLIC_CANONICAL });
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body).toEqual({
+      error: "viva_library_control_unavailable",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+    });
+    expect(storeCalls).toEqual([`${STORE_ORIGIN}/v1/session-security`]);
+    expect(agentCalls).toEqual([]);
+  });
+
+  test("one-time delete rejects a foreign or missing origin before capability verification, store, and fetch", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = recordingAgentFetch(calls);
+    const token = studySetDeleteToken();
+
+    const missingOrigin = await studySetDelete(token, { origin: null });
+    const foreignOrigin = await studySetDelete(token, { origin: "https://evil.example" });
+    // The capability must still be unspent: a rejected origin never reached the store.
+    const afterwards = await studySetDelete(token);
+
+    expect([missingOrigin.status, foreignOrigin.status]).toEqual([403, 403]);
+    expect(await missingOrigin.json()).toEqual({
+      error: "viva_library_control_capability_required",
+    });
+    expect(await foreignOrigin.json()).toEqual({
+      error: "viva_library_control_capability_required",
+    });
+    expect(afterwards.status).toBe(200);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("one-time delete never forwards or logs the browser capability and session headers", async () => {
+    const calls: Array<{ init?: RequestInit }> = [];
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+    try {
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ init });
+        return new Response(JSON.stringify({ ok: true }), {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        });
+      }) as typeof fetch;
+      const token = studySetDeleteToken();
+
+      const response = await studySetDelete(token, {
+        extraHeaders: { "x-viva-session-token": "viva1.browser-held-session-credential" },
+      });
+      const serializedBody = await response.text();
+
+      expect(response.status).toBe(200);
+      const headers = new Headers(calls[0]?.init?.headers);
+      expect(headers.get("authorization")).toBe(`Bearer ${SCOPED_LIBRARY_DELETE_BEARER}`);
+      expect(headers.get("x-viva-library-control-token")).toBe(null);
+      expect(headers.get("x-viva-session-token")).toBe(null);
+      expect(headers.get("origin")).toBe(CANONICAL);
+      const forwarded = [...headers.keys()].sort();
+      expect(forwarded).toEqual(["authorization", "origin"]);
+      const observed = `${warnings.join("\n")}\n${serializedBody}`;
+      expect(observed).not.toContain(token);
+      expect(observed).not.toContain("viva1.browser-held-session-credential");
+      expect(observed).not.toContain(SCOPED_LIBRARY_DELETE_BEARER);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  function memoryStore(): SessionSecurityStore {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("fixture requires a selectable bounded security store");
+    return selection.store;
+  }
+
+  function refreshIdentity(
+    sessionId: string,
+    overrides: { studySetId?: string; userId?: string } = {},
+  ) {
+    return {
+      sessionId,
+      studySetId: overrides.studySetId ?? "biology-midterm",
+      userId: overrides.userId ?? "user-1",
+    };
+  }
+
+  async function issueRefreshRecord(
+    store: SessionSecurityStore,
+    credential: string,
+    sessionId: string,
+    nowSeconds: number,
+    overrides: { studySetId?: string; userId?: string } = {},
+  ) {
+    const issued = await store.rotateRefresh({
+      absoluteExpiresAt: nowSeconds + 21_600,
+      credentialHash: sha256Hex(credential),
+      identity: refreshIdentity(sessionId, overrides),
+      mode: "issue",
+      refreshExpiresAt: nowSeconds + 900,
+    });
+    if (!issued.ok) throw new Error("fixture must be able to issue a refresh record");
+  }
+
+  async function refreshOutcome(
+    store: SessionSecurityStore,
+    credential: string,
+    sessionId: string,
+    nowSeconds: number,
+    overrides: { studySetId?: string; userId?: string } = {},
+  ) {
+    return store.consumeRefresh({
+      credentialHash: sha256Hex(credential),
+      identity: refreshIdentity(sessionId, overrides),
+      nowSeconds,
+      reservationTtlSeconds: 10,
+    });
+  }
+
+  function studySetDeleteToken(): string {
+    const token = signVivaLibraryControlToken({
+      scope: "study_set_delete",
+      studySetId: "biology-midterm",
+      userId: "user-1",
+    });
+    if (!token) throw new Error("fixture must sign a study-set delete control capability");
+    return token;
+  }
+
+  function sessionDeleteToken(voiceSessionId: string): string {
+    const token = signVivaLibraryControlToken({
+      scope: "session_history_delete",
+      studySetId: "biology-midterm",
+      userId: "user-1",
+      voiceSessionId,
+    });
+    if (!token) throw new Error("fixture must sign a session delete control capability");
+    return token;
+  }
+
+  function recordingAgentFetch(calls: string[]): typeof fetch {
+    return (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(
+        JSON.stringify({
+          deleted_at: "2026-08-23T12:00:00Z",
+          policy: "hard_purge_text",
+          status: "deleted",
+          study_set_id: "biology-midterm",
+        }),
+        { headers: { "content-type": "application/json" }, status: 200 },
+      );
+    }) as typeof fetch;
+  }
+
+  function studySetDelete(
+    token: string,
+    options: { extraHeaders?: Record<string, string>; origin?: string | null } = {},
+  ): Promise<Response> {
+    const path = ["study-sets", "biology-midterm"];
+    return DELETE(destructiveRequest(path, token, options), {
+      params: Promise.resolve({ path }),
+    });
+  }
+
+  function sessionDelete(token: string, voiceSessionId: string): Promise<Response> {
+    const path = ["study-sets", "biology-midterm", "sessions", voiceSessionId];
+    return DELETE(destructiveRequest(path, token), {
+      params: Promise.resolve({ path }),
+    });
+  }
+
+  function destructiveRequest(
+    path: string[],
+    token: string,
+    options: { extraHeaders?: Record<string, string>; origin?: string | null } = {},
+  ): NextRequest {
+    const origin = options.origin === undefined ? CANONICAL : options.origin;
+    const headers = new Headers({
+      "sec-fetch-site": "same-origin",
+      "x-viva-library-control-token": token,
+      ...(options.extraHeaders ?? {}),
+    });
+    if (origin) headers.set("origin", origin);
+    return {
+      headers,
+      method: "DELETE",
+      nextUrl: new URL(`${CANONICAL}/api/viva-library/${path.join("/")}?user_id=user-1`),
+    } as unknown as NextRequest;
+  }
+});
+
 const HOSTILE_CREDENTIAL_KEYS = [
   "session_token",
   "control_token",
@@ -2762,4 +3151,13 @@ function restoreEnv(name: string, value: string | undefined) {
   } else {
     process.env[name] = value;
   }
+}
+
+/**
+ * Independent restatement of the credential-hash rule the store contract pins: the adapter only
+ * ever sees SHA-256, never a raw credential. Computed here rather than imported, so a production
+ * drift in the hashing rule breaks these assertions.
+ */
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }

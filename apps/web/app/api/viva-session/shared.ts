@@ -332,6 +332,25 @@ type MemoryRateLimitRecord = {
   resetAtMs: number;
 };
 
+/**
+ * One bounded refresh record. `consumed` is the replay tombstone the plan requires the store to
+ * retain until absolute expiry, and `revoked` is the terminal state a destructive delete (or the
+ * reuse of a consumed tombstone) drives every record for an identity into.
+ */
+type MemoryRefreshRecord = {
+  absoluteExpiresAt: number;
+  consumed: boolean;
+  identity: SessionIdentity;
+  refreshExpiresAt: number;
+  reservation: { expiresAtSeconds: number; rotationId: string } | null;
+  revoked: boolean;
+};
+
+/** A spent destructive capability, keyed by SHA-256 hash and kept until the capability expires. */
+type MemoryCapabilityTombstone = {
+  expiresAt: number;
+};
+
 type TrustedClientAdmission = { ok: true; value: string } | { ok: false; reason: "untrusted" };
 
 type AdmissionLimitRange = {
@@ -466,6 +485,10 @@ const PROJECTION_ADMISSION_LIMIT: AdmissionLimitRange = {
 };
 /** One process-wide map, shared by every adapter this module hands out. */
 const memorySecurityStoreRateLimits = new Map<string, MemoryRateLimitRecord>();
+/** Refresh records, keyed by the SHA-256 of the credential; the raw value never reaches here. */
+const memorySecurityStoreRefreshRecords = new Map<string, MemoryRefreshRecord>();
+/** Spent destructive capabilities, keyed by the SHA-256 of the capability token. */
+const memorySecurityStoreCapabilityTombstones = new Map<string, MemoryCapabilityTombstone>();
 
 export async function handleVivaSessionStart(request: NextRequest) {
   const routeContext = { route: "start" } as const;
@@ -575,8 +598,11 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
   );
 }
 
-export function resetVivaSessionMintRateLimitsForTests() {
+/** Clears every bounded in-memory record this module owns: admission, refresh, and tombstones. */
+export function resetVivaSessionSecurityStoreForTests() {
   memorySecurityStoreRateLimits.clear();
+  memorySecurityStoreRefreshRecords.clear();
+  memorySecurityStoreCapabilityTombstones.clear();
 }
 
 export function signVivaSessionBootstrapToken(input: {
@@ -633,14 +659,21 @@ export function isVivaLibraryControlToken(token: string | null | undefined): boo
   return token?.startsWith(`${LIBRARY_CONTROL_TOKEN_PREFIX}.`) ?? false;
 }
 
+export type VivaLibraryControlTokenVerification =
+  | { outcome: "valid"; claims: LibraryControlTokenClaims }
+  | { outcome: "invalid" }
+  | { outcome: "missing_secret" };
+
 export function verifyVivaLibraryControlToken(input: {
   scope: VivaLibraryControlScope;
   studySetId: string;
   token: string;
   userId: string;
   voiceSessionId?: string | null;
-}): "invalid" | "missing_secret" | "valid" {
-  if (!bootstrapCapabilityVerificationKeys() || !canonicalWebOrigin().ok) return "missing_secret";
+}): VivaLibraryControlTokenVerification {
+  if (!bootstrapCapabilityVerificationKeys() || !canonicalWebOrigin().ok) {
+    return { outcome: "missing_secret" };
+  }
   const claims = verifyLibraryControlTokenClaims(input.token);
   if (
     !claims ||
@@ -649,9 +682,68 @@ export function verifyVivaLibraryControlToken(input: {
     claims.study_set_id !== input.studySetId ||
     claims.voice_session_id !== (input.voiceSessionId?.trim() || null)
   ) {
-    return "invalid";
+    return { outcome: "invalid" };
   }
-  return "valid";
+  return { claims, outcome: "valid" };
+}
+
+export type VivaLibraryDeleteCapabilityConsumption =
+  | { ok: true }
+  | { ok: false; reason: "invalid" | "unavailable" };
+
+/**
+ * The one-time destructive capability transaction (`WEBAPI-009`).
+ *
+ * Verification and consumption live together here so a route can never verify a capability and
+ * then forget to spend it. The capability is hashed with SHA-256 before the adapter sees it; the
+ * raw signed token never crosses the store boundary. The consume also revokes every refresh record
+ * in the capability's scope, and it happens BEFORE the upstream DELETE: a failed upstream leaves
+ * credentials revoked, which is the safe direction, and the next library snapshot can mint a fresh
+ * delete capability. There is no distributed rollback.
+ *
+ * Every non-`unavailable` store rejection — expired, replayed, scope mismatch, conflict — collapses
+ * into the single `invalid` reason so the route can return one coarse 403 for all of them.
+ */
+export async function consumeVivaLibraryDeleteCapability(input: {
+  scope: VivaLibraryControlScope;
+  studySetId: string;
+  token: string;
+  userId: string;
+  voiceSessionId?: string | null;
+}): Promise<VivaLibraryDeleteCapabilityConsumption> {
+  const verification = verifyVivaLibraryControlToken(input);
+  if (verification.outcome === "missing_secret") return { ok: false, reason: "unavailable" };
+  if (verification.outcome === "invalid") return { ok: false, reason: "invalid" };
+  const selection = vivaSessionSecurityStore();
+  if (!selection.ok) return { ok: false, reason: "unavailable" };
+
+  const claims = verification.claims;
+  const voiceSessionId = claims.voice_session_id;
+  const outcome = await selection.store.revokeSession({
+    capabilityExpiresAt: claims.expires_at,
+    capabilityHash: capabilityTokenHash(input.token),
+    nowSeconds: Math.floor(Date.now() / 1000),
+    operation: "consume_delete_and_revoke",
+    purpose: claims.scope,
+    scope:
+      claims.scope === "session_history_delete" && voiceSessionId
+        ? {
+            identity: {
+              sessionId: voiceSessionId,
+              studySetId: claims.study_set_id,
+              userId: claims.user_id,
+            },
+            kind: "session",
+          }
+        : { kind: "study_set", studySetId: claims.study_set_id, userId: claims.user_id },
+  });
+  if (outcome.ok) return { ok: true };
+  return { ok: false, reason: outcome.reason === "unavailable" ? "unavailable" : "invalid" };
+}
+
+/** Capabilities reach the shared store only as a SHA-256 digest, never as the signed token. */
+function capabilityTokenHash(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
 export function attachVivaSessionBootstrapTokensToLibrarySnapshot(
@@ -1014,25 +1106,197 @@ function inMemorySessionSecurityStoreAllowed(): boolean {
   return isLoopbackHostname(originHostname) && isLoopbackAgentUrl(serverAgentBaseUrl());
 }
 
-/** Bounded process-local adapter. Every call returns a fresh facade over the one shared map. */
+/**
+ * Bounded process-local adapter. Every call returns a fresh facade over the one shared map set.
+ *
+ * Each method body below is synchronous end to end. That is the whole point: JavaScript runs one
+ * synchronous block to completion, so "check then insert" inside a single body is the atomic
+ * transaction the shared-store contract demands, and two concurrent callers can never both win.
+ */
 function createMemorySessionSecurityStore(): SessionSecurityStore {
   return {
-    consumeRefresh: async () => memorySecurityStoreTransactionDeferred(),
+    consumeRefresh: async (input) => memoryConsumeRefresh(input),
     incrementRateLimit: async (input) => memoryIncrementRateLimit(input),
-    revokeSession: async () => memorySecurityStoreTransactionDeferred(),
-    rotateRefresh: async () => memorySecurityStoreTransactionDeferred(),
+    revokeSession: async (input) => memoryRevokeSession(input),
+    rotateRefresh: async (input) => memoryRotateRefresh(input),
   };
 }
 
+function memoryConsumeRefresh(input: {
+  credentialHash: string;
+  identity: SessionIdentity;
+  nowSeconds: number;
+  reservationTtlSeconds: 10;
+}):
+  | { ok: true; absoluteExpiresAt: number; rotationId: string }
+  | {
+      ok: false;
+      reason: "expired" | "identity_mismatch" | "replayed" | "revoked" | "unavailable";
+    } {
+  pruneExpiredMemoryRefreshRecords(input.nowSeconds);
+  const record = memorySecurityStoreRefreshRecords.get(input.credentialHash);
+  // An unknown hash is a forged or long-expired credential. It reports as a replay so the adapter
+  // never separates "never existed" from "already spent" for a caller.
+  if (!record) return { ok: false, reason: "replayed" };
+  if (!sameSessionIdentity(record.identity, input.identity)) {
+    return { ok: false, reason: "identity_mismatch" };
+  }
+  if (record.revoked) return { ok: false, reason: "revoked" };
+  if (record.consumed) {
+    // Reuse of a consumed tombstone revokes every current record for that session identity
+    // through absolute expiry, so the replacement credential the winning rotation issued dies
+    // with it and no further rotation can extend the chain.
+    revokeMemoryRefreshRecords((identity) => sameSessionIdentity(identity, record.identity));
+    return { ok: false, reason: "replayed" };
+  }
+  if (input.nowSeconds >= record.refreshExpiresAt || input.nowSeconds >= record.absoluteExpiresAt) {
+    return { ok: false, reason: "expired" };
+  }
+  if (record.reservation && input.nowSeconds < record.reservation.expiresAtSeconds) {
+    // The losing side of a race is rejected without cancelling the winner's reservation.
+    return { ok: false, reason: "replayed" };
+  }
+  const rotationId = randomUUID();
+  record.reservation = {
+    expiresAtSeconds: input.nowSeconds + input.reservationTtlSeconds,
+    rotationId,
+  };
+  return { absoluteExpiresAt: record.absoluteExpiresAt, ok: true, rotationId };
+}
+
+function memoryRotateRefresh(
+  input:
+    | {
+        mode: "issue";
+        identity: SessionIdentity;
+        credentialHash: string;
+        refreshExpiresAt: number;
+        absoluteExpiresAt: number;
+      }
+    | {
+        mode: "rotate";
+        identity: SessionIdentity;
+        rotationId: string;
+        credentialHash: string;
+        refreshExpiresAt: number;
+        absoluteExpiresAt: number;
+      },
+): { ok: true } | { ok: false; reason: "conflict" | "unavailable" } {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  pruneExpiredMemoryRefreshRecords(nowSeconds);
+  if (memorySecurityStoreRefreshRecords.has(input.credentialHash)) {
+    return { ok: false, reason: "conflict" };
+  }
+  if (memorySecurityStoreRefreshRecords.size + 1 > MEMORY_SECURITY_STORE_MAX_RECORDS) {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  if (input.mode === "rotate") {
+    const previous = reservedMemoryRefreshRecord(input.rotationId, nowSeconds);
+    if (!previous || !sameSessionIdentity(previous.identity, input.identity)) {
+      return { ok: false, reason: "conflict" };
+    }
+    // The spent hash stays behind as a replay tombstone until its absolute expiry.
+    previous.consumed = true;
+    previous.reservation = null;
+  }
+  memorySecurityStoreRefreshRecords.set(input.credentialHash, {
+    absoluteExpiresAt: input.absoluteExpiresAt,
+    consumed: false,
+    identity: { ...input.identity },
+    refreshExpiresAt: input.refreshExpiresAt,
+    reservation: null,
+    revoked: false,
+  });
+  return { ok: true };
+}
+
+function memoryRevokeSession(
+  input: Parameters<SessionSecurityStore["revokeSession"]>[0],
+):
+  | { ok: true }
+  | { ok: false; reason: "conflict" | "expired" | "replayed" | "scope_mismatch" | "unavailable" } {
+  if (input.operation !== "consume_delete_and_revoke") {
+    // D-04 `CONFIRM_DELETE` is the recorded branch, so this deployment neither registers nor
+    // consumes a restore capability. The typed union stays so both deployments speak one adapter
+    // protocol, but Branch A has no runtime caller and no in-memory implementation; Task 7B owns
+    // these two operations if the sponsor ever reselects.
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  if (!Number.isSafeInteger(input.nowSeconds) || !Number.isSafeInteger(input.capabilityExpiresAt)) {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  pruneExpiredMemoryCapabilityTombstones(input.nowSeconds);
+  pruneExpiredMemoryRefreshRecords(input.nowSeconds);
+  const scope = input.scope;
+  const purposeMatchesScope =
+    input.purpose === "session_history_delete"
+      ? scope.kind === "session"
+      : scope.kind === "study_set";
+  if (!purposeMatchesScope) return { ok: false, reason: "scope_mismatch" };
+  if (input.nowSeconds >= input.capabilityExpiresAt) return { ok: false, reason: "expired" };
+  if (memorySecurityStoreCapabilityTombstones.has(input.capabilityHash)) {
+    return { ok: false, reason: "replayed" };
+  }
+  if (memorySecurityStoreCapabilityTombstones.size + 1 > MEMORY_SECURITY_STORE_MAX_RECORDS) {
+    return SESSION_SECURITY_STORE_UNAVAILABLE;
+  }
+  memorySecurityStoreCapabilityTombstones.set(input.capabilityHash, {
+    expiresAt: input.capabilityExpiresAt,
+  });
+  revokeMemoryRefreshRecords((identity) =>
+    scope.kind === "session"
+      ? sameSessionIdentity(identity, scope.identity)
+      : identity.userId === scope.userId && identity.studySetId === scope.studySetId,
+  );
+  return { ok: true };
+}
+
+function sameSessionIdentity(left: SessionIdentity, right: SessionIdentity): boolean {
+  return (
+    left.userId === right.userId &&
+    left.studySetId === right.studySetId &&
+    left.sessionId === right.sessionId
+  );
+}
+
+function revokeMemoryRefreshRecords(matches: (identity: SessionIdentity) => boolean): void {
+  for (const record of memorySecurityStoreRefreshRecords.values()) {
+    if (!matches(record.identity)) continue;
+    record.revoked = true;
+    record.reservation = null;
+  }
+}
+
+/** The one live record holding this reservation, or null if it is missing, spent, or timed out. */
+function reservedMemoryRefreshRecord(
+  rotationId: string,
+  nowSeconds: number,
+): MemoryRefreshRecord | null {
+  for (const record of memorySecurityStoreRefreshRecords.values()) {
+    if (record.reservation?.rotationId !== rotationId) continue;
+    if (record.consumed || record.revoked) return null;
+    return nowSeconds < record.reservation.expiresAtSeconds ? record : null;
+  }
+  return null;
+}
+
 /**
- * The refresh and destructive halves of the in-memory adapter are OWNED BY Tasks 7 and 8A of this
- * plan, which carry their own RED tests for the reservation, rotation, tombstone, and
- * capability-consumption state machines. Until those land this adapter reports the fail-closed
- * direction rather than inventing untested transaction semantics here; no route in the tree calls
- * these three methods yet, so nothing regresses. The HTTP adapter below implements all four.
+ * Refresh records and capability tombstones are scanned whole rather than pruned from an expired
+ * prefix: a rotation carries the original absolute expiry forward and capabilities expire on their
+ * own clocks, so insertion order is not expiry order the way it is for a fixed rate-limit window.
  */
-function memorySecurityStoreTransactionDeferred() {
-  return SESSION_SECURITY_STORE_UNAVAILABLE;
+function pruneExpiredMemoryRefreshRecords(nowSeconds: number): void {
+  for (const [key, record] of memorySecurityStoreRefreshRecords) {
+    if (record.absoluteExpiresAt > nowSeconds) continue;
+    memorySecurityStoreRefreshRecords.delete(key);
+  }
+}
+
+function pruneExpiredMemoryCapabilityTombstones(nowSeconds: number): void {
+  for (const [key, record] of memorySecurityStoreCapabilityTombstones) {
+    if (record.expiresAt > nowSeconds) continue;
+    memorySecurityStoreCapabilityTombstones.delete(key);
+  }
 }
 
 function memoryIncrementRateLimit(input: {

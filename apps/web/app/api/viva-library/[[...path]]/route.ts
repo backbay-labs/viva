@@ -2,12 +2,12 @@ import { type NextRequest, NextResponse } from "next/server";
 import {
   attachVivaLibraryControlTokensToLibrarySnapshot,
   attachVivaSessionBootstrapTokensToLibrarySnapshot,
+  consumeVivaLibraryDeleteCapability,
   isVivaCanonicalMutatingRequest,
   isVivaLibraryControlToken,
   parseBoundedJson,
   readBoundedBody,
   type VivaLibraryControlScope,
-  verifyVivaLibraryControlToken,
   vivaAgentScopedCredential,
   vivaBoundedBodyRejection,
   vivaCanonicalWebOrigin,
@@ -55,11 +55,14 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
+  // The destructive sequence is fixed and fail-closed: canonical origin, route/query allowlist,
+  // a selectable shared store, then (inside the authorization step) constant-time capability
+  // verification, one-time consumption, and only then the scoped delete credential.
   const controlTarget = libraryControlRouteTarget(request.method, path);
-  const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
-  if (controlGuard) return controlGuard;
   const originGuard = guardDestructiveRequestOrigin(request, controlTarget);
   if (originGuard) return originGuard;
+  const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
+  if (controlGuard) return controlGuard;
   const storeGuard = guardDestructiveSecurityStore(request, controlTarget);
   if (storeGuard) return storeGuard;
 
@@ -67,7 +70,7 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const ingestionOriginGuard = guardIngestionRequestOrigin(request, ingestion);
   if (ingestionOriginGuard) return ingestionOriginGuard;
 
-  const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
+  const serverBearer = await serverBearerForBrowserLibraryRequest(request, path, controlTarget);
   if (!serverBearer.ok) return serverBearer.response;
   const { snapshotFilter } = serverBearer;
   const headers = vivaLibraryProxyHeaders(request, {
@@ -412,18 +415,19 @@ function vivaLibraryProxyOrigin(): string | null {
   return vivaCanonicalWebOrigin();
 }
 
-function serverBearerForBrowserLibraryRequest(
+async function serverBearerForBrowserLibraryRequest(
   request: NextRequest,
   path: string[],
   controlTarget: LibraryControlRouteTarget | null,
-):
+): Promise<
   | {
       consumedControlToken?: boolean;
       ok: true;
       snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
       token?: string;
     }
-  | { ok: false; response: NextResponse } {
+  | { ok: false; response: NextResponse }
+> {
   const browserSnapshotRequest =
     request.method === "GET" && path.join("/") === "study-sets/library";
   const controlToken = request.headers.get("x-viva-library-control-token")?.trim() || null;
@@ -442,37 +446,38 @@ function serverBearerForBrowserLibraryRequest(
       response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
     };
   }
-  const token = vivaAgentScopedCredential(
-    sameOriginControlRequest ? "library_delete" : "library_read",
-  );
-  if (!token) {
-    return {
-      ok: false,
-      response: libraryConfigUnavailableResponse(request.method, path),
-    };
-  }
   if (sameOriginControlRequest) {
+    // Verify and SPEND the capability before any delete authority is resolved, so an unspendable
+    // capability can never reach the agent and a spent one can never be replayed.
     const userId = request.nextUrl.searchParams.get("user_id")?.trim() || "";
-    const verification = verifyVivaLibraryControlToken({
+    const consumption = await consumeVivaLibraryDeleteCapability({
       scope: controlTarget?.scope ?? "study_set_delete",
       studySetId: controlTarget?.studySetId ?? "",
       token: controlToken ?? "",
       userId,
       voiceSessionId: controlTarget?.voiceSessionId ?? null,
     });
-    if (verification === "missing_secret") {
+    if (!consumption.ok) {
       return {
         ok: false,
-        response: vivaLibraryProxyJsonError(503, "viva_library_control_unavailable"),
+        response:
+          consumption.reason === "unavailable"
+            ? libraryControlStoreUnavailableResponse()
+            : vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
       };
     }
-    if (verification !== "valid") {
-      return {
-        ok: false,
-        response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
-      };
+    const deleteToken = vivaAgentScopedCredential("library_delete");
+    if (!deleteToken) {
+      return { ok: false, response: libraryConfigUnavailableResponse(request.method, path) };
     }
-    return { consumedControlToken: true, ok: true, token };
+    return { consumedControlToken: true, ok: true, token: deleteToken };
+  }
+  const token = vivaAgentScopedCredential("library_read");
+  if (!token) {
+    return {
+      ok: false,
+      response: libraryConfigUnavailableResponse(request.method, path),
+    };
   }
 
   const userId = request.nextUrl.searchParams.get("user_id")?.trim();
@@ -573,6 +578,14 @@ function guardDestructiveSecurityStore(
 ): NextResponse | null {
   if (request.method !== "DELETE" || !controlTarget?.studySetId) return null;
   if (vivaSessionSecurityStore().ok) return null;
+  return libraryControlStoreUnavailableResponse();
+}
+
+/**
+ * An unavailable or ambiguous destructive store. The capability may or may not have been consumed,
+ * so the route refuses without contacting the agent and without hinting at a retry.
+ */
+function libraryControlStoreUnavailableResponse(): NextResponse {
   return NextResponse.json(
     {
       error: "viva_library_control_unavailable",
