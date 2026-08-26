@@ -92,7 +92,7 @@ boundary well · wash 4 · margin num · rows dots · folio acc · accent copper
 - **margin `num`** — hanging numerals in the margin
 - **rows `dots`** — dot leaders carrying the eye to the folio
 - **folio `acc`** — page/interval references in the accent
-- **accent `copper`** (`#B06A3B`) — but see §7's accent roles and §15's O-8; the *text* value must be `copperInk` #6A4023, not `copper` (atmosphere spec §11.2)
+- **accent `copper`** (`#B06A3B`) — but see §7's accent roles and §15's O-8; the *text* value must be `copperInk` #693F23, not `copper` (atmosphere spec §11.2)
 
 The numerals are not decoration. **They can be referenced inline from the correction text** — "the
 gradient **stores** the energy.¹" — which turns grouping into a function instead of a container. That
@@ -145,7 +145,7 @@ radius  = { surface: 7, pill: 999 }   // 7 is locked; pill is the primary CTA on
 | role | job | value |
 | --- | --- | --- |
 | structural | keylines, rules, hairlines, the spark | `gold` #BD9A55 |
-| grouping | group labels, folios, leaders (§5) | `copperInk` #6A4023 |
+| grouping | group labels, folios, leaders (§5) | `copperInk` #693F23 |
 | rubrication | correction and repair only | *pending O-8* |
 
 Ornament values and `*Ink` text values are distinct tokens, per atmosphere spec §11. **A component

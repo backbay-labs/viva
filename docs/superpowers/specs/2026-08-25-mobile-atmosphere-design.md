@@ -278,9 +278,16 @@ consequence of the drift; it was already failing on the flat `#F7F0E7` ground.
 | sage | `#667C61` | `sageInk` **#3F4D3C** |
 | ochre | `#B77831` | `ochreInk` **#65421B** |
 | gold | `#BD9A55` | `goldInk` **#574727** |
-| copper | `#B06A3B` | `copperInk` **#6A4023** |
+| copper | `#B06A3B` | `copperInk` **#693F23** |
 | prussian | `#3C5A78` | `prussianInk` **#324C65** |
 | plum | `#6E429B` | `plumInk` **#5C3782** |
+
+> **Method note (learned the hard way).** These values must be searched over
+> **integer** RGB triples and scored on the *rounded* hex. The first pass scored
+> the ratio on unrounded floats and then rounded to hex, which published a
+> `copperInk` of `#6A4023` that actually measures **4.4983:1** — under the bar by
+> 0.0017. The corrected value is `#693F23` (4.5648:1). The unit test in §11.3
+> catches this class of error because it parses the shipped hex.
 
 **Move 2 — accents may not carry body-size text.** Ornament values stay exactly as they are for
 hairlines, keylines, sparks, gauge fills and rules; purely decorative marks are outside WCAG 1.4.11,
@@ -292,7 +299,7 @@ darkest — so any accent mark that *conveys state* (the gauge fill, the selecte
 
 The grouping lock (component spec §5) specifies `folio acc` with `accent copper`, and folios render at
 caption size — **2.15:1 at the darkest, the worst value in the table.** The design is kept; the token
-is not. Copper folios must use `copperInk #6A4023`. Same for the `ghead` group label.
+is not. Copper folios must use `copperInk #693F23`. Same for the `ghead` group label.
 
 ### 11.3 Guard, not a clamp
 

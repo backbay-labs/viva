@@ -218,7 +218,7 @@ export const colors = {
   sageInk: "#3F4D3C",
   ochreInk: "#65421B",
   goldInk: "#574727",
-  copperInk: "#6A4023",
+  copperInk: "#693F23",
   prussianInk: "#324C65",
   plumInk: "#5C3782",
   hairline: "rgba(39, 26, 48, 0.11)",
