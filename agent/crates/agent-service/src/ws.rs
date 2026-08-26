@@ -381,6 +381,69 @@ impl SessionLimitRuntime {
     }
 }
 
+/// What the heartbeat timer asks the socket to do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeartbeatAction {
+    SleepUntil(Instant),
+    SendPing,
+    Expired,
+}
+
+/// `SERVICE-001`: the server-owned transport liveness probe.
+///
+/// Only a Pong received while one is outstanding clears `pong_deadline`, so an
+/// unsolicited Pong buys nothing. Ping/Pong activity never touches the in-turn,
+/// between-turn, or absolute-session deadlines: this state owns no other clock.
+#[derive(Debug)]
+struct HeartbeatState {
+    next_ping: Instant,
+    pong_deadline: Option<Instant>,
+}
+
+impl HeartbeatState {
+    fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            next_ping: now + interval,
+            pong_deadline: None,
+        }
+    }
+
+    /// The next instant this state has anything to do: an outstanding pong
+    /// deadline first, otherwise the next scheduled ping.
+    fn next_wake(&self) -> Instant {
+        self.pong_deadline.unwrap_or(self.next_ping)
+    }
+
+    fn on_timer(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        pong_timeout: Duration,
+    ) -> HeartbeatAction {
+        if let Some(deadline) = self.pong_deadline {
+            return if now >= deadline {
+                HeartbeatAction::Expired
+            } else {
+                HeartbeatAction::SleepUntil(deadline)
+            };
+        }
+        if now < self.next_ping {
+            return HeartbeatAction::SleepUntil(self.next_ping);
+        }
+        self.pong_deadline = Some(now + pong_timeout);
+        self.next_ping = now + interval;
+        HeartbeatAction::SendPing
+    }
+
+    fn on_pong(&mut self, now: Instant, interval: Duration) -> bool {
+        if self.pong_deadline.take().is_none() {
+            return false;
+        }
+        self.next_ping = now + interval;
+        true
+    }
+}
+
 /// `SERVICE-002`: why an outbound write did not complete. A missed deadline and a
 /// broken sink are different facts and record different sanitized terminal labels.
 #[derive(Debug, thiserror::Error)]
@@ -773,6 +836,11 @@ async fn run_voice_session<S, R>(
     let mut completed_provider_turn_response_ids = HashSet::<String>::new();
     let mut superseded_provider_turn_response_ids = HashSet::<String>::new();
     let mut turn_work_outstanding = false;
+    // `SERVICE-001`: the transport liveness probe owns its own timer. It never
+    // reads or writes the absolute-session, in-turn, or between-turn sleepers.
+    let mut heartbeat = HeartbeatState::new(Instant::now(), state.ws_timeouts.heartbeat_interval);
+    let heartbeat_timer = tokio::time::sleep_until(heartbeat.next_wake());
+    tokio::pin!(heartbeat_timer);
     let mut drain_signal = state.drain_signal.subscribe();
     if *drain_signal.borrow_and_update() {
         terminal_reason = close_with_terminal_session_phase(
@@ -867,6 +935,41 @@ async fn run_voice_session<S, R>(
                 )
                 .await;
                 break;
+            }
+            _ = &mut heartbeat_timer => {
+                match heartbeat.on_timer(
+                    Instant::now(),
+                    state.ws_timeouts.heartbeat_interval,
+                    state.ws_timeouts.pong_timeout,
+                ) {
+                    HeartbeatAction::SleepUntil(deadline) => {
+                        heartbeat_timer.as_mut().reset(deadline);
+                    }
+                    HeartbeatAction::SendPing => {
+                        if let Err(error) = sender.send(Message::Ping(Vec::new().into())).await {
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                            break;
+                        }
+                        heartbeat_timer.as_mut().reset(heartbeat.next_wake());
+                    }
+                    HeartbeatAction::Expired => {
+                        // A peer that stopped answering is indistinguishable from a
+                        // peer that stopped reading, and Plan 05 already publishes
+                        // that terminal contract.
+                        abort_realtime_session_tasks(&mut session);
+                        terminal_reason = close_with_terminal_session_phase(
+                            &mut sender,
+                            &session.input,
+                            &state,
+                            voice_session_id.clone(),
+                            &mut terminal_persisted,
+                            TerminalSessionReason::SlowClient,
+                            close_code::POLICY,
+                        )
+                        .await;
+                        break;
+                    }
+                }
             }
             queued = &mut pending_provider_admission, if !pending_provider_admission.is_terminated() => {
                 let QueuedProviderAdmission {
@@ -1005,6 +1108,28 @@ async fn run_voice_session<S, R>(
                     terminal_reason = "client_disconnect";
                     break;
                 };
+                // `SERVICE-001`: WebSocket control frames are transport, not
+                // protocol. They are answered here, before any `ClientFrame`
+                // parsing, and they move no session deadline.
+                match &message {
+                    Message::Ping(payload) => {
+                        let payload = payload.clone();
+                        if let Err(error) = sender.send(Message::Pong(payload)).await {
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
+                            break;
+                        }
+                        continue;
+                    }
+                    Message::Pong(_) => {
+                        if heartbeat
+                            .on_pong(Instant::now(), state.ws_timeouts.heartbeat_interval)
+                        {
+                            heartbeat_timer.as_mut().reset(heartbeat.next_wake());
+                        }
+                        continue;
+                    }
+                    Message::Text(_) | Message::Binary(_) | Message::Close(_) => {}
+                }
                 let client_input = match prepare_client_message_with_drain(
                     message,
                     &session_binding,
@@ -8650,5 +8775,152 @@ mod tests {
             "intent": { "kind": "answer_text", "text": "an answer the client never reads back" },
         })
         .to_string()
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 10 (SERVICE-001): heartbeat expiry that keepalives cannot extend.
+    // ---------------------------------------------------------------------
+
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+    const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_pings_at_the_configured_interval_and_expires_without_a_pong() {
+        let start = Instant::now();
+        let mut heartbeat = HeartbeatState::new(start, HEARTBEAT_INTERVAL);
+        assert_eq!(heartbeat.next_wake(), start + HEARTBEAT_INTERVAL);
+
+        // Nothing is due before the interval elapses.
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(29),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::SleepUntil(start + HEARTBEAT_INTERVAL)
+        );
+
+        let at_thirty = start + HEARTBEAT_INTERVAL;
+        assert_eq!(
+            heartbeat.on_timer(at_thirty, HEARTBEAT_INTERVAL, PONG_TIMEOUT),
+            HeartbeatAction::SendPing
+        );
+        assert_eq!(heartbeat.next_wake(), at_thirty + PONG_TIMEOUT);
+
+        // Still inside the pong window at 39 seconds.
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(39),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::SleepUntil(at_thirty + PONG_TIMEOUT)
+        );
+
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(40),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::Expired
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_pong_before_the_deadline_schedules_the_next_ping() {
+        let start = Instant::now();
+        let mut heartbeat = HeartbeatState::new(start, HEARTBEAT_INTERVAL);
+        assert_eq!(
+            heartbeat.on_timer(start + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, PONG_TIMEOUT),
+            HeartbeatAction::SendPing
+        );
+
+        let at_thirty_nine = start + Duration::from_secs(39);
+        assert!(heartbeat.on_pong(at_thirty_nine, HEARTBEAT_INTERVAL));
+        assert_eq!(heartbeat.next_wake(), at_thirty_nine + HEARTBEAT_INTERVAL);
+
+        // The next ping is due at 69 seconds, not at 60.
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(60),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::SleepUntil(start + Duration::from_secs(69))
+        );
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(69),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::SendPing
+        );
+        assert_eq!(
+            heartbeat.on_timer(
+                start + Duration::from_secs(79),
+                HEARTBEAT_INTERVAL,
+                PONG_TIMEOUT
+            ),
+            HeartbeatAction::Expired
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_ignores_an_unsolicited_pong() {
+        let start = Instant::now();
+        let mut heartbeat = HeartbeatState::new(start, HEARTBEAT_INTERVAL);
+
+        // No ping is outstanding, so this pong clears nothing and moves nothing.
+        assert!(!heartbeat.on_pong(start + Duration::from_secs(5), HEARTBEAT_INTERVAL));
+        assert_eq!(heartbeat.next_wake(), start + HEARTBEAT_INTERVAL);
+        assert_eq!(
+            heartbeat.on_timer(start + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, PONG_TIMEOUT),
+            HeartbeatAction::SendPing
+        );
+
+        // A second pong while one is outstanding clears it; a third does not
+        // re-open the window.
+        assert!(heartbeat.on_pong(start + Duration::from_secs(31), HEARTBEAT_INTERVAL));
+        assert!(!heartbeat.on_pong(start + Duration::from_secs(32), HEARTBEAT_INTERVAL));
+        assert_eq!(
+            heartbeat.next_wake(),
+            start + Duration::from_secs(31) + HEARTBEAT_INTERVAL
+        );
+    }
+
+    /// `SERVICE-001`: keepalives keep the transport alive and change nothing else.
+    /// Twenty ping/pong exchanges span the whole 600-second between-turn deadline
+    /// without moving it by a nanosecond.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_never_moves_the_between_turn_or_session_deadline() {
+        let start = Instant::now();
+        let between_turn_idle = Duration::from_secs(600);
+        let sleeper = tokio::time::sleep(between_turn_idle);
+        tokio::pin!(sleeper);
+        let armed_deadline = sleeper.deadline();
+        assert_eq!(armed_deadline, start + between_turn_idle);
+
+        let mut heartbeat = HeartbeatState::new(start, HEARTBEAT_INTERVAL);
+        let mut now = start;
+        let mut pings = 0_u32;
+        while now < start + between_turn_idle {
+            now += Duration::from_secs(30);
+            match heartbeat.on_timer(now, HEARTBEAT_INTERVAL, PONG_TIMEOUT) {
+                HeartbeatAction::SendPing => {
+                    pings += 1;
+                    assert!(heartbeat.on_pong(now, HEARTBEAT_INTERVAL));
+                }
+                other => panic!("expected a ping at {now:?}, got {other:?}"),
+            }
+            // Neither the ping nor the pong may re-arm the between-turn deadline:
+            // there is still no outstanding turn work, and `rearm_between_turn_idle`
+            // is never reached from a keepalive.
+            assert_eq!(sleeper.deadline(), armed_deadline);
+        }
+
+        assert_eq!(pings, 20);
+        assert_eq!(sleeper.deadline(), armed_deadline);
     }
 }

@@ -16973,3 +16973,251 @@ async fn between_turn_idle_is_not_postponed_by_client_keepalives() {
         "the between-turn deadline moved with keepalives"
     );
 }
+
+// -------------------------------------------------------------------------
+// Task 10 (SERVICE-001): a half-open socket expires on the server's own
+// heartbeat rather than surviving to the absolute session cap.
+// -------------------------------------------------------------------------
+
+/// A provider that holds one turn open forever, so the only thing that can end
+/// the socket is a server-owned deadline.
+struct HalfOpenProbeBrain {
+    study_store: Arc<dyn StudyMemoryStore>,
+}
+
+#[async_trait::async_trait]
+impl RealtimeBrain for HalfOpenProbeBrain {
+    fn capabilities(&self) -> RealtimeBrainCapabilities {
+        RealtimeBrainCapabilities {
+            provider: "half_open_probe".to_owned(),
+            configured: true,
+            selectable: true,
+            live_runtime: false,
+        }
+    }
+
+    async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+        let _outcome = self
+            .study_store
+            .record_voice_session(&config)
+            .await
+            .map_err(|error| store_stage_error(error.kind().as_str()))?;
+        let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+        let (event_tx, events) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let _ = event_tx
+                .send(BrainEvent::SessionPhase {
+                    phase: agent_domain::StudySessionPhase::Ready,
+                })
+                .await;
+            let _ = event_tx
+                .send(BrainEvent::QuestionStarted {
+                    response_id: "response-1".to_owned(),
+                    question: agent_domain::fixture_question(),
+                })
+                .await;
+            // Consume input and never resolve the turn.
+            while input_rx.recv().await.is_some() {}
+        });
+
+        Ok(RealtimeSession {
+            input,
+            events,
+            task_guard: Some(RealtimeSessionTaskGuard::new(vec![task.abort_handle()])),
+        })
+    }
+}
+
+/// `SERVICE-001`: a client that stops reading and stops writing is detected by
+/// the server's own heartbeat. Every server-owned permit — session slot, IP
+/// lease, user/study-set lease, provider lease — is back before one heartbeat
+/// interval has passed, and a fresh client for the same identity connects.
+#[tokio::test]
+async fn half_open_socket_expires_and_releases_every_server_owned_lease() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        2,
+        store,
+    )
+    .with_voice_limits(VoiceLimitConfig {
+        max_ip_sessions: Some(2),
+        max_user_sessions: Some(1),
+        provider_limiter_enabled: true,
+        max_provider_concurrent_turns: Some(1),
+        max_provider_queue_depth: Some(1),
+        ..VoiceLimitConfig::default()
+    })
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        // Every other deadline is far away: only the heartbeat can end this socket.
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_millis(120),
+        pong_timeout: Duration::from_millis(60),
+        ..WsTimeouts::default()
+    });
+    let limits = state.limit_state.clone();
+    let slots = state.session_slots.clone();
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    // One admitted answer holds the only provider slot; the provider never
+    // resolves it.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-half-open".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "an answer the provider never resolves".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        limits.ip_lease_count(TEST_PEER_IP) == Some(1)
+    })
+    .await;
+    assert_eq!(slots.available_permits(), 1);
+
+    // The client goes half-open: the socket object is kept alive, but the test
+    // stops reading it and never writes again, so no Pong will ever be answered.
+    let half_open = socket;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if limits.ip_lease_count(TEST_PEER_IP).is_none() && slots.available_permits() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        limits.ip_lease_count(TEST_PEER_IP),
+        None,
+        "the half-open socket must release its IP lease"
+    );
+    assert_eq!(slots.available_permits(), 2);
+    let recorded = evidence.snapshot();
+    assert!(
+        recorded.iter().any(|event| {
+            event.kind == VoiceEvidenceEventKind::TerminalReason
+                && event.detail == TerminalSessionReason::SlowClient.as_str()
+        }),
+        "{recorded:?}"
+    );
+    drop(half_open);
+
+    // The user, study-set, and provider leases are gone too: the same identity
+    // reconnects and is admitted a provider turn.
+    let (mut second_socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut second_socket, "half_open_probe").await;
+    send_client_frame(&mut second_socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut second_socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+    send_client_frame(
+        &mut second_socket,
+        &ClientFrame::TurnIntent {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: "bac522-half-open-2".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            intent: ClientTurnIntent::AnswerText {
+                text: "the provider slot was released".to_owned(),
+            },
+        },
+    )
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .filter(|event| {
+                event.kind == VoiceEvidenceEventKind::AnswerReceived
+                    && event.detail == "text answer received"
+            })
+            .count()
+            == 2
+    })
+    .await;
+}
+
+/// A client that keeps answering the server's Pings stays connected across many
+/// heartbeat intervals; the keepalives never end the socket and never move any
+/// other deadline.
+#[tokio::test]
+async fn half_open_answered_heartbeats_keep_the_socket_alive() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(30),
+        between_turn_idle: Duration::from_secs(30),
+        session: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_millis(60),
+        pong_timeout: Duration::from_millis(30),
+        ..WsTimeouts::default()
+    });
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+
+    // Reading the socket is what answers the server's Pings: tokio-tungstenite
+    // replies to a Ping while the stream is polled.
+    let mut pings = 0_usize;
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), socket.next()).await {
+            Ok(Some(Ok(WsMessage::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                panic!("an answered heartbeat must not close the socket: {frame:?}")
+            }
+            Ok(Some(Ok(_))) | Err(_) => {}
+            Ok(Some(Err(error))) => panic!("socket error: {error:?}"),
+            Ok(None) => panic!("an answered heartbeat must not end the socket"),
+        }
+    }
+    assert!(
+        pings >= 3,
+        "the server must keep pinging across heartbeat intervals, saw {pings}"
+    );
+}
