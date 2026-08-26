@@ -17221,3 +17221,133 @@ async fn half_open_answered_heartbeats_keep_the_socket_alive() {
         "the server must keep pinging across heartbeat intervals, saw {pings}"
     );
 }
+
+/// Independent-review CRITICAL (cancel-after-submit): a scoped cancel that names
+/// a turn the client has already ended must not end the session.
+///
+/// The browser decides to cancel while its own `audio_end` is already on the
+/// wire; the server has no way to make that race disappear. Before this fix the
+/// late cancel found no open assembly, was classified `invalid_audio_frame`, and
+/// closed the socket with a PROTOCOL code — a learner losing their session for
+/// tapping cancel a few milliseconds late. Existing coverage stopped at the
+/// mid-stream cancel; this is the after-`audio_end` case.
+#[tokio::test]
+async fn websocket_scoped_cancel_after_audio_end_does_not_close_the_session() {
+    let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let state = AppState::with_study_store(
+        Arc::new(HalfOpenProbeBrain {
+            study_store: store.clone(),
+        }),
+        "half_open_probe",
+        VoiceWsAccess::default(),
+        1,
+        store,
+    )
+    .with_ws_timeouts(WsTimeouts {
+        first_frame: Duration::from_secs(5),
+        idle: Duration::from_secs(10),
+        between_turn_idle: Duration::from_secs(10),
+        session: Duration::from_secs(20),
+        ..WsTimeouts::default()
+    });
+    let evidence = state.evidence.clone();
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let (mut socket, _) = connect_async(url.as_str()).await.unwrap();
+    assert_ready_provider(&mut socket, "half_open_probe").await;
+    send_client_frame(&mut socket, &fixture_session_config_frame()).await;
+    loop {
+        let frame = read_server_frame(&mut socket).await;
+        if matches!(
+            &frame,
+            ServerFrame::Event { event, .. }
+                if matches!(event.as_ref(), VivaServerEvent::QuestionStarted { .. })
+        ) {
+            break;
+        }
+    }
+
+    send_v5_audio_turn(&mut socket, "turn-late-cancel", &[1_u8, 2]).await;
+    assert!(matches!(
+        read_server_frame_exact(&mut socket).await,
+        ServerFrame::AudioTurnAccepted { turn_id, .. } if turn_id == "turn-late-cancel"
+    ));
+
+    // The cancel the learner sent a moment too late.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-late-cancel".to_owned()),
+        },
+    )
+    .await;
+
+    // It is recorded as a cancel, and the socket is still open: no error frame,
+    // no close, no terminal reason.
+    wait_until(Duration::from_secs(2), || {
+        evidence
+            .snapshot()
+            .iter()
+            .any(|event| event.kind == VoiceEvidenceEventKind::CancelReceived)
+    })
+    .await;
+    match tokio::time::timeout(Duration::from_millis(300), socket.next()).await {
+        Err(_) => {}
+        Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => {}
+        Ok(other) => panic!("a late scoped cancel must not end the session, got {other:?}"),
+    }
+    assert!(
+        evidence.snapshot().iter().all(|event| {
+            event.kind != VoiceEvidenceEventKind::TerminalReason
+                && event.kind != VoiceEvidenceEventKind::Close
+        }),
+        "{:?}",
+        evidence.snapshot()
+    );
+
+    // Repeating the late cancel is still benign, and a cancel naming a turn this
+    // connection never saw is still refused.
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-late-cancel".to_owned()),
+        },
+    )
+    .await;
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::Cancel {
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+            client_generation_id: VOICE_TEST_CLIENT_GENERATION.to_owned(),
+            turn_id: Some("turn-never-seen".to_owned()),
+        },
+    )
+    .await;
+    let error = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    if let ServerFrame::Error { error, .. } =
+                        serde_json::from_str::<ServerFrame>(&text).unwrap()
+                    {
+                        return error;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected the unknown turn to be refused, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a cancel for a turn this connection never saw is still refused");
+    assert_eq!(
+        error.code,
+        VoiceServerErrorCode::ClientFrameMalformed.as_str()
+    );
+    assert_close_code(&mut socket, CloseCode::Protocol).await;
+}
