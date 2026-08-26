@@ -226,12 +226,16 @@ where
                 .await;
             let _ = event_tx
                 .send(BrainEvent::QuestionStarted {
-                    response_id: first_response_id,
+                    response_id: first_response_id.clone(),
                     question,
                 })
                 .await;
 
             let mut turn = 1_usize;
+            // The response whose question has already been announced. The open
+            // handshake announces the first one; every later accepted turn
+            // announces its own before it records or emits anything else.
+            let mut started_response_id = Some(first_response_id);
             let mut active_response: Option<ActiveRunnerResponse> = None;
             while let Some(input) = input_rx.recv().await {
                 let runner_input = match input {
@@ -308,6 +312,13 @@ where
                         .or(session_generation_id.as_deref()),
                 );
                 turn += 1;
+                // Every accepted turn is correlated to its own question. The
+                // first one was announced by the open handshake; a replacement
+                // or follow-on turn announces its own before anything else it
+                // records or emits, so a client's staleness guard can key on it.
+                let announce_question =
+                    started_response_id.as_deref() != Some(response_id.as_str());
+                started_response_id = Some(response_id.clone());
                 active_response = Some(runner.spawn_turn(
                     RunnerTurnJob {
                         event_tx: event_tx.clone(),
@@ -317,6 +328,7 @@ where
                         submission_sequence,
                         input: runner_input,
                         phases: phases.clone(),
+                        announce_question,
                         cancelled: Arc::new(AtomicBool::new(false)),
                         completed: Arc::new(AtomicBool::new(false)),
                     },
@@ -524,6 +536,19 @@ where
             &job.response_id,
         )
         .await?;
+        if job.announce_question
+            && !send_fake_unless_cancelled(
+                &job.event_tx,
+                BrainEvent::QuestionStarted {
+                    response_id: job.response_id.clone(),
+                    question: question.clone(),
+                },
+                &job.cancelled,
+            )
+            .await
+        {
+            return Ok(());
+        }
         job.executor
             .record_answer_attempt_envelope(answer_attempt_envelope(
                 &job.session,
@@ -1169,6 +1194,10 @@ pub(crate) struct RunnerTurnJob {
     pub(crate) submission_sequence: u32,
     pub(crate) input: RunnerInput,
     pub(crate) phases: SessionPhaseTracker,
+    /// Whether this turn owns the `QuestionStarted` emission for its response.
+    /// The open handshake already announced the first response; every later
+    /// accepted turn announces its own.
+    pub(crate) announce_question: bool,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) completed: Arc<AtomicBool>,
 }
@@ -2867,6 +2896,7 @@ mod tests {
                     client_generation_id: None,
                 },
                 phases: SessionPhaseTracker::ready(),
+                announce_question: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 completed: Arc::new(AtomicBool::new(false)),
             })
@@ -2947,6 +2977,7 @@ mod tests {
                     client_generation_id: None,
                 },
                 phases: SessionPhaseTracker::ready(),
+                announce_question: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 completed: Arc::new(AtomicBool::new(false)),
             })

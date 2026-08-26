@@ -772,6 +772,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
         .unwrap();
 
     let mut saw_old_cancel = false;
+    let mut saw_new_question = false;
     let mut saw_new_interim = false;
     let mut saw_new_transcript = false;
     let mut saw_new_evaluation = false;
@@ -783,6 +784,16 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
                 if response_id == "response-1" {
                     saw_old_cancel = true;
                 }
+            }
+            // `ADAPTER-02`: the replacement turn starts its own question, and it
+            // does so before any other event bound to the replacement response.
+            BrainEvent::QuestionStarted { response_id, .. } => {
+                assert_eq!(response_id, "response-2");
+                assert!(
+                    !saw_new_interim && !saw_new_transcript && !saw_new_evaluation,
+                    "the replacement question must start before the replacement turn speaks"
+                );
+                saw_new_question = true;
             }
             BrainEvent::TranscriptDelta { response_id, text } => {
                 if response_id == "response-2" {
@@ -822,6 +833,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
             _ => {}
         }
         if saw_old_cancel
+            && saw_new_question
             && saw_new_interim
             && saw_new_transcript
             && saw_new_evaluation
@@ -833,6 +845,7 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     }
 
     assert!(saw_old_cancel);
+    assert!(saw_new_question);
     assert!(saw_new_interim);
     assert!(saw_new_transcript);
     assert!(saw_new_evaluation);
@@ -3190,4 +3203,341 @@ async fn evaluated_outcome_without_a_concept_transition_fails_closed_without_a_d
     assert_eq!(calls.record_concept_status, 0);
     assert!(calls.persist_review_schedule_decision.is_empty());
     assert_eq!(calls.recorded_recaps, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 (`ADAPTER-02`): every accepted turn starts its own question.
+//
+// The expectation is not written here by hand: it is read out of the frozen
+// Plan 05 fixture through the published manifest, so the adapter's per-turn
+// correlation is pinned to the same artefact the service and client lanes use.
+// ---------------------------------------------------------------------------
+
+const VOICE_FIXTURE_MANIFEST_SCHEMA: &str = "viva.voice-fixtures.manifest.v1";
+const VOICE_FIXTURE_MANIFEST_PATH: &str = "agent/fixtures/voice-protocol/v5/manifest.json";
+
+fn repository_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("the adapter crate lives three directories below the repository root")
+        .to_path_buf()
+}
+
+/// Resolve one Plan 05 fixture by its published manifest ID.
+///
+/// The manifest is the only way in: the schema, protocol version, supported
+/// versions, and legacy disposition are validated first, the ID must resolve
+/// exactly once, and the referenced path may not escape `agent/fixtures`. A
+/// missing or duplicated ID fails the test rather than silently selecting one.
+fn resolve_voice_fixture(manifest_id: &str) -> serde_json::Value {
+    let root = repository_root();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(VOICE_FIXTURE_MANIFEST_PATH))
+            .expect("Plan 05 publishes the v5 fixture manifest"),
+    )
+    .expect("the v5 fixture manifest is JSON");
+
+    assert_eq!(manifest["schema"], VOICE_FIXTURE_MANIFEST_SCHEMA);
+    assert_eq!(manifest["protocol_version"], 5);
+    assert_eq!(manifest["supported_versions"], json!([5]));
+    assert_eq!(manifest["legacy_v4_disposition"], "reject");
+
+    let entries = manifest["fixtures"]
+        .as_array()
+        .expect("the manifest publishes a fixture list");
+    let resolved = entries
+        .iter()
+        .filter(|entry| entry["id"] == manifest_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved.len(),
+        1,
+        "manifest id {manifest_id} must be published exactly once"
+    );
+    let path = resolved[0]["path"]
+        .as_str()
+        .expect("a manifest entry names a path");
+    assert!(
+        path.starts_with("agent/fixtures/"),
+        "manifest path {path} escapes the fixture tree"
+    );
+    assert!(
+        !path.contains("/../") && !path.contains("/./"),
+        "manifest path {path} traverses out of the fixture tree"
+    );
+
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(path)).expect("the manifest path resolves to a fixture"),
+    )
+    .expect("the resolved fixture is JSON");
+    assert_eq!(
+        fixture["protocol_version"], 5,
+        "strict v5 rejects a legacy envelope"
+    );
+    fixture
+}
+
+/// The adapter-owned half of the frozen two-turn session fixture.
+struct TwoTurnQuestionCorrelation {
+    first_response_id: String,
+    second_response_id: String,
+    /// Event kinds the fixture itself places after the second question starts
+    /// while still naming the first response. Nothing else may trail.
+    authorized_trailing_kinds: std::collections::BTreeSet<String>,
+}
+
+fn two_turn_question_correlation(fixture: &serde_json::Value) -> TwoTurnQuestionCorrelation {
+    let turns = fixture["turns"]
+        .as_array()
+        .expect("a session-sequence fixture publishes its turns");
+    assert_eq!(turns.len(), 2, "the two-turn fixture publishes two turns");
+    let first_response_id = turns[0]["response_id"]
+        .as_str()
+        .expect("turn 1 names its response")
+        .to_owned();
+    let second_response_id = turns[1]["response_id"]
+        .as_str()
+        .expect("turn 2 names its response")
+        .to_owned();
+    assert_ne!(first_response_id, second_response_id);
+
+    let frames = fixture["server_sequence_json"]
+        .as_array()
+        .expect("a session-sequence fixture publishes its server frames")
+        .iter()
+        .map(|frame| {
+            serde_json::from_str::<serde_json::Value>(
+                frame.as_str().expect("each server frame is encoded JSON"),
+            )
+            .expect("each server frame is JSON")
+        })
+        .collect::<Vec<_>>();
+    let second_start = frames
+        .iter()
+        .position(|frame| {
+            frame["event"]["type"] == "question_started"
+                && frame["event"]["response_id"] == second_response_id.as_str()
+        })
+        .expect("the fixture starts a question for the second response");
+    let authorized_trailing_kinds = frames[second_start + 1..]
+        .iter()
+        .filter(|frame| frame["event"]["response_id"] == first_response_id.as_str())
+        .filter_map(|frame| frame["event"]["type"].as_str().map(ToOwned::to_owned))
+        .collect();
+
+    TwoTurnQuestionCorrelation {
+        first_response_id,
+        second_response_id,
+        authorized_trailing_kinds,
+    }
+}
+
+fn adapter_event_kind(event: &BrainEvent) -> &'static str {
+    match event {
+        BrainEvent::QuestionStarted { .. } => "question_started",
+        BrainEvent::TranscriptDelta { .. } => "transcript_delta",
+        BrainEvent::TranscriptFinal { .. } => "transcript_final",
+        BrainEvent::ResponseTranscriptDelta { .. } => "response_transcript_delta",
+        BrainEvent::AnswerEvaluated { .. } => "answer_evaluated",
+        BrainEvent::TurnDeferred { .. } => "turn_deferred",
+        BrainEvent::SourceReference { .. } => "source_reference",
+        BrainEvent::ConceptStatus { .. } => "concept_status",
+        BrainEvent::ManuscriptIntent { .. } => "manuscript_intent",
+        BrainEvent::AudioDelta { .. } => "audio_delta",
+        BrainEvent::ResponseCompleted { .. } => "response_completed",
+        BrainEvent::ResponseCancelledFor { .. } => "cancellation",
+        BrainEvent::RecapReady { .. } => "recap_ready",
+        BrainEvent::ProviderFallbackActivated { .. } => "provider_fallback_activated",
+        _ => "other",
+    }
+}
+
+fn adapter_event_response_id(event: &BrainEvent) -> Option<&str> {
+    match event {
+        BrainEvent::QuestionStarted { response_id, .. }
+        | BrainEvent::TranscriptDelta { response_id, .. }
+        | BrainEvent::TranscriptFinal { response_id, .. }
+        | BrainEvent::ResponseTranscriptDelta { response_id, .. }
+        | BrainEvent::AnswerEvaluated { response_id, .. }
+        | BrainEvent::TurnDeferred { response_id, .. }
+        | BrainEvent::SourceReference { response_id, .. }
+        | BrainEvent::ConceptStatus { response_id, .. }
+        | BrainEvent::ManuscriptIntent { response_id, .. }
+        | BrainEvent::AudioDelta { response_id, .. }
+        | BrainEvent::ResponseCompleted { response_id, .. }
+        | BrainEvent::ResponseCancelledFor { response_id }
+        | BrainEvent::RecapReady { response_id, .. }
+        | BrainEvent::ProviderFallbackActivated { response_id, .. }
+        | BrainEvent::ResponseStarted { response_id }
+        | BrainEvent::ResponseAudio { response_id, .. }
+        | BrainEvent::ResponseToolProposal { response_id, .. }
+        | BrainEvent::ResponseTextStarted { response_id } => Some(response_id.as_str()),
+        _ => None,
+    }
+}
+
+/// The parity helper the mutation controls are aimed at.
+fn two_turn_question_correlation_result(
+    events: &[BrainEvent],
+    correlation: &TwoTurnQuestionCorrelation,
+) -> Result<(), String> {
+    let started = events
+        .iter()
+        .filter_map(|event| match event {
+            BrainEvent::QuestionStarted { response_id, .. } => Some(response_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        correlation.first_response_id.as_str(),
+        correlation.second_response_id.as_str(),
+    ];
+    if started != expected {
+        return Err(format!(
+            "each accepted turn must start exactly one correlated question; expected {expected:?}, saw {started:?}"
+        ));
+    }
+
+    for response_id in expected {
+        let first_bound = events
+            .iter()
+            .find(|event| adapter_event_response_id(event) == Some(response_id))
+            .ok_or_else(|| format!("no event carries {response_id}"))?;
+        if !matches!(first_bound, BrainEvent::QuestionStarted { .. }) {
+            return Err(format!(
+                "{response_id} emitted {} before its question started",
+                adapter_event_kind(first_bound)
+            ));
+        }
+    }
+
+    let second_start = events
+        .iter()
+        .position(|event| {
+            matches!(event, BrainEvent::QuestionStarted { response_id, .. }
+                if response_id == &correlation.second_response_id)
+        })
+        .expect("the second question start was located above");
+    for event in &events[second_start + 1..] {
+        let Some(response_id) = adapter_event_response_id(event) else {
+            continue;
+        };
+        if response_id == correlation.second_response_id {
+            continue;
+        }
+        let kind = adapter_event_kind(event);
+        if response_id == correlation.first_response_id
+            && correlation.authorized_trailing_kinds.contains(kind)
+        {
+            continue;
+        }
+        return Err(format!(
+            "{kind} for {response_id} trails the start of {}",
+            correlation.second_response_id
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_cartesia_two_turns_match_manifest_question_correlation() {
+    let fixture = resolve_voice_fixture("VOICE-FAKE-CARTESIA-GEMINI-TWO-TURN-SESSION");
+    let correlation = two_turn_question_correlation(&fixture);
+
+    let store = learning_ready_store();
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime.open(fixture_session_config()).await.unwrap();
+
+    let mut events = vec![next_event(&mut session).await];
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            1_u8, 2, 3, 4,
+        ])))
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut session).await;
+        let completed = matches!(&event, BrainEvent::RecapReady { response_id, .. }
+            if response_id == &correlation.first_response_id);
+        events.push(event);
+        if completed {
+            break;
+        }
+    }
+    // Let the first turn finish before the second is submitted: this is an
+    // ordinary next turn, not a barge-in.
+    events.extend(remaining_events(&mut session).await);
+
+    session
+        .input
+        .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+            5_u8, 6, 7, 8,
+        ])))
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut session).await;
+        let completed = matches!(&event, BrainEvent::RecapReady { response_id, .. }
+            if response_id == &correlation.second_response_id);
+        events.push(event);
+        if completed {
+            break;
+        }
+    }
+    events.extend(remaining_events(&mut session).await);
+
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, BrainEvent::ResponseCancelledFor { .. })),
+        "the second turn must be accepted without a barge-in: {events:?}"
+    );
+    two_turn_question_correlation_result(&events, &correlation)
+        .unwrap_or_else(|error| panic!("{error}: {events:?}"));
+
+    let started = events
+        .iter()
+        .filter_map(|event| match event {
+            BrainEvent::QuestionStarted {
+                response_id,
+                question,
+            } => Some((response_id.clone(), question.question_id.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[0].0, correlation.first_response_id);
+    assert_eq!(started[1].0, correlation.second_response_id);
+    assert_ne!(started[0].0, started[1].0);
+
+    // Local mutation controls. The frozen fixture is never edited: both
+    // mutations are applied to a clone of the projection this run produced, and
+    // both must be rejected.
+    let mut without_second_start = events.clone();
+    let second_start_index = without_second_start
+        .iter()
+        .position(|event| {
+            matches!(event, BrainEvent::QuestionStarted { response_id, .. }
+                if response_id == &correlation.second_response_id)
+        })
+        .expect("the second turn started a question");
+    without_second_start.remove(second_start_index);
+    assert!(
+        two_turn_question_correlation_result(&without_second_start, &correlation).is_err(),
+        "deleting the second question start must be rejected"
+    );
+
+    let mut duplicated_response_id = events.clone();
+    if let Some(BrainEvent::QuestionStarted { response_id, .. }) =
+        duplicated_response_id.get_mut(second_start_index)
+    {
+        *response_id = correlation.first_response_id.clone();
+    }
+    assert!(
+        two_turn_question_correlation_result(&duplicated_response_id, &correlation).is_err(),
+        "reusing the first response id for the second turn must be rejected"
+    );
 }
