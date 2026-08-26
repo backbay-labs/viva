@@ -6,10 +6,7 @@ pub mod tts;
 
 use std::{
     env, fmt,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -17,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use agent_domain::{
     learning_outcome::{VIVA_TURN_OUTCOME_RECORD_SCHEMA, VIVA_TURN_OUTCOME_SCHEMA},
@@ -916,19 +914,24 @@ impl RealtimeBrain for FakeCartesiaGeminiRuntime {
     }
 }
 
+/// Emit one event unless the turn it belongs to was cancelled.
+///
+/// `ADAPTER-03`: the signal is the same cooperative token the provider stages
+/// select on, so a barge-in suppresses this turn's remaining events and the
+/// provider's cancel/close controls through one source of truth.
 async fn send_fake_unless_cancelled(
     event_tx: &mpsc::Sender<BrainEvent>,
     event: BrainEvent,
-    cancelled: &AtomicBool,
+    cancelled: &CancellationToken,
 ) -> bool {
-    if cancelled.load(Ordering::SeqCst) {
+    if cancelled.is_cancelled() {
         return false;
     }
     if event_tx.send(event).await.is_err() {
         return false;
     }
     tokio::task::yield_now().await;
-    !cancelled.load(Ordering::SeqCst)
+    !cancelled.is_cancelled()
 }
 
 /// The one provider-error emission path.

@@ -10,7 +10,8 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::{sync::mpsc, task::AbortHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 use agent_domain::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
@@ -40,6 +41,14 @@ use super::{
     InkEvent, SessionPhaseTracker, SonicEvent, FAKE_CARTESIA_GEMINI_FINAL_TRANSCRIPT,
     MAX_GEMINI_EXECUTED_TOOL_STAGES, MAX_GEMINI_TOOL_LOOP_PASSES,
 };
+
+/// How long a replaced or stopped turn may take to write its provider
+/// cancel/close controls before the task is force-aborted.
+///
+/// `ADAPTER-03`: cancellation is cooperative for exactly this long. The bound
+/// exists because a provider that never answers must not hold a session open,
+/// and an abort before it must not skip the controls Cartesia documents.
+const PROVIDER_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Which evaluator a runtime injected.
 ///
@@ -262,15 +271,10 @@ where
                         client_generation_id,
                     }),
                     BrainInput::CancelResponse => {
-                        let response_id = match active_response
-                            .take()
-                            .filter(|active| !active.completed.load(Ordering::SeqCst))
+                        let response_id = match cancel_active_runner_response(&mut active_response)
+                            .await
                         {
-                            Some(active) => {
-                                active.cancelled.store(true, Ordering::SeqCst);
-                                active.abort_handle.abort();
-                                active.response_id.clone()
-                            }
+                            Some(response_id) => response_id,
                             None => {
                                 let response_id =
                                     response_id_for_turn(turn, session_generation_id.as_deref());
@@ -284,7 +288,7 @@ where
                         continue;
                     }
                     BrainInput::Stop => {
-                        let _ = cancel_active_runner_response(&mut active_response);
+                        let _ = cancel_active_runner_response(&mut active_response).await;
                         if let Some(event) = phases.phase_event_if_legal(StudySessionPhase::Recap) {
                             let _ = event_tx.send(event).await;
                         }
@@ -299,7 +303,8 @@ where
                     continue;
                 };
 
-                if let Some(response_id) = cancel_active_runner_response(&mut active_response) {
+                if let Some(response_id) = cancel_active_runner_response(&mut active_response).await
+                {
                     let _ = event_tx
                         .send(BrainEvent::ResponseCancelledFor { response_id })
                         .await;
@@ -329,7 +334,7 @@ where
                         input: runner_input,
                         phases: phases.clone(),
                         announce_question,
-                        cancelled: Arc::new(AtomicBool::new(false)),
+                        cancelled: CancellationToken::new(),
                         completed: Arc::new(AtomicBool::new(false)),
                     },
                     response_id,
@@ -391,9 +396,11 @@ where
                     "error_kind=answer_attempt_envelope_failed",
                 )
             })?;
+        // The one-shot fixture replay has no session loop to cancel it.
+        let cancel = CancellationToken::new();
         let transcript = self
             .transports
-            .transcribe_audio(&self.config, &response_id, &frame)
+            .transcribe_audio(&self.config, &response_id, &frame, &cancel)
             .await?;
         let phases = SessionPhaseTracker::ready();
         let mut events = vec![BrainEvent::InputSpeechStarted];
@@ -467,7 +474,13 @@ where
                 require_spoken_response_text(&turn.response_text, &self.config.gemini.model_id)?;
             let frames = self
                 .transports
-                .synthesize_sonic(&self.config, &response_id, response_text, interrupt)
+                .synthesize_sonic(
+                    &self.config,
+                    &response_id,
+                    response_text,
+                    interrupt,
+                    &cancel,
+                )
                 .await?;
             for frame in frames {
                 events.push(BrainEvent::AudioDelta {
@@ -492,21 +505,25 @@ where
         let cancelled = job.cancelled.clone();
         let completed = job.completed.clone();
         let runner = self.clone();
-        let abort_handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             runner.emit_turn(job).await;
-        })
-        .abort_handle();
+        });
         ActiveRunnerResponse {
             response_id,
             cancelled,
             completed,
-            abort_handle,
+            handle,
         }
     }
 
     async fn emit_turn(&self, job: RunnerTurnJob) {
         let mut deferred_events = Vec::new();
         if let Err(error) = self.run_turn(&job, &mut deferred_events).await {
+            // A learner's own barge-in or stop is not an incident: a turn that
+            // ended because it was cancelled reports no provider error.
+            if job.cancelled.is_cancelled() {
+                return;
+            }
             // A fallback activation is a fact about the attempt that already
             // happened, so it survives the turn's failure.
             for event in deferred_events {
@@ -584,7 +601,7 @@ where
             return Ok(());
         }
         let transcript = self
-            .transcript_for_input(&job.response_id, &job.input)
+            .transcript_for_input(&job.response_id, &job.input, &job.cancelled)
             .await?;
         if !transcript.interim_text.trim().is_empty()
             && transcript.interim_text != transcript.final_text
@@ -716,6 +733,7 @@ where
                     &job.response_id,
                     response_text,
                     FakeRuntimeInterrupt::None,
+                    &job.cancelled,
                 )
                 .await?;
             for frame in frames {
@@ -834,11 +852,12 @@ where
         &self,
         response_id: &str,
         input: &RunnerInput,
+        cancel: &CancellationToken,
     ) -> Result<RunnerTranscript, BrainError> {
         match input {
             RunnerInput::Audio { frame, .. } => {
                 self.transports
-                    .transcribe_audio(&self.config, response_id, frame)
+                    .transcribe_audio(&self.config, response_id, frame, cancel)
                     .await
             }
             RunnerInput::Text { text, .. } => Ok(RunnerTranscript {
@@ -875,7 +894,7 @@ where
         let mut active_gemini = self.config.gemini.clone();
 
         for pass_index in 0..MAX_GEMINI_TOOL_LOOP_PASSES {
-            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+            if cancelled.is_some_and(CancellationToken::is_cancelled) {
                 return Ok(GeminiTurnResult {
                     response_text: response_prompt,
                     turn_outcome,
@@ -890,7 +909,23 @@ where
             };
             let request = gemini_request(&active_config.gemini, conversation.snapshot(), tools);
             let gemini_started = Instant::now();
-            let stream = match self.transports.stream_gemini(&active_config, request).await {
+            // The Gemini stage is cooperative too: a barge-in does not wait for
+            // the model to finish answering the turn it replaced.
+            let attempt = match cancelled {
+                Some(cancelled) => tokio::select! {
+                    biased;
+                    () = cancelled.cancelled() => None,
+                    attempt = self.transports.stream_gemini(&active_config, request) => Some(attempt),
+                },
+                None => Some(self.transports.stream_gemini(&active_config, request).await),
+            };
+            let Some(attempt) = attempt else {
+                return Ok(GeminiTurnResult {
+                    response_text: response_prompt,
+                    turn_outcome,
+                });
+            };
+            let stream = match attempt {
                 Ok(stream) => stream,
                 Err(failure) => {
                     for event in failure.events {
@@ -930,7 +965,7 @@ where
                             turn_outcome,
                         });
                     }
-                    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+                    if cancelled.is_some_and(CancellationToken::is_cancelled) {
                         return Ok(GeminiTurnResult {
                             response_text: response_prompt,
                             turn_outcome,
@@ -962,7 +997,7 @@ where
                                 turn_outcome,
                             });
                         }
-                        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst)) {
+                        if cancelled.is_some_and(CancellationToken::is_cancelled) {
                             return Ok(GeminiTurnResult {
                                 response_text: response_prompt,
                                 turn_outcome,
@@ -1198,7 +1233,9 @@ pub(crate) struct RunnerTurnJob {
     /// The open handshake already announced the first response; every later
     /// accepted turn announces its own.
     pub(crate) announce_question: bool,
-    pub(crate) cancelled: Arc<AtomicBool>,
+    /// The one cooperative cancellation signal for this turn: the provider
+    /// stages select on it and the event projection suppresses through it.
+    pub(crate) cancelled: CancellationToken,
     pub(crate) completed: Arc<AtomicBool>,
 }
 
@@ -1280,7 +1317,7 @@ struct GeminiToolLoopJob<'a> {
     events: &'a mut Vec<BrainEvent>,
     usage: &'a mut BrainUsage,
     emit_text_delta: bool,
-    cancelled: Option<&'a AtomicBool>,
+    cancelled: Option<&'a CancellationToken>,
 }
 
 async fn execute_tool_stage(
@@ -1833,6 +1870,7 @@ mod fallback_tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             unreachable!("test calls Gemini tool loop directly")
         }
@@ -1872,6 +1910,7 @@ mod fallback_tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             unreachable!("test calls Gemini tool loop directly")
         }
@@ -1982,31 +2021,46 @@ fn fake_interrupt_gemini_stream(
 
 struct ActiveRunnerResponse {
     response_id: String,
-    cancelled: Arc<AtomicBool>,
+    cancelled: CancellationToken,
     completed: Arc<AtomicBool>,
-    abort_handle: AbortHandle,
+    handle: JoinHandle<()>,
+}
+
+impl ActiveRunnerResponse {
+    /// Signal the turn, then give it a bounded window to write the provider's
+    /// cancel/close controls before forcing it down.
+    async fn cancel_with_bounded_cleanup(&mut self, cleanup: Duration) {
+        self.cancelled.cancel();
+        if timeout(cleanup, &mut self.handle).await.is_err() {
+            self.handle.abort();
+        }
+    }
 }
 
 impl Drop for ActiveRunnerResponse {
     fn drop(&mut self) {
         if !self.completed.load(Ordering::SeqCst) {
-            self.cancelled.store(true, Ordering::SeqCst);
-            self.abort_handle.abort();
+            self.cancelled.cancel();
+            self.handle.abort();
         }
     }
 }
 
-fn cancel_active_runner_response(
+/// Cancel the active response cooperatively and wait out the cleanup bound.
+///
+/// A response that already completed is simply forgotten: there is nothing to
+/// cancel and no replacement to name.
+async fn cancel_active_runner_response(
     active_response: &mut Option<ActiveRunnerResponse>,
 ) -> Option<String> {
-    if let Some(active) = active_response.take() {
-        if !active.completed.load(Ordering::SeqCst) {
-            active.cancelled.store(true, Ordering::SeqCst);
-            active.abort_handle.abort();
-            return Some(active.response_id.clone());
-        }
+    let mut active = active_response.take()?;
+    if active.completed.load(Ordering::SeqCst) {
+        return None;
     }
-    None
+    active
+        .cancel_with_bounded_cleanup(PROVIDER_CLEANUP_TIMEOUT)
+        .await;
+    Some(active.response_id.clone())
 }
 
 pub(crate) struct RunnerTranscript {
@@ -2026,6 +2080,7 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         config: &CartesiaGeminiConfig,
         response_id: &str,
         frame: &AudioFrame,
+        cancel: &CancellationToken,
     ) -> Result<RunnerTranscript, BrainError>;
 
     async fn stream_gemini(
@@ -2040,6 +2095,7 @@ pub(crate) trait CartesiaGeminiTransports: Clone + Send + Sync + 'static {
         response_id: &str,
         transcript: &str,
         interrupt: FakeRuntimeInterrupt,
+        cancel: &CancellationToken,
     ) -> Result<Vec<AudioFrame>, BrainError>;
 }
 
@@ -2071,6 +2127,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         _config: &CartesiaGeminiConfig,
         _response_id: &str,
         frame: &AudioFrame,
+        _cancel: &CancellationToken,
     ) -> Result<RunnerTranscript, BrainError> {
         let pcm_len = audio_frame_bytes(frame).len();
         let Some(InkEvent::TurnEnd { text }) = parse_ink_event(
@@ -2187,6 +2244,7 @@ impl CartesiaGeminiTransports for FakeCartesiaGeminiTransports {
         response_id: &str,
         transcript: &str,
         interrupt: FakeRuntimeInterrupt,
+        _cancel: &CancellationToken,
     ) -> Result<Vec<AudioFrame>, BrainError> {
         // Counted on entry, before any outcome: an asked-for synthesis that then
         // failed is still a call the provider saw.
@@ -2391,11 +2449,13 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         config: &CartesiaGeminiConfig,
         _response_id: &str,
         frame: &AudioFrame,
+        cancel: &CancellationToken,
     ) -> Result<RunnerTranscript, BrainError> {
         let started = Instant::now();
-        let transcript = transcribe_ink_websocket(&config.ink, &config.cartesia_api_key, frame)
-            .await
-            .map_err(|error| failure_with_latency(error, started.elapsed()))?;
+        let transcript =
+            transcribe_ink_websocket(&config.ink, &config.cartesia_api_key, frame, cancel)
+                .await
+                .map_err(|error| failure_with_latency(error, started.elapsed()))?;
         Ok(RunnerTranscript {
             interim_text: transcript.interim_text,
             final_text: transcript.final_text,
@@ -2423,6 +2483,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
         response_id: &str,
         transcript: &str,
         _interrupt: FakeRuntimeInterrupt,
+        cancel: &CancellationToken,
     ) -> Result<Vec<AudioFrame>, BrainError> {
         let started = Instant::now();
         synthesize_sonic_websocket(
@@ -2430,6 +2491,7 @@ impl CartesiaGeminiTransports for LiveCartesiaGeminiTransports {
             &config.cartesia_api_key,
             response_id,
             transcript,
+            cancel,
         )
         .await
         .map_err(|error| failure_with_latency(error, started.elapsed()))
@@ -2897,7 +2959,7 @@ mod tests {
                 },
                 phases: SessionPhaseTracker::ready(),
                 announce_question: false,
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancelled: CancellationToken::new(),
                 completed: Arc::new(AtomicBool::new(false)),
             })
             .await;
@@ -2978,7 +3040,7 @@ mod tests {
                 },
                 phases: SessionPhaseTracker::ready(),
                 announce_question: false,
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancelled: CancellationToken::new(),
                 completed: Arc::new(AtomicBool::new(false)),
             })
             .await;
@@ -3042,6 +3104,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             Ok(RunnerTranscript {
                 interim_text: String::new(),
@@ -3116,6 +3179,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3128,6 +3192,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             Ok(RunnerTranscript {
                 interim_text: String::new(),
@@ -3166,6 +3231,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3178,6 +3244,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             Ok(RunnerTranscript {
                 interim_text: String::new(),
@@ -3245,6 +3312,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3257,6 +3325,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             Ok(RunnerTranscript {
                 interim_text: String::new(),
@@ -3299,6 +3368,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3311,6 +3381,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             _frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             Ok(RunnerTranscript {
                 interim_text: String::new(),
@@ -3336,6 +3407,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3354,6 +3426,7 @@ mod tests {
             _config: &CartesiaGeminiConfig,
             _response_id: &str,
             frame: &AudioFrame,
+            _cancel: &CancellationToken,
         ) -> Result<RunnerTranscript, BrainError> {
             self.transcribed_bytes
                 .lock()
@@ -3387,6 +3460,7 @@ mod tests {
             _response_id: &str,
             _transcript: &str,
             _interrupt: FakeRuntimeInterrupt,
+            _cancel: &CancellationToken,
         ) -> Result<Vec<AudioFrame>, BrainError> {
             Ok(Vec::new())
         }
@@ -3452,6 +3526,321 @@ mod tests {
                 .expect("gemini calls lock poisoned"),
             1
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3 (`ADAPTER-03`): a cancelled speech context never becomes audio,
+    // even when the provider finishes generating it anyway.
+    //
+    // Cartesia documents that a cancel may not stop a request already in
+    // flight, so correctness comes from writing the cancel, suppressing the
+    // cancelled context, and closing on terminal cleanup — never from treating
+    // the cancel write as an acknowledgement.
+    // -----------------------------------------------------------------
+
+    /// The seeded set plus a second active question, so a session that already
+    /// graded one turn can legitimately be asked another.
+    fn two_question_seeded_store() -> Arc<data::InMemoryStudyStore> {
+        let store = learning_ready_seeded_store();
+        let question = agent_domain::fixture_question();
+        let mut follow_up = question.clone();
+        follow_up.question_id = "q-oxidative-phosphorylation-atp".to_owned();
+        follow_up.prompt = "Explain what the proton gradient powers.".to_owned();
+        store.upsert_question(data::StudyQuestionRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            question: follow_up.clone(),
+            active: true,
+        });
+        let mut concept_ids = vec![
+            "oxidative-phosphorylation".to_owned(),
+            "nadh".to_owned(),
+            "atp-synthase".to_owned(),
+            "cellular-respiration".to_owned(),
+        ];
+        for criterion in &question.rubric.criteria {
+            if !concept_ids.contains(&criterion.concept_id) {
+                concept_ids.push(criterion.concept_id.clone());
+            }
+        }
+        store.upsert_study_set(data::StudySetRecord {
+            study_set_id: "biology-midterm".to_owned(),
+            user_id: "user-1".to_owned(),
+            title: "Biology Midterm".to_owned(),
+            course: Some("Biology 201".to_owned()),
+            ingestion_status: agent_domain::StudySetIngestionStatus::Ready,
+            ingestion_error: None,
+            concept_ids,
+            question_ids: vec![question.question_id.clone(), follow_up.question_id.clone()],
+        });
+        store
+    }
+
+    #[tokio::test]
+    async fn cancelled_sonic_context_never_emits_audio_even_when_provider_finishes_it() {
+        let store = two_question_seeded_store();
+        let session_config = SessionConfig {
+            session_id: Some(SessionId::new("voice-session-1")),
+            user_id: Some("user-1".to_owned()),
+            study_set_id: Some("biology-midterm".to_owned()),
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        };
+        let (transports, mut speaking) = ProviderFinishesCancelledContextTransports::new();
+        let runner = CartesiaGeminiRunner::scripted(
+            CartesiaGeminiConfig::default(),
+            transports.clone(),
+            store,
+            synthetic_fixture_answer_evaluator(),
+            EvaluatorProvenance::SyntheticFixture,
+        );
+        let mut session = runner.open(session_config).await.unwrap();
+
+        let mut events = Vec::new();
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                1_u8, 2, 3, 4,
+            ])))
+            .await
+            .unwrap();
+
+        // Barrier, not a sleep: the barge-in lands once response-1 genuinely
+        // opened its speech context on the provider.
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut speaking => break,
+                event = session.events.recv() => events.push(event.expect("the session stays open")),
+            }
+        }
+        session
+            .input
+            .send(BrainInput::Audio(AudioFrame::from_pcm16_bytes(vec![
+                5_u8, 6, 7, 8,
+            ])))
+            .await
+            .unwrap();
+
+        loop {
+            let event = timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("the replacement turn completes")
+                .expect("the session stays open");
+            let completed = matches!(&event, BrainEvent::ResponseCompleted { response_id }
+                if response_id == "response-2");
+            events.push(event);
+            if completed {
+                break;
+            }
+        }
+
+        let audio = events
+            .iter()
+            .filter_map(|event| match event {
+                BrainEvent::AudioDelta { response_id, frame } => {
+                    Some((response_id.clone(), frame.pcm16_bytes().to_vec()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audio,
+            vec![("response-2".to_owned(), vec![3_u8, 4])],
+            "only the replacement context may be heard: {events:?}"
+        );
+
+        let record = transports.record();
+        let written = record
+            .iter()
+            .map(|value| {
+                (
+                    value["context_id"]
+                        .as_str()
+                        .expect("every Sonic control names its context")
+                        .to_owned(),
+                    value
+                        .get("cancel")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cancel_index = written
+            .iter()
+            .position(|(context_id, cancel)| *cancel && context_id == "response-1")
+            .unwrap_or_else(|| panic!("the replaced context must be cancelled: {written:?}"));
+        assert!(written[..cancel_index]
+            .iter()
+            .all(|(context_id, _)| context_id == "response-1"));
+        assert!(written[cancel_index + 1..]
+            .iter()
+            .all(|(context_id, cancel)| context_id == "response-2" && !cancel));
+        assert!(!written[cancel_index + 1..].is_empty());
+    }
+
+    /// Fixture Ink/Gemini with a scripted Sonic connection whose replaced
+    /// context keeps generating after it is cancelled.
+    #[derive(Clone)]
+    struct ProviderFinishesCancelledContextTransports {
+        inner: FakeCartesiaGeminiTransports,
+        script: Arc<ScriptedSonicScript>,
+    }
+
+    impl ProviderFinishesCancelledContextTransports {
+        /// The receiver fires once the replaced context is genuinely open on the
+        /// provider, so the barge-in lands on a real speech context.
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (speaking, speaking_rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    inner: FakeCartesiaGeminiTransports::new(),
+                    script: Arc::new(ScriptedSonicScript {
+                        connects: AtomicU32::new(0),
+                        sent_json: std::sync::Mutex::new(Vec::new()),
+                        released: AtomicBool::new(false),
+                        release: tokio::sync::Notify::new(),
+                        speaking: std::sync::Mutex::new(Some(speaking)),
+                    }),
+                },
+                speaking_rx,
+            )
+        }
+
+        fn record(&self) -> Vec<Value> {
+            self.script
+                .sent_json
+                .lock()
+                .expect("record lock poisoned")
+                .clone()
+        }
+    }
+
+    struct ScriptedSonicScript {
+        connects: AtomicU32,
+        sent_json: std::sync::Mutex<Vec<Value>>,
+        released: AtomicBool,
+        release: tokio::sync::Notify,
+        speaking: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl CartesiaGeminiTransports for ProviderFinishesCancelledContextTransports {
+        async fn transcribe_audio(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            frame: &AudioFrame,
+            cancel: &CancellationToken,
+        ) -> Result<RunnerTranscript, BrainError> {
+            self.inner
+                .transcribe_audio(config, response_id, frame, cancel)
+                .await
+        }
+
+        async fn stream_gemini(
+            &self,
+            config: &CartesiaGeminiConfig,
+            request: Value,
+        ) -> Result<Vec<GeminiStreamEvent>, GeminiStreamAttemptFailure> {
+            self.inner.stream_gemini(config, request).await
+        }
+
+        async fn synthesize_sonic(
+            &self,
+            config: &CartesiaGeminiConfig,
+            response_id: &str,
+            transcript: &str,
+            _interrupt: FakeRuntimeInterrupt,
+            cancel: &CancellationToken,
+        ) -> Result<Vec<AudioFrame>, BrainError> {
+            super::super::tts::synthesize_sonic_with_connector(
+                &ScriptedSonicConnector {
+                    script: Arc::clone(&self.script),
+                },
+                &config.sonic,
+                "sk_car_scripted_secret",
+                response_id,
+                transcript,
+                cancel,
+            )
+            .await
+        }
+    }
+
+    struct ScriptedSonicConnector {
+        script: Arc<ScriptedSonicScript>,
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicConnector for ScriptedSonicConnector {
+        type Socket = ScriptedSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, BrainError> {
+            let index = self.script.connects.fetch_add(1, Ordering::SeqCst);
+            let incoming = if index == 0 {
+                std::collections::VecDeque::from([
+                    r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#.to_owned(),
+                    r#"{"type":"done","context_id":"response-1"}"#.to_owned(),
+                ])
+            } else {
+                std::collections::VecDeque::from([
+                    r#"{"type":"chunk","context_id":"response-2","data":"AwQ="}"#.to_owned(),
+                    r#"{"type":"done","context_id":"response-2"}"#.to_owned(),
+                ])
+            };
+            Ok(ScriptedSonicSocket {
+                script: Arc::clone(&self.script),
+                incoming,
+                gated: index == 0,
+            })
+        }
+    }
+
+    struct ScriptedSonicSocket {
+        script: Arc<ScriptedSonicScript>,
+        incoming: std::collections::VecDeque<String>,
+        gated: bool,
+    }
+
+    #[async_trait]
+    impl super::super::tts::SonicSocket for ScriptedSonicSocket {
+        async fn send_json(&mut self, value: Value) -> Result<(), BrainError> {
+            let cancelled = value.get("cancel").and_then(Value::as_bool) == Some(true);
+            self.script
+                .sent_json
+                .lock()
+                .expect("record lock poisoned")
+                .push(value);
+            if cancelled {
+                self.script.released.store(true, Ordering::SeqCst);
+                self.script.release.notify_waiters();
+            } else if self.gated {
+                if let Some(speaking) = self
+                    .script
+                    .speaking
+                    .lock()
+                    .expect("speaking lock poisoned")
+                    .take()
+                {
+                    let _ = speaking.send(());
+                }
+            }
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, BrainError> {
+            while self.gated && !self.script.released.load(Ordering::SeqCst) {
+                self.script.release.notified().await;
+            }
+            Ok(self.incoming.pop_front())
+        }
+
+        async fn close(&mut self) -> Result<(), BrainError> {
+            Ok(())
+        }
     }
 }
 

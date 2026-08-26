@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
@@ -14,6 +14,7 @@ use tokio_tungstenite::{
     },
     MaybeTlsStream, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use agent_domain::{
     AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
@@ -179,42 +180,71 @@ pub(crate) trait InkConnector: Send + Sync {
     async fn connect(&self, request: Request<()>) -> Result<Self::Socket, BrainError>;
 }
 
+/// One turn's transcription, bounded by the stage deadline and cancellable.
+///
+/// `ADAPTER-03`: only the handshake runs outside the scope that owns the
+/// socket. A deadline that fires after the connection exists closes it; a
+/// deadline that fires before it has nothing to close.
 pub(crate) async fn transcribe_ink_with_connector<C>(
     connector: &C,
     config: &InkConfig,
     api_key: &str,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError>
 where
     C: InkConnector,
 {
     let request = config.websocket_request(api_key)?;
-    timeout(config.stage_timeout, async {
-        let mut socket = connector.connect(request).await?;
-        transcribe_ink_turn(&mut socket, frame).await
-    })
-    .await
-    .map_err(|_| {
-        ink_failure(
-            BrainFailureClass::Timeout,
-            BrainFailureStage::Provider,
-            true,
-            "deadline_elapsed",
-        )
-    })?
+    let deadline = Instant::now() + config.stage_timeout;
+    let mut socket = match timeout(config.stage_timeout, connector.connect(request)).await {
+        Ok(socket) => socket?,
+        Err(_) => return Err(ink_deadline_failure()),
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match timeout(remaining, transcribe_ink_turn(&mut socket, frame, cancel)).await {
+        Ok(transcript) => transcript,
+        Err(_) => {
+            // Cleanup is best-effort and never replaces the sanitized terminal
+            // classification the deadline produced.
+            close_quietly(&mut socket).await;
+            Err(ink_deadline_failure())
+        }
+    }
+}
+
+fn ink_deadline_failure() -> BrainError {
+    ink_failure(
+        BrainFailureClass::Timeout,
+        BrainFailureStage::Provider,
+        true,
+        "deadline_elapsed",
+    )
+}
+
+/// A cancelled turn is the learner's own decision, not a provider incident.
+fn ink_cancelled_failure() -> BrainError {
+    ink_failure(
+        BrainFailureClass::Cancellation,
+        BrainFailureStage::Provider,
+        false,
+        "cancelled",
+    )
 }
 
 pub(crate) async fn transcribe_ink_websocket(
     config: &InkConfig,
     api_key: &str,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError> {
-    transcribe_ink_with_connector(&WebSocketInkConnector, config, api_key, frame).await
+    transcribe_ink_with_connector(&WebSocketInkConnector, config, api_key, frame, cancel).await
 }
 
 pub(crate) async fn transcribe_ink_turn<S>(
     socket: &mut S,
     frame: &AudioFrame,
+    cancel: &CancellationToken,
 ) -> Result<InkTranscript, BrainError>
 where
     S: InkSocket + ?Sized,
@@ -230,11 +260,20 @@ where
 
     let mut accumulator = InkTranscriptAccumulator::default();
     loop {
-        let Some(text) = socket
-            .next_text()
-            .await
-            .map_err(|_| ink_transport_failure("receive_failed"))?
-        else {
+        if cancel.is_cancelled() {
+            close_quietly(socket).await;
+            return Err(ink_cancelled_failure());
+        }
+        let received = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            received = socket.next_text() => Some(received),
+        };
+        let Some(received) = received else {
+            close_quietly(socket).await;
+            return Err(ink_cancelled_failure());
+        };
+        let Some(text) = received.map_err(|_| ink_transport_failure("receive_failed"))? else {
             close_quietly(socket).await;
             return Err(ink_protocol_failure("closed_before_final_transcript"));
         };
@@ -252,10 +291,10 @@ where
             InkEvent::TurnEnd { text } => {
                 accumulator.final_text = Some(text);
                 let transcript = accumulator.finish()?;
-                socket
-                    .close()
-                    .await
-                    .map_err(|_| ink_transport_failure("close_failed"))?;
+                // The Ink turn endpoint is short-lived by design: the socket is
+                // closed with the turn rather than kept idle against Cartesia's
+                // documented STT concurrency limits.
+                close_quietly(socket).await;
                 return Ok(transcript);
             }
             InkEvent::Error { .. } => {
@@ -408,6 +447,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -468,10 +508,13 @@ mod tests {
     #[tokio::test]
     async fn turn_runner_forwards_binary_audio_and_closes_session() {
         let mut socket = FakeInkSocket::new(vec![r#"{"type":"turn.end","transcript":"ATP"}"#]);
-        let transcript =
-            transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2, 3, 4]))
-                .await
-                .unwrap();
+        let transcript = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2, 3, 4]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(transcript.final_text, "ATP");
         assert_eq!(socket.sent_binary, vec![Bytes::from_static(&[1, 2, 3, 4])]);
@@ -490,10 +533,13 @@ mod tests {
             r#"{"type":"turn.end","transcript":"NADH donates electrons"}"#,
         ]);
 
-        let transcript =
-            transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2]))
-                .await
-                .unwrap();
+        let transcript = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(transcript.interim_text, "NADH");
         assert_eq!(transcript.final_text, "NADH donates electrons");
@@ -510,6 +556,7 @@ mod tests {
         let error = transcribe_ink_turn(
             &mut provider_error,
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -529,6 +576,7 @@ mod tests {
         let error = transcribe_ink_turn(
             &mut backpressure,
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -551,9 +599,13 @@ mod tests {
         let mut socket =
             FakeInkSocket::new(vec![r#"{"type":"turn.update","transcript":"partial"}"#]);
 
-        let error = transcribe_ink_turn(&mut socket, &AudioFrame::from_pcm16_bytes(vec![1, 2]))
-            .await
-            .unwrap_err();
+        let error = transcribe_ink_turn(
+            &mut socket,
+            &AudioFrame::from_pcm16_bytes(vec![1, 2]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(
             error.failure().metadata(),
@@ -574,6 +626,7 @@ mod tests {
             &InkConfig::default(),
             "sk_car_connector_secret",
             &AudioFrame::from_pcm16_bytes(vec![3, 2, 1]),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -607,6 +660,7 @@ mod tests {
             &config,
             "sk_car_timeout_secret",
             &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -634,6 +688,8 @@ mod tests {
     struct SocketRecord {
         request_uri: Option<String>,
         authorization: Option<String>,
+        handshake_attempts: u32,
+        connected: bool,
         sent_binary: Vec<Bytes>,
         sent_text: Vec<&'static str>,
         closed: bool,
@@ -660,6 +716,7 @@ mod tests {
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
+            record.connected = true;
             drop(record);
             Ok(RecordingInkSocket {
                 record: self.record.clone(),
@@ -736,6 +793,149 @@ mod tests {
                 send_error: Some(message),
                 closed: false,
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3 (`ADAPTER-03`): the Ink stage deadline lives inside the scope that
+    // owns the connected socket, so a timeout can close it. A timeout before
+    // connect has no socket to close and must not claim one.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ink_timeout_after_connect_closes_the_socket() {
+        let record = Arc::new(Mutex::new(SocketRecord::default()));
+        let connector = StallingInkConnector {
+            record: record.clone(),
+        };
+        let config = InkConfig {
+            stage_timeout: Duration::from_millis(30),
+            ..InkConfig::default()
+        };
+
+        let error = transcribe_ink_with_connector(
+            &connector,
+            &config,
+            "sk_car_cleanup_secret",
+            &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let failure = error.failure();
+
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_ink error_kind=deadline_elapsed"
+        );
+        {
+            let after_connect = record.lock().expect("record lock poisoned");
+            assert!(after_connect.connected);
+            assert!(
+                after_connect.closed,
+                "a stage timeout after connect must close the provider socket"
+            );
+        }
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_cleanup_secret"));
+        assert!(!rendered.contains("9, 8, 7, 6"));
+
+        // Control: the deadline can also fire before the handshake completes.
+        // There is no socket then, and cleanup must not pretend otherwise.
+        let before_connect = Arc::new(Mutex::new(SocketRecord::default()));
+        let error = transcribe_ink_with_connector(
+            &SlowHandshakeInkConnector {
+                record: before_connect.clone(),
+            },
+            &config,
+            "sk_car_cleanup_secret",
+            &AudioFrame::from_pcm16_bytes(vec![9, 8, 7, 6]),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.failure().failure_class(), BrainFailureClass::Timeout);
+        let before_connect = before_connect.lock().expect("record lock poisoned");
+        assert_eq!(
+            before_connect.handshake_attempts, 1,
+            "the handshake was attempted and the deadline fired inside it"
+        );
+        assert!(!before_connect.connected);
+        assert!(!before_connect.closed);
+    }
+
+    /// Connects immediately, then never transcribes. Only the deadline ends it.
+    struct StallingInkConnector {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkConnector for StallingInkConnector {
+        type Socket = StallingInkSocket;
+
+        async fn connect(&self, _request: Request<()>) -> Result<Self::Socket, BrainError> {
+            let mut record = self.record.lock().expect("record lock poisoned");
+            record.handshake_attempts += 1;
+            record.connected = true;
+            drop(record);
+            Ok(StallingInkSocket {
+                record: self.record.clone(),
+            })
+        }
+    }
+
+    struct StallingInkSocket {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkSocket for StallingInkSocket {
+        async fn send_binary(&mut self, bytes: Bytes) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_binary
+                .push(bytes);
+            Ok(())
+        }
+
+        async fn send_text(&mut self, text: &'static str) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_text
+                .push(text);
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, agent_domain::BrainError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").closed = true;
+            Ok(())
+        }
+    }
+
+    /// The handshake itself outlives the stage deadline.
+    struct SlowHandshakeInkConnector {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl InkConnector for SlowHandshakeInkConnector {
+        type Socket = StallingInkSocket;
+
+        async fn connect(&self, _request: Request<()>) -> Result<Self::Socket, BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .handshake_attempts += 1;
+            std::future::pending::<()>().await;
+            unreachable!("the stage deadline fires before the handshake completes")
         }
     }
 

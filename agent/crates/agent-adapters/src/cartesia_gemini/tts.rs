@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{
@@ -13,6 +13,7 @@ use tokio_tungstenite::{
     },
     MaybeTlsStream, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use agent_domain::{
     AudioFrame, BrainError, BrainFailureClass, BrainFailureStage, BrainProviderFailureParts,
@@ -27,6 +28,10 @@ use super::constants::{
 
 const CARTESIA_VERSION_HEADER: &str = "cartesia-version";
 const SONIC_TRANSCRIPT_CHUNK_TARGET: usize = 96;
+/// How many frames a cancelled context may still deliver before the connection
+/// is closed. Cartesia documents that a cancel may not stop a request already
+/// generating, so the drain is bounded rather than open-ended.
+const SONIC_CANCEL_DRAIN_LIMIT: usize = 64;
 
 /// `ADAPTER-01` / `A-13.2`: every Sonic failure is classified where it is
 /// observed, and only a closed `error_kind` token travels. Assistant text, a
@@ -194,6 +199,7 @@ pub(crate) async fn synthesize_sonic_websocket(
     api_key: &str,
     context_id: &str,
     transcript: &str,
+    cancel: &CancellationToken,
 ) -> Result<Vec<AudioFrame>, BrainError> {
     synthesize_sonic_with_connector(
         &WebSocketSonicConnector,
@@ -201,34 +207,66 @@ pub(crate) async fn synthesize_sonic_websocket(
         api_key,
         context_id,
         transcript,
+        cancel,
     )
     .await
 }
 
+/// One response's speech, bounded by the stage deadline and cancellable.
+///
+/// `ADAPTER-03`: the deadline is split so that only the handshake runs outside
+/// the scope that owns the socket. Once the connection exists every exit —
+/// success, provider failure, cancellation, or deadline — writes the controls
+/// Cartesia documents and closes the connection, instead of dropping it.
 pub(crate) async fn synthesize_sonic_with_connector<C>(
     connector: &C,
     config: &SonicConfig,
     api_key: &str,
     context_id: &str,
     transcript: &str,
+    cancel: &CancellationToken,
 ) -> Result<Vec<AudioFrame>, BrainError>
 where
     C: SonicConnector,
 {
     let request = config.websocket_request(api_key)?;
-    timeout(config.stage_timeout, async {
-        let mut socket = connector.connect(request).await?;
-        synthesize_sonic_context(&mut socket, config, context_id, transcript).await
-    })
+    let deadline = Instant::now() + config.stage_timeout;
+    // A deadline that fires before the handshake completes has no socket to
+    // close, and cleanup must not pretend otherwise.
+    let mut socket = match timeout(config.stage_timeout, connector.connect(request)).await {
+        Ok(socket) => socket?,
+        Err(_) => return Err(sonic_deadline_failure()),
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match timeout(
+        remaining,
+        synthesize_sonic_context(&mut socket, config, context_id, transcript, cancel),
+    )
     .await
-    .map_err(|_| {
-        sonic_failure(
-            BrainFailureClass::Timeout,
-            BrainFailureStage::Provider,
-            true,
-            "deadline_elapsed",
-        )
-    })?
+    {
+        Ok(Ok(frames)) => {
+            close_quietly(&mut socket).await;
+            Ok(frames)
+        }
+        // The context already closed the connection on its own terminal paths.
+        Ok(Err(error)) => Err(error),
+        Err(_) => {
+            // Cleanup is best-effort: a failed cancel or close must not replace
+            // the sanitized terminal classification the deadline produced.
+            let _ = cancel_sonic_context(&mut socket, context_id).await;
+            close_quietly(&mut socket).await;
+            Err(sonic_deadline_failure())
+        }
+    }
+}
+
+fn sonic_deadline_failure() -> BrainError {
+    sonic_failure(
+        BrainFailureClass::Timeout,
+        BrainFailureStage::Provider,
+        true,
+        "deadline_elapsed",
+    )
 }
 
 pub(crate) async fn synthesize_sonic_context<S>(
@@ -236,6 +274,7 @@ pub(crate) async fn synthesize_sonic_context<S>(
     config: &SonicConfig,
     context_id: &str,
     transcript: &str,
+    cancel: &CancellationToken,
 ) -> Result<Vec<AudioFrame>, BrainError>
 where
     S: SonicSocket + ?Sized,
@@ -249,11 +288,20 @@ where
 
     let mut frames = Vec::new();
     loop {
-        let Some(text) = socket
-            .next_text()
-            .await
-            .map_err(|_| sonic_transport_failure("receive_failed"))?
-        else {
+        // Cooperative: a barge-in does not wait for the provider to speak
+        // again before the cancel control is written.
+        if cancel.is_cancelled() {
+            return cancel_sonic_context_and_drain(socket, context_id).await;
+        }
+        let received = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            received = socket.next_text() => Some(received),
+        };
+        let Some(received) = received else {
+            return cancel_sonic_context_and_drain(socket, context_id).await;
+        };
+        let Some(text) = received.map_err(|_| sonic_transport_failure("receive_failed"))? else {
             close_quietly(socket).await;
             return Err(sonic_protocol_failure("closed_before_done"));
         };
@@ -273,11 +321,8 @@ where
             SonicEvent::Done {
                 context_id: event_context_id,
             } if event_context_id == context_id => {
-                socket
-                    .close()
-                    .await
-                    .map_err(|_| sonic_transport_failure("close_failed"))?;
                 if frames.is_empty() {
+                    close_quietly(socket).await;
                     return Err(sonic_protocol_failure("no_audio_chunks"));
                 }
                 return Ok(frames);
@@ -301,8 +346,43 @@ where
     }
 }
 
-#[cfg(test)]
-async fn cancel_sonic_context<S>(socket: &mut S, context_id: &str) -> Result<(), BrainError>
+/// Write the documented context cancel, then suppress what the provider still
+/// finishes for that context.
+///
+/// The cancel write is a request, never an acknowledgement: Cartesia documents
+/// that an already-generating request may complete anyway, so the frames that
+/// arrive afterwards are drained and discarded rather than surfacing as the
+/// replacement response's audio. A cancelled context yields no audio and is not
+/// a provider incident.
+async fn cancel_sonic_context_and_drain<S>(
+    socket: &mut S,
+    context_id: &str,
+) -> Result<Vec<AudioFrame>, BrainError>
+where
+    S: SonicSocket + ?Sized,
+{
+    if cancel_sonic_context(socket, context_id).await.is_ok() {
+        for _ in 0..SONIC_CANCEL_DRAIN_LIMIT {
+            match socket.next_text().await {
+                Ok(Some(text)) => match parse_sonic_event(&text) {
+                    Some(SonicEvent::Done {
+                        context_id: event_context_id,
+                    }) if event_context_id == context_id => break,
+                    Some(SonicEvent::Error { .. }) => break,
+                    _ => {}
+                },
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
+    close_quietly(socket).await;
+    Ok(Vec::new())
+}
+
+pub(crate) async fn cancel_sonic_context<S>(
+    socket: &mut S,
+    context_id: &str,
+) -> Result<(), BrainError>
 where
     S: SonicSocket + ?Sized,
 {
@@ -553,6 +633,7 @@ mod tests {
             "sk_car_connector_secret",
             "response-1",
             long_transcript,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -598,6 +679,7 @@ mod tests {
             "sk_car_timeout_secret",
             "response-1",
             transcript,
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -638,6 +720,7 @@ mod tests {
             &SonicConfig::default(),
             "response-1",
             "assistant text must not appear in errors",
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -658,6 +741,7 @@ mod tests {
             &SonicConfig::default(),
             "response-1",
             "another assistant payload",
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -687,6 +771,7 @@ mod tests {
             &SonicConfig::default(),
             "response-1",
             "partial assistant text",
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -710,6 +795,7 @@ mod tests {
     struct SocketRecord {
         request_uri: Option<String>,
         authorization: Option<String>,
+        connected: bool,
         sent_json: Vec<serde_json::Value>,
         closed: bool,
     }
@@ -736,6 +822,7 @@ mod tests {
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
+            record.connected = true;
             drop(record);
             Ok(RecordingSonicSocket {
                 record: self.record.clone(),
@@ -806,6 +893,310 @@ mod tests {
                 send_error: Some(message),
                 closed: false,
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3 (`ADAPTER-03`): a barge-in writes the documented context cancel for
+    // the response it replaces *before* the replacement context is opened.
+    //
+    // Cartesia documents that a cancel may not stop a request that is already
+    // generating, so the cancelled context's late frames are drained and
+    // discarded rather than treated as replacement audio.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sonic_barge_in_sends_context_cancel_before_replacement_context() {
+        let record = Arc::new(Mutex::new(SocketRecord::default()));
+        let connector = Arc::new(BargeInSonicConnector::new(record.clone()));
+        let config = SonicConfig::default();
+        let cancel = CancellationToken::new();
+
+        let speaking = tokio::spawn({
+            let connector = Arc::clone(&connector);
+            let config = config.clone();
+            let cancel = cancel.clone();
+            async move {
+                synthesize_sonic_with_connector(
+                    &*connector,
+                    &config,
+                    "sk_car_barge_secret",
+                    "response-1",
+                    "first response text",
+                    &cancel,
+                )
+                .await
+            }
+        });
+
+        // Barrier, not a sleep: the barge-in happens once the replaced context
+        // is genuinely open on the provider.
+        connector.first_generation_written().await;
+        cancel.cancel();
+        let cancelled = speaking
+            .await
+            .expect("the cancelled synthesis task completes")
+            .expect("a cancelled context is not a provider incident");
+        assert!(
+            cancelled.is_empty(),
+            "a cancelled context yields no audio, even when the provider finishes it"
+        );
+
+        let replacement = CancellationToken::new();
+        let frames = synthesize_sonic_with_connector(
+            &*connector,
+            &config,
+            "sk_car_barge_secret",
+            "response-2",
+            "second response text",
+            &replacement,
+        )
+        .await
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pcm16_bytes(), [3, 4]);
+
+        let record = record.lock().expect("record lock poisoned");
+        let written = record
+            .sent_json
+            .iter()
+            .map(|value| {
+                (
+                    value["context_id"]
+                        .as_str()
+                        .expect("every Sonic control names its context")
+                        .to_owned(),
+                    value
+                        .get("cancel")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cancel_index = written
+            .iter()
+            .position(|(_, cancel)| *cancel)
+            .unwrap_or_else(|| panic!("a barge-in must write a context cancel: {written:?}"));
+
+        // 1. generation message(s) for response-1.
+        assert!(!written[..cancel_index].is_empty());
+        assert!(written[..cancel_index]
+            .iter()
+            .all(|(context_id, _)| context_id == "response-1"));
+        // 2. the cancel for response-1.
+        assert_eq!(written[cancel_index].0, "response-1");
+        // 3. generation message(s) for response-2 on a fresh context.
+        assert!(!written[cancel_index + 1..].is_empty());
+        assert!(written[cancel_index + 1..]
+            .iter()
+            .all(|(context_id, cancel)| context_id == "response-2" && !cancel));
+    }
+
+    /// Hands out one scripted socket per connect. The replaced context stays
+    /// silent until its cancel is written, then delivers the frames the provider
+    /// had already generated.
+    struct BargeInSonicConnector {
+        record: Arc<Mutex<SocketRecord>>,
+        connects: std::sync::atomic::AtomicUsize,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        first_generation: Arc<tokio::sync::Notify>,
+    }
+
+    impl BargeInSonicConnector {
+        fn new(record: Arc<Mutex<SocketRecord>>) -> Self {
+            Self {
+                record,
+                connects: std::sync::atomic::AtomicUsize::new(0),
+                released: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                release: Arc::new(tokio::sync::Notify::new()),
+                first_generation: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        async fn first_generation_written(&self) {
+            self.first_generation.notified().await;
+        }
+    }
+
+    #[async_trait]
+    impl SonicConnector for BargeInSonicConnector {
+        type Socket = BargeInSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, agent_domain::BrainError> {
+            let index = self
+                .connects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.record.lock().expect("record lock poisoned").connected = true;
+            let incoming = if index == 0 {
+                VecDeque::from([
+                    r#"{"type":"chunk","context_id":"response-1","data":"AQI="}"#.to_owned(),
+                    r#"{"type":"done","context_id":"response-1"}"#.to_owned(),
+                ])
+            } else {
+                VecDeque::from([
+                    r#"{"type":"chunk","context_id":"response-2","data":"AwQ="}"#.to_owned(),
+                    r#"{"type":"done","context_id":"response-2"}"#.to_owned(),
+                ])
+            };
+            Ok(BargeInSonicSocket {
+                record: self.record.clone(),
+                incoming,
+                gated: index == 0,
+                released: Arc::clone(&self.released),
+                release: Arc::clone(&self.release),
+                first_generation: Arc::clone(&self.first_generation),
+            })
+        }
+    }
+
+    struct BargeInSonicSocket {
+        record: Arc<Mutex<SocketRecord>>,
+        incoming: VecDeque<String>,
+        gated: bool,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        first_generation: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl SonicSocket for BargeInSonicSocket {
+        async fn send_json(
+            &mut self,
+            value: serde_json::Value,
+        ) -> Result<(), agent_domain::BrainError> {
+            let cancelled = value.get("cancel").and_then(Value::as_bool) == Some(true);
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_json
+                .push(value);
+            if cancelled {
+                self.released
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.release.notify_waiters();
+            } else if self.gated {
+                self.first_generation.notify_one();
+            }
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, agent_domain::BrainError> {
+            while self.gated && !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            Ok(self.incoming.pop_front())
+        }
+
+        async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").closed = true;
+            Ok(())
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3 (`ADAPTER-03`): a stage deadline that fires after the socket is
+    // connected must still write the documented context cancel and close the
+    // connection. Dropping the socket is not cleanup.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sonic_timeout_sends_cancel_and_clean_close() {
+        let record = Arc::new(Mutex::new(SocketRecord::default()));
+        let connector = StallingSonicConnector {
+            record: record.clone(),
+        };
+        let config = SonicConfig {
+            stage_timeout: Duration::from_millis(30),
+            ..SonicConfig::default()
+        };
+        let transcript = "assistant text must not appear in cleanup evidence";
+
+        let error = synthesize_sonic_with_connector(
+            &connector,
+            &config,
+            "sk_car_cleanup_secret",
+            "response-1",
+            transcript,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let failure = error.failure();
+
+        assert_eq!(failure.failure_class(), BrainFailureClass::Timeout);
+        assert_eq!(
+            failure.metadata(),
+            "stage=cartesia_sonic error_kind=deadline_elapsed"
+        );
+
+        let record = record.lock().expect("record lock poisoned");
+        assert!(record.connected);
+        assert!(
+            record
+                .sent_json
+                .iter()
+                .any(|value| value == &json!({ "context_id": "response-1", "cancel": true })),
+            "a stage timeout must write the documented context cancel: {:?}",
+            record.sent_json
+        );
+        assert!(
+            record.closed,
+            "a stage timeout after connect must close the provider socket"
+        );
+        let rendered = format!("{error} {failure:?}");
+        assert!(!rendered.contains("sk_car_cleanup_secret"));
+        assert!(!rendered.contains(transcript));
+    }
+
+    /// Connects immediately, then never speaks. Only the stage deadline ends it.
+    struct StallingSonicConnector {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl SonicConnector for StallingSonicConnector {
+        type Socket = StallingSonicSocket;
+
+        async fn connect(
+            &self,
+            _request: tokio_tungstenite::tungstenite::http::Request<()>,
+        ) -> Result<Self::Socket, agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").connected = true;
+            Ok(StallingSonicSocket {
+                record: self.record.clone(),
+            })
+        }
+    }
+
+    struct StallingSonicSocket {
+        record: Arc<Mutex<SocketRecord>>,
+    }
+
+    #[async_trait]
+    impl SonicSocket for StallingSonicSocket {
+        async fn send_json(
+            &mut self,
+            value: serde_json::Value,
+        ) -> Result<(), agent_domain::BrainError> {
+            self.record
+                .lock()
+                .expect("record lock poisoned")
+                .sent_json
+                .push(value);
+            Ok(())
+        }
+
+        async fn next_text(&mut self) -> Result<Option<String>, agent_domain::BrainError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), agent_domain::BrainError> {
+            self.record.lock().expect("record lock poisoned").closed = true;
+            Ok(())
         }
     }
 
