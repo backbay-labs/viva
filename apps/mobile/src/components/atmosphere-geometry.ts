@@ -25,10 +25,21 @@ export const WELL = {
 } as const;
 
 /**
- * A cool sink at the extreme edge, so the page reads as embedded.
+ * A darkening sink at the extreme edge, so the page reads as embedded.
+ *
+ * **Why pure black.** The locked shader darkened its edges with a multiply
+ * (`col *= 1.0 - dot(vd, vd) * 0.46`), which cannot shift hue because it only
+ * scales channels. Act 1 moved the vignette out of the bake and into SVG so it
+ * stays screen-relative, and the first cut used a cool plum (#2B1D34) — an
+ * *overlay*, which adds blue. Measured on device that cost 2-7 points of R-B
+ * spread across the ground and up to 6.7 at the corners, reading grey where the
+ * design reads gold. A pure-black overlay at alpha `a` is exactly `col *= 1 - a`,
+ * so black restores the shader's operation. `edgeOpacity` is set to the value
+ * that holds composited luminance where the plum left it (0.35300 -> 0.35291),
+ * so this is a hue correction that leaves the contrast certification untouched.
  *
  * **The known limit.** Inside this band the ground darkens toward
- * `VELLUM_VIGNETTED` (#AA9E99), where only the three darkest TEXT tokens still
+ * `VELLUM_VIGNETTED` (#A89F95), where only the three darkest TEXT tokens still
  * clear 4.5:1 — `ink`, `inkStrong` and `pressedInk`; the suite asserts that
  * exact list. Every other text token lands near 3.4-3.5:1 at the corner clamp,
  * which still clears 3:1. This is an **accepted limit for Act 1, not an
@@ -51,8 +62,8 @@ export const VIGNETTE = {
   rx: 0.74,
   ry: 0.64,
   innerStop: 0.52,
-  edgeOpacity: 0.16,
-  color: "#2B1D34",
+  edgeOpacity: 0.132,
+  color: "#000000",
 } as const;
 
 /**

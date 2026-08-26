@@ -24,7 +24,7 @@ export const VELLUM_BRIGHTEST = "#FFF5DD";
 export const VELLUM_DARKEST = "#C2B7AC";
 /**
  * The worst case *inside the vignette band*, where the SVG vignette composites
- * its full `edgeOpacity` of #2B1D34 over the plate floor. Both tiers clamp here
+ * its full `edgeOpacity` of #000000 over the plate floor. Both tiers clamp here
  * at the corners: a corner sits at objectBoundingBox distance 0.707, past the
  * last gradient stop, so `r`/`rx`/`ry` cannot lighten it on either platform.
  *
@@ -39,7 +39,7 @@ export const VELLUM_DARKEST = "#C2B7AC";
  * all four screens scroll, so body text passes through the band transiently no
  * matter where it is authored. See VIGNETTE in components/atmosphere-geometry.
  */
-export const VELLUM_VIGNETTED = "#AA9E99";
+export const VELLUM_VIGNETTED = "#A89F95";
 
 export const AA_BODY = 4.5;
 export const AA_LARGE = 3;

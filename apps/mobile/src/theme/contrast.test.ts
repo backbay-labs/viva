@@ -198,7 +198,7 @@ describe("the contrast floor inside the vignette band", () => {
   // The band is where the SVG vignette composites its full edgeOpacity over the
   // plate floor. Both tiers clamp there: a corner sits at objectBoundingBox
   // distance 0.707, past the last gradient stop, so neither r nor rx/ry can
-  // lighten it on either platform. edgeOpacity 0.16 is approved design and
+  // lighten it on either platform. edgeOpacity 0.132 is approved design and
   // stays; what this block does is keep the cost of it measured. See the note on
   // VIGNETTE in @/components/atmosphere-geometry for why it is an accepted limit
   // rather than an enforceable rule.

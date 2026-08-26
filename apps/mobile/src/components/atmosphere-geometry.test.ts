@@ -78,7 +78,10 @@ describe("locked geometry", () => {
     // restating the vignette's independently. Changing the component's copy
     // moved the ground and left VELLUM_VIGNETTED stale with a green suite.
     expect(WELL.color).toBe("#FFFDFA");
-    expect(VIGNETTE.color).toBe("#2B1D34");
+    expect(VIGNETTE.color).toBe("#000000");
+    // Black is load-bearing, not incidental: it makes the overlay an exact
+    // multiply, which is the only form that darkens without shifting hue.
+    expect(VIGNETTE.edgeOpacity).toBe(0.132);
   });
 });
 
