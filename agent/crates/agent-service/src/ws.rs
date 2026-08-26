@@ -54,6 +54,11 @@ use crate::{
 
 const TERMINAL_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RECONNECT_LEASE_GRACE: Duration = Duration::from_millis(250);
+/// `SERVICE-002`: how long a closed socket stays readable so the peer's in-flight
+/// bytes are consumed before it is dropped. Server-owned and short: it holds no
+/// lease, and dropping a socket with unread bytes resets the connection, which
+/// discards the terminal frame and Close frame already written to it.
+const CLOSING_HANDSHAKE_GRACE: Duration = Duration::from_millis(250);
 const RECONNECT_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_ACTIVE_SESSIONS_PER_USER_STUDY_SET: usize = 1;
 /// `SERVICE-003`: the longest forwarding chain a trusted proxy may present. The
@@ -376,14 +381,104 @@ impl SessionLimitRuntime {
     }
 }
 
+/// `SERVICE-002`: why an outbound write did not complete. A missed deadline and a
+/// broken sink are different facts and record different sanitized terminal labels.
+#[derive(Debug, thiserror::Error)]
+enum OutboundWriteError {
+    #[error("outbound websocket write exceeded its deadline")]
+    Timeout,
+    #[error("outbound websocket sink failed")]
+    Sink(#[source] axum::Error),
+}
+
+/// The one outbound write path. Every server frame, `Ready`, provider event,
+/// protocol error, Ping/Pong, terminal frame, and Close frame goes through it, so
+/// no write on this socket can outlive one server-configured deadline.
+struct BoundedSender<S> {
+    inner: S,
+    timeout: Duration,
+}
+
+impl<S> BoundedSender<S>
+where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+{
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+
+    async fn send(&mut self, message: Message) -> Result<(), OutboundWriteError> {
+        match tokio::time::timeout(self.timeout, self.inner.send(message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(OutboundWriteError::Sink(error)),
+            Err(_) => Err(OutboundWriteError::Timeout),
+        }
+    }
+}
+
+/// The sanitized terminal label an outbound write failure records. A client that
+/// stopped reading is a slow client; a sink that broke is a failed send.
+fn outbound_write_terminal_label(error: &OutboundWriteError) -> &'static str {
+    match error {
+        OutboundWriteError::Timeout => TerminalSessionReason::SlowClient.as_str(),
+        OutboundWriteError::Sink(_) => "send_failed",
+    }
+}
+
+/// Whether a recorded terminal label came from a failed outbound write.
+fn is_outbound_write_failure_label(label: &str) -> bool {
+    label == "send_failed" || label == TerminalSessionReason::SlowClient.as_str()
+}
+
+/// A client that stopped reading is not worth another provider turn's work, so a
+/// missed write deadline aborts the provider tasks before the socket unwinds. A
+/// broken sink leaves them to the ordinary teardown.
+fn handle_outbound_write_failure(
+    error: &OutboundWriteError,
+    session: &mut agent_domain::RealtimeSession,
+) -> &'static str {
+    if matches!(error, OutboundWriteError::Timeout) {
+        abort_realtime_session_tasks(session);
+    }
+    outbound_write_terminal_label(error)
+}
+
+/// `SERVICE-008`: serialization is fallible, and its only fallback is Plan 05's
+/// published frame. The serializer is a parameter so the fallback is reachable in
+/// a test without a frame that cannot be serialized.
+fn serialize_server_frame_with<E>(
+    frame: &ServerFrame,
+    serializer: impl FnOnce(&ServerFrame) -> Result<String, E>,
+) -> String {
+    serializer(frame).unwrap_or_else(|_| VOICE_SERIALIZATION_FALLBACK_FRAME.to_owned())
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     admission: VoiceAdmission,
     request_origin: String,
 ) {
+    let (sender, receiver) = socket.split();
+    // `SERVICE-002`: the bounded sender is installed the instant the socket is
+    // split, so there is no window in which an unbounded write is possible.
+    let sender = BoundedSender::new(sender, state.ws_timeouts.outbound_write);
+    run_voice_session(sender, receiver, state, admission, request_origin).await;
+}
+
+/// The whole post-split session, generic over its sink and stream so a
+/// deterministic test drives the real cleanup path rather than a parallel helper.
+async fn run_voice_session<S, R>(
+    mut sender: BoundedSender<S>,
+    mut receiver: R,
+    state: AppState,
+    admission: VoiceAdmission,
+    request_origin: String,
+) where
+    S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
     let principal = admission.principal.clone();
-    let (mut sender, mut receiver) = socket.split();
     if send_json(
         &mut sender,
         &ServerFrame::ready_with_capabilities(
@@ -836,7 +931,7 @@ async fn handle_socket(
                             }
                         }
                         if let Some(accepted) = accepted_audio_turn {
-                            if send_json(
+                            if let Err(error) = send_json(
                                 &mut sender,
                                 &ServerFrame::audio_turn_accepted(
                                     accepted.client_generation_id,
@@ -845,9 +940,8 @@ async fn handle_socket(
                                 ),
                             )
                             .await
-                            .is_err()
                             {
-                                terminal_reason = "send_failed";
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                 break;
                             }
                         }
@@ -959,7 +1053,7 @@ async fn handle_socket(
                 // on the same socket. No provider input, store write, lease, or
                 // deadline is touched, and Plan 05 classifies the frame nonterminal.
                 if let Some(denial) = client_input.recoverable_denial() {
-                    if send_json(
+                    if let Err(error) = send_json(
                         &mut sender,
                         &ServerFrame::Event {
                             version: VIVA_VOICE_PROTOCOL_VERSION,
@@ -967,9 +1061,8 @@ async fn handle_socket(
                         },
                     )
                     .await
-                    .is_err()
                     {
-                        terminal_reason = "send_failed";
+                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
                         break;
                     }
                     continue;
@@ -1123,16 +1216,15 @@ async fn handle_socket(
                                 reason,
                                 response_id,
                             }) => {
-                                if send_partial_recap_for_provider_failure(
+                                if let Err(error) = send_partial_recap_for_provider_failure(
                                     &forward_context,
                                     reason,
                                     response_id.as_deref(),
                                     &mut sender,
                                 )
                                 .await
-                                .is_err()
                                 {
-                                    terminal_reason = "send_failed";
+                                    terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                     break;
                                 }
                                 terminal_reason = close_with_terminal_session_phase(
@@ -1147,8 +1239,8 @@ async fn handle_socket(
                                 .await;
                                 break;
                             }
-                            Err(_) => {
-                                terminal_reason = "send_failed";
+                            Err(error) => {
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                 break;
                             }
                         }
@@ -1256,7 +1348,7 @@ async fn handle_socket(
                             }
                         }
                         if let Some(accepted) = accepted_audio_turn {
-                            if send_json(
+                            if let Err(error) = send_json(
                                 &mut sender,
                                 &ServerFrame::audio_turn_accepted(
                                     accepted.client_generation_id,
@@ -1265,9 +1357,8 @@ async fn handle_socket(
                                 ),
                             )
                             .await
-                            .is_err()
                             {
-                                terminal_reason = "send_failed";
+                                terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                 break;
                             }
                         }
@@ -1331,16 +1422,15 @@ async fn handle_socket(
                                         reason,
                                         response_id,
                                     }) => {
-                                        if send_partial_recap_for_provider_failure(
+                                        if let Err(error) = send_partial_recap_for_provider_failure(
                                             &forward_context,
                                             reason,
                                             response_id.as_deref(),
                                             &mut sender,
                                         )
                                         .await
-                                        .is_err()
                                         {
-                                            terminal_reason = "send_failed";
+                                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                             break;
                                         }
                                         terminal_reason = close_with_terminal_session_phase(
@@ -1355,8 +1445,8 @@ async fn handle_socket(
                                         .await;
                                         break;
                                     }
-                                    Err(_) => {
-                                        terminal_reason = "send_failed";
+                                    Err(error) => {
+                                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
                                         let _ = close_with(
                                             &mut sender,
                                             close_code::NORMAL,
@@ -1509,16 +1599,15 @@ async fn handle_socket(
                         reason,
                         response_id,
                     }) => {
-                        if send_partial_recap_for_provider_failure(
+                        if let Err(error) = send_partial_recap_for_provider_failure(
                             &forward_context,
                             reason,
                             response_id.as_deref(),
                             &mut sender,
                         )
                         .await
-                        .is_err()
                         {
-                            terminal_reason = "send_failed";
+                            terminal_reason = handle_outbound_write_failure(&error, &mut session);
                             break;
                         }
                         terminal_reason = close_with_terminal_session_phase(
@@ -1533,8 +1622,8 @@ async fn handle_socket(
                         .await;
                         break;
                     }
-                    Err(_) => {
-                        terminal_reason = "send_failed";
+                    Err(error) => {
+                        terminal_reason = handle_outbound_write_failure(&error, &mut session);
                         break;
                     }
                 }
@@ -1546,6 +1635,41 @@ async fn handle_socket(
     } else {
         record_terminal(&state, voice_session_id, terminal_reason).await;
     }
+    // `SERVICE-002`: every server-owned permit is released *before* the closing
+    // handshake is waited on, so a client that never answers the Close cannot
+    // hold a lease for the length of that wait.
+    drop(pending_provider_admissions);
+    drop(session);
+    drop(_user_study_set_lease);
+    drop(_user_total_lease);
+    drop(_failure_control_identity_lease);
+    drop(admission);
+    // A socket whose own write side already failed, or whose client is already
+    // gone, has no handshake left to finish and must not wait for one.
+    if !is_outbound_write_failure_label(terminal_reason) && terminal_reason != "client_disconnect" {
+        finish_closing_handshake(&mut receiver, CLOSING_HANDSHAKE_GRACE).await;
+    }
+}
+
+/// `SERVICE-002`: read the peer out before the socket is dropped.
+///
+/// Dropping a socket that still holds unread client bytes resets the connection,
+/// and a reset discards the terminal frame and the Close frame already written to
+/// it — the client sees a transport error instead of the reason it was closed.
+/// The wait is bounded by a server-owned grace and holds no lease; a client can
+/// neither shorten nor extend it.
+async fn finish_closing_handshake<R>(receiver: &mut R, grace: Duration)
+where
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    let _ = timeout(grace, async {
+        while let Some(Ok(message)) = receiver.next().await {
+            if matches!(message, Message::Close(_)) {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 fn abort_realtime_session_tasks(session: &mut agent_domain::RealtimeSession) {
@@ -1621,7 +1745,7 @@ fn rearm_between_turn_idle(
 }
 
 async fn close_with_terminal_session_phase<S>(
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     input: &mpsc::Sender<BrainInput>,
     state: &AppState,
     voice_session_id: Option<String>,
@@ -1636,11 +1760,11 @@ where
     let terminal_reason =
         persist_terminal_session_reason(state, voice_session_id, terminal_reason).await;
     *terminal_persisted = true;
-    if send_terminal_session_phase(sender, terminal_reason)
-        .await
-        .is_err()
-    {
-        return terminal_label_after_terminal_phase_close(terminal_reason, "send_failed");
+    if let Err(error) = send_terminal_session_phase(sender, terminal_reason).await {
+        return terminal_label_after_terminal_phase_close(
+            terminal_reason,
+            outbound_write_terminal_label(&error),
+        );
     }
     let close_code = terminal_close_code(terminal_reason, close_code);
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
@@ -1648,18 +1772,15 @@ where
 }
 
 async fn close_with_terminal_session_phase_only<S>(
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     terminal_reason: TerminalSessionReason,
     close_code: u16,
 ) -> &'static str
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
-    if send_terminal_session_phase(sender, terminal_reason)
-        .await
-        .is_err()
-    {
-        return "send_failed";
+    if let Err(error) = send_terminal_session_phase(sender, terminal_reason).await {
+        return outbound_write_terminal_label(&error);
     }
     let _ = close_with(sender, close_code, terminal_reason.close_reason()).await;
     terminal_reason.as_str()
@@ -1669,7 +1790,7 @@ fn terminal_label_after_terminal_phase_close(
     terminal_reason: TerminalSessionReason,
     close_terminal_reason: &'static str,
 ) -> &'static str {
-    if close_terminal_reason == "send_failed"
+    if is_outbound_write_failure_label(close_terminal_reason)
         && terminal_reason_overrides_send_failure(terminal_reason)
     {
         terminal_reason.as_str()
@@ -1701,7 +1822,7 @@ fn terminal_reason_overrides_send_failure(terminal_reason: TerminalSessionReason
 }
 
 async fn close_with_client_stop<S>(
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     state: &AppState,
     voice_session_id: Option<String>,
     terminal_persisted: &mut bool,
@@ -1728,9 +1849,9 @@ where
 }
 
 async fn send_terminal_session_phase<S>(
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     terminal_reason: TerminalSessionReason,
-) -> Result<(), axum::Error>
+) -> Result<(), OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -1754,8 +1875,8 @@ async fn send_partial_recap_for_provider_failure<S>(
     context: &BrainForwardContext<'_>,
     terminal_reason: TerminalSessionReason,
     response_id: Option<&str>,
-    sender: &mut S,
-) -> Result<bool, axum::Error>
+    sender: &mut BoundedSender<S>,
+) -> Result<bool, OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -2106,8 +2227,8 @@ async fn drain_terminal_events<S>(
     events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
     cancelled_responses: &mut CancelledResponseTracker,
     session_started_at: Instant,
-    sender: &mut S,
-) -> Result<ForwardBrainEvent, axum::Error>
+    sender: &mut BoundedSender<S>,
+) -> Result<ForwardBrainEvent, OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -2151,9 +2272,9 @@ async fn forward_ready_brain_events<S>(
     events: &mut mpsc::Receiver<agent_domain::BrainEvent>,
     cancelled_responses: &mut CancelledResponseTracker,
     session_started_at: Instant,
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     runtime: &mut ProviderTurnRuntime<'_>,
-) -> Result<ForwardBrainEvent, axum::Error>
+) -> Result<ForwardBrainEvent, OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -2188,9 +2309,9 @@ async fn forward_brain_event_with_turn_accounting<S>(
     event: agent_domain::BrainEvent,
     cancelled_responses: &mut CancelledResponseTracker,
     session_started_at: Instant,
-    sender: &mut S,
+    sender: &mut BoundedSender<S>,
     runtime: &mut ProviderTurnRuntime<'_>,
-) -> Result<ForwardBrainEvent, axum::Error>
+) -> Result<ForwardBrainEvent, OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -2316,8 +2437,8 @@ async fn forward_brain_event<S>(
     event: agent_domain::BrainEvent,
     cancelled_responses: &mut CancelledResponseTracker,
     session_elapsed: Duration,
-    sender: &mut S,
-) -> Result<ForwardBrainEvent, axum::Error>
+    sender: &mut BoundedSender<S>,
+) -> Result<ForwardBrainEvent, OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -2403,23 +2524,25 @@ where
             // duplicate response id is an invariant breach and fails closed.
             if context.turn_bindings.pending_turn_ids.is_empty() {
                 context.turn_bindings.register_server_turn().map_err(|_| {
-                    axum::Error::new(std::io::Error::other("server turn id is not registrable"))
+                    OutboundWriteError::Sink(axum::Error::new(std::io::Error::other(
+                        "server turn id is not registrable",
+                    )))
                 })?;
             }
             let turn_id = context
                 .turn_bindings
                 .bind_question(response_id)
                 .map_err(|_| {
-                    axum::Error::new(std::io::Error::other(
+                    OutboundWriteError::Sink(axum::Error::new(std::io::Error::other(
                         "question_started is not turn-bindable",
-                    ))
+                    )))
                 })?
                 .to_owned();
             Some(
                 ServerFrame::question_started(&turn_id, &event).map_err(|_| {
-                    axum::Error::new(std::io::Error::other(
+                    OutboundWriteError::Sink(axum::Error::new(std::io::Error::other(
                         "question_started is not turn-bindable",
-                    ))
+                    )))
                 })?,
             )
         }
@@ -4871,17 +4994,23 @@ async fn record_terminal_evidence(
     ));
 }
 
-async fn send_json<S>(sender: &mut S, frame: &ServerFrame) -> Result<(), axum::Error>
+async fn send_json<S>(
+    sender: &mut BoundedSender<S>,
+    frame: &ServerFrame,
+) -> Result<(), OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     // Plan 05 owns the fallback frame; this service never writes its own error JSON.
-    let text = serde_json::to_string(frame)
-        .unwrap_or_else(|_| VOICE_SERIALIZATION_FALLBACK_FRAME.to_owned());
+    let text = serialize_server_frame_with(frame, serde_json::to_string);
     sender.send(Message::Text(text.into())).await
 }
 
-async fn close_with<S>(sender: &mut S, code: u16, reason: &'static str) -> Result<(), axum::Error>
+async fn close_with<S>(
+    sender: &mut BoundedSender<S>,
+    code: u16,
+    reason: &'static str,
+) -> Result<(), OutboundWriteError>
 where
     S: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
@@ -5324,7 +5453,7 @@ mod tests {
             turn_bindings: &mut turn_bindings,
         };
         let mut cancelled_responses = CancelledResponseTracker::default();
-        let mut sender = RecordingSink::new();
+        let mut sender = BoundedSender::new(RecordingSink::new(), Duration::from_secs(5));
         let error = BrainProviderError::from_failure(BrainProviderFailure::new(
             BrainProviderFailureParts {
                 failure_class: BrainFailureClass::DurabilityDegraded,
@@ -5348,7 +5477,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, ForwardBrainEvent::DurabilityDegraded);
-        assert!(sender.sent.is_empty());
+        assert!(sender.inner.sent.is_empty());
         let evidence = state.evidence.snapshot();
         assert!(evidence.iter().any(|event| {
             event.kind == VoiceEvidenceEventKind::ProviderStageFailure
@@ -7007,7 +7136,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_session_phase_close_preserves_deploy_drain_when_writer_fails() {
         let (input, mut received) = mpsc::channel(1);
-        let mut sender = FailingSink;
+        let mut sender = BoundedSender::new(FailingSink, Duration::from_secs(5));
         let state = AppState::new(
             Arc::new(SyntheticBrain::default()),
             "synthetic",
@@ -7035,7 +7164,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_session_phase_close_preserves_provider_reason_when_writer_fails() {
         let (input, mut received) = mpsc::channel(1);
-        let mut sender = FailingSink;
+        let mut sender = BoundedSender::new(FailingSink, Duration::from_secs(5));
         let state = AppState::new(
             Arc::new(SyntheticBrain::default()),
             "synthetic",
@@ -7126,7 +7255,7 @@ mod tests {
         input
             .try_send(BrainInput::Text("queued".to_owned()))
             .unwrap();
-        let mut sender = RecordingSink::new();
+        let mut sender = BoundedSender::new(RecordingSink::new(), Duration::from_secs(5));
         let state = AppState::new(
             Arc::new(SyntheticBrain::default()),
             "synthetic",
@@ -7152,8 +7281,8 @@ mod tests {
 
         assert_eq!(reason, "drained");
         assert!(terminal_persisted);
-        assert_eq!(sender.sent.len(), 2);
-        let Message::Text(text) = &sender.sent[0] else {
+        assert_eq!(sender.inner.sent.len(), 2);
+        let Message::Text(text) = &sender.inner.sent[0] else {
             panic!("expected terminal session phase text frame");
         };
         let frame: ServerFrame = serde_json::from_str(text).unwrap();
@@ -7167,7 +7296,7 @@ mod tests {
                 ..
             }
         ));
-        let Message::Close(Some(close)) = &sender.sent[1] else {
+        let Message::Close(Some(close)) = &sender.inner.sent[1] else {
             panic!("expected websocket close frame");
         };
         assert_eq!(close.code, close_code::NORMAL);
@@ -7192,7 +7321,7 @@ mod tests {
         );
         let (_events_tx, mut events) = mpsc::channel(1);
         let mut cancelled_responses = CancelledResponseTracker::default();
-        let mut sender = RecordingSink::new();
+        let mut sender = BoundedSender::new(RecordingSink::new(), Duration::from_secs(5));
         let limits = VoiceLimitConfig::default();
         let mut session_limits = SessionLimitRuntime::new();
         let mut turn_bindings = TurnBindingTracker::default();
@@ -7218,7 +7347,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, ForwardBrainEvent::Continue);
-        assert!(sender.sent.is_empty());
+        assert!(sender.inner.sent.is_empty());
         assert!(started_at.elapsed() >= TERMINAL_EVENT_DRAIN_TIMEOUT);
     }
 
@@ -8095,5 +8224,431 @@ mod tests {
             client_ip_key(client_ip_test_peer("10.1.2.3"), &headers, &trusted),
             Err(ClientIpError::MissingForwardedChain)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 9 (SERVICE-002, SERVICE-008): one deadline on every outbound write.
+    // ---------------------------------------------------------------------
+
+    /// A sink that never becomes ready, flushes, or closes. It is the whole
+    /// slow-reader model: no TCP buffer, no timing, nothing the test has to guess
+    /// about. `blocking_after` lets a session make real progress first.
+    struct PendingSink {
+        accepted: usize,
+        block_after: usize,
+    }
+
+    impl PendingSink {
+        fn new() -> Self {
+            Self {
+                accepted: 0,
+                block_after: 0,
+            }
+        }
+
+        fn blocking_after(block_after: usize) -> Self {
+            Self {
+                accepted: 0,
+                block_after,
+            }
+        }
+
+        fn blocked(&self) -> bool {
+            self.accepted >= self.block_after
+        }
+    }
+
+    impl futures_util::Sink<Message> for PendingSink {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.blocked() {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            self.accepted = self.accepted.saturating_add(1);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.blocked() {
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    /// The plan's boundary is "one nanosecond before the deadline"; Tokio's paused
+    /// clock is a millisecond timer wheel, so a one-nanosecond gap is not a
+    /// representable instant — both timers would land on the same tick and the
+    /// assertion would decide nothing. The boundary is therefore taken at the
+    /// runtime's own smallest observable step.
+    const TIMER_TICK: Duration = Duration::from_millis(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_sender_times_out_one_tick_after_its_deadline() {
+        let start = Instant::now();
+        // A second timer armed across the same stalled write. It must fire on its
+        // own schedule, which is what proves the bounded write parks on a real
+        // timer rather than blocking the runtime.
+        let concurrent = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Instant::now()
+        });
+        let mut sender = BoundedSender::new(PendingSink::new(), Duration::from_secs(5));
+        let write = sender.send(Message::Text("frame".into()));
+        tokio::pin!(write);
+
+        let before_deadline = tokio::select! {
+            biased;
+            result = &mut write => Some(result),
+            () = tokio::time::sleep(Duration::from_secs(5) - TIMER_TICK) => None,
+        };
+        assert!(
+            before_deadline.is_none(),
+            "the write must still be pending one tick before its deadline"
+        );
+        assert_eq!(
+            Instant::now().duration_since(start),
+            Duration::from_secs(5) - TIMER_TICK
+        );
+
+        let result = (&mut write).await;
+        assert!(
+            matches!(result, Err(OutboundWriteError::Timeout)),
+            "{result:?}"
+        );
+        assert_eq!(Instant::now().duration_since(start), Duration::from_secs(5));
+        assert_eq!(
+            concurrent.await.expect("concurrent timer task"),
+            start + Duration::from_secs(1),
+            "a concurrently armed one-second timer must fire on schedule"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_sender_separates_a_failed_sink_from_a_missed_deadline() {
+        let mut failing = BoundedSender::new(FailingSink, Duration::from_secs(5));
+        let failed = failing.send(Message::Text("frame".into())).await;
+        assert!(
+            matches!(failed, Err(OutboundWriteError::Sink(_))),
+            "{failed:?}"
+        );
+        assert_eq!(
+            outbound_write_terminal_label(&failed.expect_err("sink failure")),
+            "send_failed"
+        );
+
+        let mut stalled = BoundedSender::new(PendingSink::new(), Duration::from_secs(5));
+        let timed_out = stalled.send(Message::Text("frame".into())).await;
+        assert!(matches!(timed_out, Err(OutboundWriteError::Timeout)));
+        assert_eq!(
+            outbound_write_terminal_label(&timed_out.expect_err("write timeout")),
+            TerminalSessionReason::SlowClient.as_str()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_sender_completes_a_ready_write_without_consuming_its_deadline() {
+        let start = Instant::now();
+        let mut sender = BoundedSender::new(RecordingSink::new(), Duration::from_secs(5));
+
+        sender
+            .send(Message::Text("frame".into()))
+            .await
+            .expect("a ready sink completes inside its deadline");
+
+        assert_eq!(Instant::now(), start);
+        assert_eq!(sender.inner.sent.len(), 1);
+    }
+
+    #[test]
+    fn serialization_fallback_uses_plan_05s_exact_published_bytes() {
+        let frame = ServerFrame::error(
+            VoiceServerErrorCode::ClientFrameMalformed,
+            "a frame that cannot be serialized",
+        );
+
+        let rendered = serialize_server_frame_with(&frame, |_| Err::<String, ()>(()));
+
+        assert_eq!(rendered, VOICE_SERIALIZATION_FALLBACK_FRAME);
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).expect("the fallback frame is valid JSON");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["version"], VIVA_VOICE_PROTOCOL_VERSION);
+        assert_eq!(VIVA_VOICE_PROTOCOL_VERSION, 5);
+        // Named through Plan 05's own enum rather than restated as a literal:
+        // `protocol_v5_fixture_shadow_types_are_absent` proves no service-local
+        // wire error JSON survives in this file.
+        assert_eq!(
+            value["error"]["code"],
+            VoiceServerErrorCode::InternalSerialization.as_str()
+        );
+        assert_eq!(value["error"]["retryable"], true);
+        assert_eq!(
+            value
+                .as_object()
+                .expect("envelope object")
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            ["type", "version", "error"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<HashSet<_>>(),
+            "the fallback carries no application payload"
+        );
+        assert_eq!(
+            value["error"]
+                .as_object()
+                .expect("error object")
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            ["code", "message", "retryable"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn serialization_fallback_is_not_used_when_the_frame_serializes() {
+        let frame = ServerFrame::error(VoiceServerErrorCode::ClientFrameMalformed, "malformed");
+
+        let rendered = serialize_server_frame_with(&frame, serde_json::to_string);
+
+        assert_ne!(rendered, VOICE_SERIALIZATION_FALLBACK_FRAME);
+        assert_eq!(rendered, serde_json::to_string(&frame).unwrap());
+    }
+
+    /// A provider that answers one question and then keeps a task alive forever.
+    /// The task is handed back so the test can prove the socket aborted it.
+    struct SlowClientProbeBrain {
+        study_store: Arc<dyn agent_domain::StudyMemoryStore>,
+        #[allow(clippy::type_complexity)]
+        task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl agent_domain::RealtimeBrain for SlowClientProbeBrain {
+        fn capabilities(&self) -> agent_domain::RealtimeBrainCapabilities {
+            agent_domain::RealtimeBrainCapabilities {
+                provider: "slow_client_probe".to_owned(),
+                configured: true,
+                selectable: true,
+                live_runtime: false,
+            }
+        }
+
+        async fn open(&self, config: SessionConfig) -> Result<RealtimeSession, BrainError> {
+            let _recorded = self
+                .study_store
+                .record_voice_session(&config)
+                .await
+                .map_err(|_| {
+                    BrainError::from_failure(BrainProviderFailure::new(BrainProviderFailureParts {
+                        failure_class: BrainFailureClass::DurabilityDegraded,
+                        stage: BrainFailureStage::Store,
+                        retry_eligible: false,
+                        latency_ms: 0,
+                        provider: "slow_client_probe".to_owned(),
+                        model: String::new(),
+                        metadata: "error_kind=store_write_failed".to_owned(),
+                    }))
+                })?;
+            let (input, mut input_rx) = mpsc::channel::<BrainInput>(8);
+            let (event_tx, events) = mpsc::channel(8);
+            let handle = tokio::spawn(async move {
+                let _ = event_tx
+                    .send(BrainEvent::SessionPhase {
+                        phase: StudySessionPhase::Ready,
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(BrainEvent::QuestionStarted {
+                        response_id: "response-1".to_owned(),
+                        question: fixture_question(),
+                    })
+                    .await;
+                while let Some(input) = input_rx.recv().await {
+                    if !matches!(
+                        input,
+                        BrainInput::Text(_) | BrainInput::TextWithMetadata { .. }
+                    ) {
+                        continue;
+                    }
+                    let _ = event_tx
+                        .send(BrainEvent::SessionPhase {
+                            phase: StudySessionPhase::Thinking,
+                        })
+                        .await;
+                }
+                // The provider stays alive until the socket aborts it.
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3_600)).await;
+                }
+            });
+            let abort = handle.abort_handle();
+            *self.task.lock().expect("probe task lock poisoned") = Some(handle);
+            Ok(RealtimeSession {
+                input,
+                events,
+                task_guard: Some(RealtimeSessionTaskGuard::new(vec![abort])),
+            })
+        }
+    }
+
+    /// `SERVICE-002`: a client that stops reading costs the server exactly one
+    /// outbound-write deadline. The session records the sanitized `slow_client`
+    /// label, aborts the provider task, and releases every server-owned permit.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_sender_slow_client_aborts_the_provider_and_releases_every_lease() {
+        let store = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        let probe_task = Arc::new(std::sync::Mutex::new(None));
+        let state = AppState::with_study_store(
+            Arc::new(SlowClientProbeBrain {
+                study_store: store.clone(),
+                task: probe_task.clone(),
+            }),
+            "slow_client_probe",
+            crate::config::VoiceWsAccess::default(),
+            2,
+            store,
+        )
+        .with_voice_limits(VoiceLimitConfig {
+            max_ip_sessions: Some(2),
+            max_user_sessions: Some(2),
+            provider_limiter_enabled: true,
+            max_provider_concurrent_turns: Some(1),
+            max_provider_queue_depth: Some(1),
+            ..VoiceLimitConfig::default()
+        })
+        .with_ws_timeouts(crate::app::WsTimeouts {
+            first_frame: Duration::from_secs(60),
+            idle: Duration::from_secs(600),
+            between_turn_idle: Duration::from_secs(600),
+            session: Duration::from_secs(6 * 60 * 60),
+            outbound_write: Duration::from_secs(5),
+            ..crate::app::WsTimeouts::default()
+        });
+        let evidence = state.evidence.clone();
+        let limit_state = state.limit_state.clone();
+        let session_slots = state.session_slots.clone();
+
+        let permit = session_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session slot");
+        let ip_lease = limit_state
+            .try_acquire_ip("198.51.100.7", 2)
+            .expect("ip lease");
+        assert_eq!(limit_state.ip_lease_count("198.51.100.7"), Some(1));
+        assert_eq!(session_slots.available_permits(), 1);
+        let admission = VoiceAdmission {
+            _permit: permit,
+            _ip_lease: Some(ip_lease),
+            principal: crate::config::UpgradePrincipal::ServiceBearer,
+        };
+
+        // The client sends its bootstrap frame and one answer, then reads and
+        // writes nothing ever again.
+        let client_frames = futures_util::stream::iter(vec![
+            Ok(Message::Text(slow_client_session_config_json().into())),
+            Ok(Message::Text(slow_client_answer_json().into())),
+        ])
+        .chain(futures_util::stream::pending());
+
+        let start = Instant::now();
+        // Ready, session_phase, question_started go out; the provider event that
+        // follows the admitted answer is the write that stalls.
+        run_voice_session(
+            BoundedSender::new(PendingSink::blocking_after(3), Duration::from_secs(5)),
+            client_frames,
+            state,
+            admission,
+            "http://localhost:3000".to_owned(),
+        )
+        .await;
+
+        assert_eq!(
+            Instant::now().duration_since(start),
+            Duration::from_secs(5),
+            "the stalled write costs exactly one outbound-write deadline"
+        );
+        let recorded = evidence.snapshot();
+        assert!(
+            recorded.iter().any(|event| {
+                event.kind == VoiceEvidenceEventKind::TerminalReason
+                    && event.detail == TerminalSessionReason::SlowClient.as_str()
+            }),
+            "{recorded:?}"
+        );
+        assert_eq!(limit_state.ip_lease_count("198.51.100.7"), None);
+        assert_eq!(session_slots.available_permits(), 2);
+        let provider = tokio::time::timeout(
+            Duration::from_millis(50),
+            limit_state.try_admit_provider_turn(
+                &VoiceLimitConfig {
+                    provider_limiter_enabled: true,
+                    max_provider_concurrent_turns: Some(1),
+                    max_provider_queue_depth: Some(1),
+                    ..VoiceLimitConfig::default()
+                },
+                ProviderQueueBehavior::Wait,
+            ),
+        )
+        .await
+        .expect("the provider slot must be free");
+        assert!(
+            matches!(provider.decision, ProviderAdmissionDecision::Admitted),
+            "the provider slot must be free: {:?}",
+            provider.decision
+        );
+        let task = probe_task
+            .lock()
+            .expect("probe task lock poisoned")
+            .take()
+            .expect("probe task handle");
+        let outcome = tokio::time::timeout(Duration::from_millis(50), task)
+            .await
+            .expect("the provider task must be aborted rather than left running")
+            .expect_err("an aborted task reports cancellation");
+        assert!(outcome.is_cancelled());
+    }
+
+    fn slow_client_session_config_json() -> String {
+        let session = include_str!("../../../fixtures/voice-protocol/session-config.json");
+        format!(
+            r#"{{"type":"session_config","version":{VIVA_VOICE_PROTOCOL_VERSION},"client_generation_id":"slow-client-1","session_token":"placeholder-session-material","session":{session}}}"#
+        )
+    }
+
+    fn slow_client_answer_json() -> String {
+        json!({
+            "type": "turn_intent",
+            "version": VIVA_VOICE_PROTOCOL_VERSION,
+            "client_generation_id": "slow-client-1",
+            "turn_id": "turn-1",
+            "intent": { "kind": "answer_text", "text": "an answer the client never reads back" },
+        })
+        .to_string()
     }
 }
