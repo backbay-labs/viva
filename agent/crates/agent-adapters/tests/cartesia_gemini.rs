@@ -397,9 +397,10 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
     let mut saw_evaluation = false;
     let mut saw_manuscript_intent = false;
     let mut saw_audio = false;
-    let mut saw_recap = false;
     for _ in 0..16 {
-        match next_event(&mut session).await {
+        let event = next_event(&mut session).await;
+        let turn_completed = matches!(event, BrainEvent::ResponseCompleted { .. });
+        match event {
             BrainEvent::AnswerEvaluated { evaluation, .. } => {
                 assert_eq!(evaluation.answer_text, FAKE_INK_FINAL_TRANSCRIPT);
                 saw_evaluation = true;
@@ -422,13 +423,12 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
                 assert_eq!(frame.pcm16_bytes(), [1, 2, 3, 4]);
                 saw_audio = true;
             }
-            BrainEvent::RecapReady { recap, .. } => {
-                assert_eq!(recap.voice_session_id, "voice-session-1");
-                saw_recap = true;
+            BrainEvent::RecapReady { .. } => {
+                panic!("the session recap is published on Stop, not inside a turn");
             }
             _ => {}
         }
-        if saw_evaluation && saw_manuscript_intent && saw_audio && saw_recap {
+        if turn_completed {
             break;
         }
     }
@@ -436,7 +436,16 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
     assert!(saw_evaluation);
     assert!(saw_manuscript_intent);
     assert!(saw_audio);
-    assert!(saw_recap);
+    // The recap is the session's fold, not the turn's, so it arrives on Stop.
+    let closing = stop_and_drain(&mut session).await;
+    let recap = closing
+        .iter()
+        .find_map(|event| match event {
+            BrainEvent::RecapReady { recap, .. } => Some(recap.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("stopping the session publishes its recap: {closing:?}"));
+    assert_eq!(recap.voice_session_id, "voice-session-1");
     // Mastery and scheduling are persisted inside one canonical turn outcome;
     // there is no separate adapter-driven status or review write any more.
     let snapshot = store.snapshot();
@@ -480,7 +489,7 @@ async fn fake_runtime_persists_client_generation_id_on_answer_attempts() {
     for _ in 0..16 {
         if matches!(
             next_event(&mut session).await,
-            BrainEvent::RecapReady { .. }
+            BrainEvent::ResponseCompleted { .. }
         ) {
             break;
         }
@@ -526,7 +535,7 @@ async fn fake_runtime_persists_client_generation_id_on_answer_attempts() {
     for _ in 0..16 {
         if matches!(
             next_event(&mut refreshed_session).await,
-            BrainEvent::RecapReady { .. }
+            BrainEvent::ResponseCompleted { .. }
         ) {
             break;
         }
@@ -777,7 +786,6 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     let mut saw_new_transcript = false;
     let mut saw_new_evaluation = false;
     let mut saw_new_audio = false;
-    let mut saw_new_recap = false;
     for _ in 0..32 {
         match next_event(&mut session).await {
             BrainEvent::ResponseCancelledFor { response_id } => {
@@ -824,11 +832,8 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
                     saw_new_audio = true;
                 }
             }
-            BrainEvent::RecapReady { response_id, recap } => {
-                if response_id == "response-2" {
-                    assert_eq!(recap.voice_session_id, "voice-session-1");
-                    saw_new_recap = true;
-                }
+            BrainEvent::RecapReady { .. } => {
+                panic!("the session recap is published on Stop, not inside a turn");
             }
             _ => {}
         }
@@ -838,7 +843,6 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
             && saw_new_transcript
             && saw_new_evaluation
             && saw_new_audio
-            && saw_new_recap
         {
             break;
         }
@@ -850,8 +854,17 @@ async fn fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn() 
     assert!(saw_new_transcript);
     assert!(saw_new_evaluation);
     assert!(saw_new_audio);
-    assert!(saw_new_recap);
     let _ = release_answer.send(());
+    // The session's one recap arrives when the learner stops, folded over both
+    // the barged-in turn and the turn that replaced it.
+    let closing = stop_and_drain(&mut session).await;
+    assert!(
+        closing.iter().any(|event| matches!(
+            event,
+            BrainEvent::RecapReady { recap, .. } if recap.voice_session_id == "voice-session-1"
+        )),
+        "stopping the session publishes its recap: {closing:?}"
+    );
     let snapshot = inner_store.snapshot();
     assert_eq!(snapshot.answer_attempts.len(), 2);
     assert!(snapshot
@@ -1064,13 +1077,36 @@ async fn fake_runtime_reports_recap_failure_with_tool_executor_failure_class() {
         .await
         .unwrap();
 
+    // The recap stage runs when the learner stops, so the failure surfaces
+    // there: the turn itself completes and publishes no recap.
+    loop {
+        match next_event(&mut realtime).await {
+            BrainEvent::ResponseCompleted { .. } => break,
+            BrainEvent::Error(error) => panic!("the turn itself must not fail: {error:?}"),
+            BrainEvent::RecapReady { .. } => {
+                panic!("recap tool failure unexpectedly emitted recap")
+            }
+            _ => {}
+        }
+    }
+    realtime.input.send(BrainInput::Stop).await.ok();
     let error = loop {
         match next_event(&mut realtime).await {
             BrainEvent::Error(error) => break error,
             BrainEvent::RecapReady { .. } => {
                 panic!("recap tool failure unexpectedly emitted recap")
             }
-            _ => {}
+            event => {
+                assert!(
+                    !matches!(
+                        event,
+                        BrainEvent::SessionPhase {
+                            phase: agent_domain::StudySessionPhase::Recap
+                        }
+                    ),
+                    "a failed recap must not move the learner into the recap phase"
+                );
+            }
         }
     };
     let error_text = error.message.clone();
@@ -2082,6 +2118,20 @@ async fn next_event(session: &mut RealtimeSession) -> BrainEvent {
         .unwrap()
 }
 
+/// End the session and collect everything it publishes on the way out.
+///
+/// The session recap is a fold over every outcome the session persisted, so it
+/// is published exactly once, on `Stop`. A test that needs the recap ends the
+/// session for it rather than waiting for a turn to produce one.
+async fn stop_and_drain(session: &mut RealtimeSession) -> Vec<BrainEvent> {
+    session.input.send(BrainInput::Stop).await.ok();
+    let mut events = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(5), session.events.recv()).await {
+        events.push(event);
+    }
+    events
+}
+
 async fn expect_fake_interim_delta(session: &mut RealtimeSession, expected_response_id: &str) {
     // An accepted turn enters `listening` through the Plan 06 phase machine
     // before any transcript exists, so that transition may precede the delta.
@@ -2882,6 +2932,29 @@ async fn run_fixture_outcome_turn(store: Arc<FixtureOutcomeStore>) -> Vec<BrainE
     run_fixture_outcome_turn_observed(store).await.0
 }
 
+/// The same fixture-outcome turn, followed by the learner stopping.
+///
+/// The session recap is published once, on `Stop`, so a trace that must record
+/// the recap projection has to end the session for it.
+async fn run_fixture_outcome_turn_then_stop(store: Arc<FixtureOutcomeStore>) -> Vec<BrainEvent> {
+    let runtime = FakeCartesiaGeminiRuntime::new(store);
+    let mut session = runtime
+        .open(fixture_session_config())
+        .await
+        .expect("runner opens");
+    session
+        .input
+        .send(BrainInput::Text("the learner answer".to_owned()))
+        .await
+        .expect("text input accepted");
+    let mut events = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_millis(400), session.events.recv()).await {
+        events.push(event);
+    }
+    events.extend(stop_and_drain(&mut session).await);
+    events
+}
+
 /// The turn's events plus how many times the runtime asked Sonic to speak.
 ///
 /// The count is a transport observation the event stream cannot make: a turn
@@ -3620,7 +3693,7 @@ async fn fake_cartesia_two_turns_match_manifest_question_correlation() {
         .unwrap();
     loop {
         let event = next_event(&mut session).await;
-        let completed = matches!(&event, BrainEvent::RecapReady { response_id, .. }
+        let completed = matches!(&event, BrainEvent::ResponseCompleted { response_id }
             if response_id == &correlation.first_response_id);
         events.push(event);
         if completed {
@@ -3640,7 +3713,7 @@ async fn fake_cartesia_two_turns_match_manifest_question_correlation() {
         .unwrap();
     loop {
         let event = next_event(&mut session).await;
-        let completed = matches!(&event, BrainEvent::RecapReady { response_id, .. }
+        let completed = matches!(&event, BrainEvent::ResponseCompleted { response_id }
             if response_id == &correlation.second_response_id);
         events.push(event);
         if completed {
@@ -4016,6 +4089,14 @@ struct VoiceFixtureAdapterContract {
     terminal_phase: agent_domain::StudySessionPhase,
     recap_schema: String,
     recap_deferred_turns: u32,
+    /// How many recaps the fixture publishes for the whole session. A recap is
+    /// a session-scope fold, so a projection that publishes a different number
+    /// of them is not the fixture's session.
+    recap_count: usize,
+    /// The learner-visible kinds the fixture itself publishes after its recap.
+    /// Both two-turn fixtures place the recap last, so this is empty and the
+    /// projection may emit nothing learner-visible after its own recap.
+    recap_trailing_kinds: std::collections::BTreeSet<String>,
     /// The recap's graded concepts, by identity and status. The label is the
     /// store's, not the adapter's, so it is deliberately not compared.
     recap_concepts: Vec<(String, ConceptStatus)>,
@@ -4250,11 +4331,21 @@ fn voice_fixture_adapter_contract(
         .ok_or_else(|| "the fixture publishes no session phase".to_owned())?
         .map_err(|error| format!("terminal phase does not parse: {error}"))?;
 
-    let recap = events
+    let recap_count = events
         .iter()
-        .rev()
-        .find(|event| event["type"] == "recap_ready")
+        .filter(|event| event["type"] == "recap_ready")
+        .count();
+    let recap_position = events
+        .iter()
+        .rposition(|event| event["type"] == "recap_ready")
         .ok_or_else(|| "the fixture publishes no recap".to_owned())?;
+    let recap_trailing_kinds = events[recap_position + 1..]
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| ADAPTER_LEARNER_VISIBLE_KINDS.contains(kind))
+        .map(ToOwned::to_owned)
+        .collect();
+    let recap = &events[recap_position];
     let recap_schema = recap["recap"]["schema"]
         .as_str()
         .ok_or_else(|| "the fixture recap names no schema".to_owned())?
@@ -4317,6 +4408,8 @@ fn voice_fixture_adapter_contract(
         terminal_phase,
         recap_schema,
         recap_deferred_turns,
+        recap_count,
+        recap_trailing_kinds,
         recap_concepts,
         recap_source_moments,
     })
@@ -4564,8 +4657,10 @@ fn adapter_projection_matches_voice_fixture(
         ));
     }
 
-    // 6. Terminal ordering: the recap is the fixture's schema and deferral
-    //    count, and it precedes the fixture's terminal phase.
+    // 6. Terminal ordering: the session publishes the fixture's number of
+    //    recaps, with the fixture's schema and deferral count, nothing
+    //    learner-visible trails the recap that the fixture does not itself
+    //    place after its own, and the recap precedes the terminal phase.
     let recaps = events
         .iter()
         .enumerate()
@@ -4574,6 +4669,14 @@ fn adapter_projection_matches_voice_fixture(
             _ => None,
         })
         .collect::<Vec<_>>();
+    if recaps.len() != contract.recap_count {
+        return Err(format!(
+            "the session published {} recaps but {} publishes {}",
+            recaps.len(),
+            contract.fixture_id,
+            contract.recap_count
+        ));
+    }
     let Some((recap_index, recap)) = recaps.last() else {
         return Err("the session produced no recap".to_owned());
     };
@@ -4583,10 +4686,16 @@ fn adapter_projection_matches_voice_fixture(
             recap.schema, contract.recap_schema
         ));
     }
-    // The recap is a fold over the outcomes that had been persisted when it was
-    // built, so its deferral bucket is compared with this run's own deferral
-    // history. The fixture's own recap was checked against the fixture's
-    // deferrals when the contract was built, so both artefacts obey one law.
+    // The recap's deferral bucket is the fixture's own number, compared
+    // directly. It is additionally held to the law that a recap counts exactly
+    // the deferrals that had happened when it was built, so a recap published
+    // too early cannot satisfy the fixture by accident.
+    if recap.deferred_turns != contract.recap_deferred_turns {
+        return Err(format!(
+            "recap counts {} deferrals but {} publishes {}",
+            recap.deferred_turns, contract.fixture_id, contract.recap_deferred_turns
+        ));
+    }
     let deferrals_before_recap = events[..*recap_index]
         .iter()
         .filter(|event| matches!(event, BrainEvent::TurnDeferred { .. }))
@@ -4596,6 +4705,17 @@ fn adapter_projection_matches_voice_fixture(
             "recap counts {} deferrals but {deferrals_before_recap} had happened",
             recap.deferred_turns
         ));
+    }
+    for event in &events[*recap_index + 1..] {
+        let kind = adapter_event_kind(event);
+        if ADAPTER_LEARNER_VISIBLE_KINDS.contains(&kind)
+            && !contract.recap_trailing_kinds.contains(kind)
+        {
+            return Err(format!(
+                "{kind} trails the session recap, which {} publishes last",
+                contract.fixture_id
+            ));
+        }
     }
     let graded = recap
         .concepts
@@ -4957,6 +5077,33 @@ fn assert_two_turn_mutation_controls(
     assert!(
         adapter_projection_matches_voice_fixture(&drifted_recap, contract).is_err(),
         "a recap deferral count that drifts from the fixture must be rejected"
+    );
+
+    // A per-turn recap published before the session's later turns: the exact
+    // shape that reports a stale deferral count to the learner.
+    let recap_index = events
+        .iter()
+        .position(|event| matches!(event, BrainEvent::RecapReady { .. }))
+        .expect("the session published its recap");
+    let mut early_recap = events.to_vec();
+    let mut moved = early_recap.remove(recap_index);
+    if let BrainEvent::RecapReady { recap, .. } = &mut moved {
+        // A recap built before the second turn could not have counted its
+        // deferral, so the mutation carries the count that position implies.
+        recap.deferred_turns = 0;
+    }
+    early_recap.insert(second_start, moved);
+    assert!(
+        adapter_projection_matches_voice_fixture(&early_recap, contract).is_err(),
+        "a recap published before the session's later turns must be rejected"
+    );
+
+    // A second recap: a session-scope fold published more than once.
+    let mut duplicated_recap = events.to_vec();
+    duplicated_recap.insert(recap_index, events[recap_index].clone());
+    assert!(
+        adapter_projection_matches_voice_fixture(&duplicated_recap, contract).is_err(),
+        "publishing the session recap twice must be rejected"
     );
 }
 
@@ -5821,8 +5968,6 @@ async fn two_turn_live_orchestration_trace_is_stable_across_extraction() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-1",
-            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
-            "cancellation:response-1",
             "question_started:response-2:q-fixture-2:concept-fixture-2:criteria=1",
             "input_speech_started",
             "session_phase:Listening",
@@ -5835,6 +5980,7 @@ async fn two_turn_live_orchestration_trace_is_stable_across_extraction() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-2",
+            "recap_ready:response-0:concepts=1:moments=1:deferred=1",
             "session_phase:Recap",
         ],
         "{fixture_events:?}"
@@ -5885,8 +6031,6 @@ async fn two_turn_live_orchestration_trace_is_stable_across_extraction() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-1",
-            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
-            "cancellation:response-1",
             "question_started:response-2:q-oxidative-phosphorylation-atp:concept-oxidative-phosphorylation:criteria=2",
             "input_speech_started",
             "session_phase:Listening",
@@ -5902,7 +6046,7 @@ async fn two_turn_live_orchestration_trace_is_stable_across_extraction() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-2",
-            "recap_ready:response-2:concepts=1:moments=2:deferred=0",
+            "recap_ready:response-0:concepts=1:moments=2:deferred=0",
             "session_phase:Recap",
         ],
         "{learning_events:?}"
@@ -6068,8 +6212,9 @@ async fn drain_turn(session: &mut RealtimeSession, input: BrainInput) -> Vec<Bra
 
 #[tokio::test]
 async fn evaluated_deferred_cancel_and_error_projection_trace_is_stable() {
-    // 1. One evaluated outcome, projected from the persisted Plan 04 record.
-    let evaluated = run_fixture_outcome_turn(Arc::new(FixtureOutcomeStore::new(
+    // 1. One evaluated outcome, projected from the persisted Plan 04 record,
+    //    and the session recap the learner's Stop folds out of it.
+    let evaluated = run_fixture_outcome_turn_then_stop(Arc::new(FixtureOutcomeStore::new(
         learning_core_question(),
         learning_core_sources(),
         learning_core_turn_outcome("evaluated_optional_contradiction_is_shaky"),
@@ -6095,7 +6240,8 @@ async fn evaluated_deferred_cancel_and_error_projection_trace_is_stable() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-1",
-            "recap_ready:response-1:concepts=2:moments=3:deferred=0",
+            "recap_ready:response-0:concepts=2:moments=3:deferred=0",
+            "session_phase:Recap",
         ],
         "{evaluated:?}"
     );
@@ -6674,7 +6820,7 @@ async fn primary_fallback_ink_and_sonic_call_trace_is_stable() {
             "session_phase:Feedback",
             "session_phase:Correction",
             "response_completed:response-1",
-            "recap_ready:response-1:concepts=1:moments=1:deferred=0",
+            "recap_ready:response-0:concepts=1:moments=1:deferred=0",
             "session_phase:Recap",
         ],
         "{events:?}"

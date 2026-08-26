@@ -309,9 +309,15 @@ where
                     }
                     BrainInput::Stop => {
                         let _ = cancel_active_runner_response(&mut active_response).await;
-                        if let Some(event) = phases.phase_event_if_legal(StudySessionPhase::Recap) {
-                            let _ = event_tx.send(event).await;
-                        }
+                        runner
+                            .emit_session_recap(
+                                &event_tx,
+                                &executor,
+                                &session,
+                                session_generation_id.as_deref(),
+                                &phases,
+                            )
+                            .await;
                         break;
                     }
                     BrainInput::ToolResult(_)
@@ -797,38 +803,62 @@ where
             return Ok(());
         }
 
-        // A deferred turn gets no graded recap: there is nothing graded to
-        // project.
-        if evaluated {
-            let recap = execute_tool_stage(
-                &job.executor,
-                &job.response_id,
-                ToolProposal::build_session_recap(
-                    &job.session.study_set_id,
-                    &job.session.voice_session_id,
-                ),
-                self.config.recap_stage_timeout,
-                BrainFailureStage::Recap,
-                BrainFailureClass::ToolExecutorFailure,
-                None,
-            )
-            .await
-            .and_then(|result| recap_from_tool_result(&result.result))?;
-            if !send_fake_unless_cancelled(
-                &job.event_tx,
-                BrainEvent::RecapReady {
-                    response_id: job.response_id.to_owned(),
-                    recap,
-                },
-                &job.cancelled,
-            )
-            .await
-            {
-                return Ok(());
-            }
-        }
+        // A turn publishes no recap. A recap is a fold over everything the
+        // session has persisted, so it is built once, when the learner stops,
+        // by `emit_session_recap`. Building one per graded turn published a
+        // count that could not see the turns that had not happened yet, so a
+        // session whose last turn deferred told the learner "Deferred turns: 0".
         job.completed.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The session's single recap, folded over every outcome it persisted.
+    ///
+    /// It is built when the learner stops so its deferral bucket, graded
+    /// concepts, and source moments cover the whole session, and it is bound to
+    /// a session-scope response identity — not to a turn — so a superseded turn
+    /// cannot carry the session's recap down with it. Every value in it is the
+    /// Plan 04 executor's; the adapter authors nothing.
+    async fn emit_session_recap(
+        &self,
+        event_tx: &mpsc::Sender<BrainEvent>,
+        executor: &VivaToolExecutor,
+        session: &AuthorizedStudySession,
+        session_generation_id: Option<&str>,
+        phases: &SessionPhaseTracker,
+    ) {
+        let response_id = response_id_for_turn(0, session_generation_id);
+        let recap = match execute_tool_stage(
+            executor,
+            &response_id,
+            ToolProposal::build_session_recap(&session.study_set_id, &session.voice_session_id),
+            self.config.recap_stage_timeout,
+            BrainFailureStage::Recap,
+            BrainFailureClass::ToolExecutorFailure,
+            None,
+        )
+        .await
+        .and_then(|result| recap_from_tool_result(&result.result))
+        {
+            Ok(recap) => recap,
+            Err(error) => {
+                // A recap the store could not build is a typed failure, not a
+                // phase transition: the learner is not told to look at a recap
+                // that does not exist.
+                emit_provider_failure(event_tx, error).await;
+                return;
+            }
+        };
+        if event_tx
+            .send(BrainEvent::RecapReady { response_id, recap })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if let Some(event) = phases.phase_event_if_legal(StudySessionPhase::Recap) {
+            let _ = event_tx.send(event).await;
+        }
     }
 
     /// The source a persisted outcome cites, re-retrieved through the executor's
@@ -3883,7 +3913,9 @@ pub(crate) mod tests {
             if let BrainEvent::Error(error) = &event {
                 panic!("unexpected provider failure: {error:?}");
             }
-            let finished = matches!(event, BrainEvent::RecapReady { .. });
+            // A turn ends at its own completion. The session recap is published
+            // once, on Stop, so it is not this turn's terminator.
+            let finished = matches!(event, BrainEvent::ResponseCompleted { .. });
             events.push(event);
             if finished {
                 return events;
