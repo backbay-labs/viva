@@ -305,7 +305,12 @@ const styles = StyleSheet.create({
     textTransform: "lowercase",
   },
   promise: {
-    color: colors.inkSecondary,
+    // inkMuted, not inkSecondary: this line sits in `heroCopy`, which has no
+    // background of its own, so it renders straight onto the atmosphere. On the
+    // flat canvas this branch replaced, inkSecondary measured 6.13:1; against
+    // the vellum's darkest excursion it is 3.52:1, under the 4.5:1 bar for
+    // 17dp regular. See MARK_TOKENS in @/theme/tokens.
+    color: colors.inkMuted,
     fontSize: 17,
     lineHeight: 24,
   },
