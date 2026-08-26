@@ -1,7 +1,7 @@
 # Viva Mobile — The Atmosphere Layer
 
 **Date:** 2026-08-25
-**Status:** Ground and aliveness locked by owner. Component system pending (separate design).
+**Status:** Ground and aliveness locked by owner. Build-readiness pass completed 2026-08-25 (§11–§18).
 **Scope:** `apps/mobile` — a cross-cutting living surface beneath every screen.
 **Prototype of record:** `.superpowers/brainstorm/50528-1787697798/content/aliveness.html` (WebGL; ports to SKSL)
 
@@ -239,22 +239,185 @@ Skia-backdrop-blur question — there is no blur pass to pay for.
 
 Each act ships independently and looks better than the last.
 
-## 11. Open questions
+## 11. Contrast under a moving light
+
+A drifting light means **the background luminance under text is a range, not a value.** Every contrast
+check must therefore be run at the light's *darkest* excursion, never against a screenshot.
+
+Composited vellum under content, derived from §4's locked parameters:
+
+| | sRGB |
+| --- | --- |
+| brightest (light tint + readability well) | `#FFF5DD` |
+| darkest (shadow tint × multiply field × occlusion inside a well) | `#C2B7AC` |
+
+Measured against the shipped palette (`apps/mobile/src/theme/tokens.ts`, `packages/tokens`):
+
+| token | @brightest | @darkest | AA 4.5:1 | AA-large 3:1 |
+| --- | --- | --- | --- | --- |
+| `inkStrong` #271A30 | 15.16 | 8.35 | **pass** | pass |
+| `inkMuted` #766B7E | 4.64 | 2.55 | **fail** | fail |
+| `plumVivid` #6E429B | 6.64 | 3.66 | fail | pass |
+| `sageDeep` #667C61 | 4.19 | 2.31 | fail | fail |
+| `ochre` #B77831 | 3.37 | 1.86 | fail | fail |
+| `gold` #BD9A55 | 2.44 | 1.35 | fail | fail |
+| `copper` #B06A3B | 3.89 | 2.15 | fail | fail |
+| `prussian` #3C5A78 | 6.62 | 3.64 | fail | pass |
+
+**Only `inkStrong` is safe.** `inkMuted` — which `VivaText tone="muted"` uses for every caption and
+every piece of museum-label metadata — fails at *both* ends of the range, so this is not a
+consequence of the drift; it was already failing on the flat `#F7F0E7` ground.
+
+### 11.1 Resolution
+
+**Move 1 — text tokens darken.** Scaled toward black until they clear 4.5:1 at the darkest excursion:
+
+| role | ornament value (unchanged) | text-safe value |
+| --- | --- | --- |
+| muted ink | — | `inkMuted` → **#4E4753** |
+| sage | `#667C61` | `sageInk` **#3F4D3C** |
+| ochre | `#B77831` | `ochreInk` **#65421B** |
+| gold | `#BD9A55` | `goldInk` **#574727** |
+| copper | `#B06A3B` | `copperInk` **#6A4023** |
+| prussian | `#3C5A78` | `prussianInk` **#324C65** |
+| plum | `#6E429B` | `plumInk` **#5C3782** |
+
+**Move 2 — accents may not carry body-size text.** Ornament values stay exactly as they are for
+hairlines, keylines, sparks, gauge fills and rules; purely decorative marks are outside WCAG 1.4.11,
+and meaningful UI graphics need 3:1, which the ornament values meet at the brightest but not the
+darkest — so any accent mark that *conveys state* (the gauge fill, the selected keyline) uses the
+`*Ink` value too.
+
+### 11.2 This invalidates part of a locked decision
+
+The grouping lock (component spec §5) specifies `folio acc` with `accent copper`, and folios render at
+caption size — **2.15:1 at the darkest, the worst value in the table.** The design is kept; the token
+is not. Copper folios must use `copperInk #6A4023`. Same for the `ghead` group label.
+
+### 11.3 Guard, not a clamp
+
+Do **not** clamp the shader's output to protect contrast — that would flatten the light to defend a
+palette. Instead the contrast table is a **unit test**: recompute the composite from the uniform
+constants and assert every text token against the darkest excursion. Any future change to `drama`,
+`warmth`, `ao` or a token then fails CI rather than silently shipping unreadable metadata.
+
+## 12. Accessibility beyond contrast
+
+- **The canvas is decorative.** `accessibilityElementsHidden` / `importantForAccessibility="no-hide-descendants"`.
+- **Depth is invisible to assistive tech.** This is the cost of §4's state language: a screen reader
+  gets nothing from a well. Every depth-encoded state must *also* be declared —
+  `accessibilityState={{ selected, disabled, expanded, busy }}` — and this is a hard review gate, not a
+  nicety, because depth is the *only* other carrier.
+- **Depth-not-colour is a genuine win.** The segmented control's selection, the switch, and the
+  correction's proud repair survive every form of colour vision deficiency, because none of them
+  encode state in hue. Worth protecting: never "fix" a depth state by adding colour.
+- **Dynamic Type forces re-measurement.** Surfaces are measured rects; a font-scale change resizes
+  them. Subscribe to `PixelRatio.getFontScale()` changes and re-measure (see component spec §10).
+- **Reduce Motion** — already handled for the orb (`voice-orb.tsx`). Extend to: atmosphere → one static
+  frame chosen for the hour; press-deepen → instant, no spring; skeleton shimmer → static; tilt → off.
+- **Reduce Transparency** — nothing to do, because nothing is transparent. A real dividend of choosing
+  impression over glass: the iOS setting that guts frosted UI has no effect here.
+- **Touch targets** stay at `layout.minTouch` 48 dp. A well may be visually inset from its hit area;
+  the impression is not the target.
+
+## 13. Appearance and dark mode
+
+`app.json` already sets `userInterfaceStyle: "light"` — the app declines OS dark mode. That is
+coherent with this design rather than an oversight: **the clock-bound sun (§6) is the night
+appearance.** At 23:00 the page falls to lamp-warm with plum corners and the orb becomes the brightest
+thing on screen — a lower-luminance, warmer state arrived at by the room rather than by a toggle, and
+better suited to a student in a dark room than an inverted palette.
+
+Two consequences to accept explicitly rather than discover:
+
+1. A user who forces dark mode system-wide still gets vellum. If that turns out to be wrong, the fix
+   is a **night-intensity preference**, not a second palette — a second palette would double every
+   token and every contrast check.
+2. **§11's table is computed for the daylight range only.** The night state has its own, lower
+   luminance range and its own contrast obligations. Recorded as O-11.
+
+## 14. Performance budget
+
+| state | target | note |
+| --- | --- | --- |
+| `ready` / idle | 10–12 fps | slow light does not need frames |
+| tilt active | 30 fps | falls back to 12 after 1.5 s of stillness |
+| session events | 30 fps | correction rake, listening bloom |
+| reduce-motion | 0 fps | one committed frame |
+
+One draw call in every state. Acceptance criteria before Act 2 ships:
+
+- **Frame time ≤ 4 ms** on the oldest supported device at 30 fps with a live session streaming PCM.
+- **No added dropped frames** on the session screen versus the pre-atmosphere baseline, measured with
+  the same harness.
+- **Battery delta ≤ 5%** over a 15-minute session versus baseline.
+
+**Fallback tier.** If Skia fails to initialise, or the device fails the frame-time gate, render a
+pre-baked vellum image plus the vignette and grain — Act 1 without Act 2. This must be a runtime
+decision, not a build flag, and it is also the web path (§16).
+
+## 15. Testing strategy
+
+The architecture was chosen partly for this: **JS owns the light's state and the shader is a pure
+function of its uniforms**, so most of it is testable without rendering.
+
+- **Unit (pure, fast):** the breath envelope's shape and asymmetry; the OU walk staying bounded; tilt
+  damping reaching target within τ; touch attack/release asymmetry; clock → sun position; session
+  state → uniform mapping; the §11.3 contrast table.
+- **Golden frames:** render the shader at fixed uniform values and hash the output. Catches the two
+  bugs this design already produced once each — a length that was viewport-relative, and grain that
+  re-seeded per frame.
+- **On-device harness:** frame time and battery against §14, scripted through the existing
+  `apps/mobile/scripts/e2e-live-loop.mjs` pattern.
+- Existing gates unchanged: `bun run --cwd apps/mobile typecheck | lint | test | build`.
+
+## 16. Web parity — resolves O-3
+
+`expo start --web` is load-bearing for this team's loop, because the iOS 26 simulator's audio stack
+freezes the JS thread. Skia's web build is CanvasKit (WASM, multi-megabyte) and the dev loop needs the
+*layout*, not the atmosphere.
+
+**Decision: web gets the fallback tier (§14).** A pre-baked vellum frame plus vignette and grain, no
+shader, no tilt. Same code path as the low-end device fallback, so it is exercised constantly rather
+than rotting.
+
+## 17. The orb and the atmosphere
+
+§6's session-reactive light requires the orb to bloom into the vellum, which appears to demand that
+both live in one canvas. It does not. **They share state, not a canvas:** the orb stays
+`react-native-svg` (proven; the 2026-08-24 design pass explicitly forbids regressing it — `expo-linear-gradient` ignores `borderRadius` on the New Architecture), and the
+*atmosphere shader* draws the bloom at the orb's measured centre, driven by the same Reanimated shared
+values that drive the orb's own breathing.
+
+Recorded as O-12: whether the orb eventually moves into Skia for a single lighting model is a real
+question, but it is not on the critical path and the SVG orb is the app's most finished object.
+
+## 18. Splash continuity
+
+`expo-splash-screen` is already configured with `backgroundColor: "#F7F0E7"`, which is the vellum's
+base value — so the handoff can be seamless. **Requirement:** hold the splash until the first
+atmosphere frame is committed, not merely until fonts load (`_layout.tsx` currently hides on
+`fontsLoaded`). Otherwise the app flashes flat canvas before the light arrives, which is precisely the
+"dead paper" impression this work exists to remove.
+
+## 19. Open questions
 
 - **O-1 — Material at scale.** `material 1.65` was dialled at ~328 px preview width. On a 402 pt phone
   at true size, texture behind the Cormorant headline may fight the type. Mitigation is to let the
   readability well eat more material directly under copy; needs a device check before it is settled.
 - **O-2 — Which screens.** Recommend all four (home, session, recap, library) with per-screen
   intensity, so the app is one place. Not yet confirmed.
-- **O-3 — Web parity.** `expo start --web` is load-bearing for this team's test loop (the iOS 26
-  simulator's audio stack freezes the JS thread). Skia's web build is CanvasKit/WASM and heavy;
-  need a decision on whether the atmosphere degrades to a static frame on web.
+- ~~**O-3 — Web parity.**~~ **Resolved in §16:** web gets the fallback tier.
 - **O-4 — Battery.** Unmeasured on a real device during a live voice session. §7's frame budget is a
   design intent, not a measurement.
 - **O-5 — Palimpsest source text.** Whether the ghost hand is authored artwork or rendered from the
   user's actual study set. The FSRS coupling in §6 implies at least partly the latter.
+- **O-11 — Night-state contrast.** §11's table covers the daylight range only. The clock-bound night
+  state has its own luminance range and must be measured before it ships.
+- **O-12 — Orb rendering.** SVG orb with shader-drawn bloom (§17) is the decision for now; whether the
+  orb eventually moves into Skia for one lighting model is deferred.
 
-## 12. Provenance
+## 20. Provenance
 
 Ground and aliveness parameters were dialled by the owner against a live WebGL prototype rather than
 chosen from description. The prototype's JS state machine is the intended shape of the RN

@@ -1,7 +1,7 @@
 # Viva Mobile — The Impression Component System
 
 **Date:** 2026-08-25
-**Status:** Treatment, depth semantics and grouping locked by owner. Type and global accent open.
+**Status:** Treatment, depth semantics and grouping locked. Build-readiness pass completed 2026-08-25 (§7–§16).
 **Companion:** `docs/superpowers/specs/2026-08-25-mobile-atmosphere-design.md` (the ground this sits on)
 **Prototypes of record:** `.superpowers/brainstorm/50528-1787697798/content/{system,grouping}.html`
 
@@ -92,7 +92,7 @@ boundary well · wash 4 · margin num · rows dots · folio acc · accent copper
 - **margin `num`** — hanging numerals in the margin
 - **rows `dots`** — dot leaders carrying the eye to the folio
 - **folio `acc`** — page/interval references in the accent
-- **accent `copper`** (`#B06A3B`) — see §7
+- **accent `copper`** (`#B06A3B`) — but see §7's accent roles and §15's O-8; the *text* value must be `copperInk` #6A4023, not `copper` (atmosphere spec §11.2)
 
 The numerals are not decoration. **They can be referenced inline from the correction text** — "the
 gradient **stores** the energy.¹" — which turns grouping into a function instead of a container. That
@@ -117,7 +117,151 @@ Primitives, all consuming a shared surface-token layer:
 Complex, already designed in the prototype: segmented control, switch, mastery gauge, progress dots,
 status banner, empty state, skeleton, correction/marginalia block, disclosure, bottom sheet.
 
-## 7. Open questions
+## 7. The surface token layer
+
+Every primitive in §6 consumes these; nothing hard-codes a depth.
+
+```ts
+// depth — the state language of §4, in bite-multiplier units
+depth = {
+  flush:   0,      // inert
+  chip:    0.7,    // small pressed
+  card:    1.0,
+  button:  1.0,
+  input:   1.25,   // deepest at rest: a field should feel like a slot
+  tray:    1.45,
+  track:   1.6,
+  gauge:   1.7,    // a channel, not a surface
+  raised: -1.0,    // selected / primary / the repair
+  pressDelta: 0.9, // added, sign-following, while held
+}
+
+keyline = { none: 0, normal: 1.0, strong: 2.2, accent: 2.6 }
+radius  = { surface: 7, pill: 999 }   // 7 is locked; pill is the primary CTA only
+```
+
+**Accent roles** — this is where §15's O-8 gets resolved once, rather than per component:
+
+| role | job | value |
+| --- | --- | --- |
+| structural | keylines, rules, hairlines, the spark | `gold` #BD9A55 |
+| grouping | group labels, folios, leaders (§5) | `copperInk` #6A4023 |
+| rubrication | correction and repair only | *pending O-8* |
+
+Ornament values and `*Ink` text values are distinct tokens, per atmosphere spec §11. **A component
+never picks a hex; it picks a role.**
+
+## 8. Motion
+
+| event | change | timing |
+| --- | --- | --- |
+| press in | depth `+pressDelta` | spring λ≈14 (~180 ms to 95%) |
+| press out | depth → rest | λ≈2.6 (~700 ms), deliberately slower than the attack |
+| segmented select | old `pressed` → new `raised` | 220 ms, both simultaneously |
+| switch | knob translate + track depth | 180 ms ease-out |
+| disclosure open | same well, depth `1.0 → 1.35` + height | 240 ms |
+| sheet present | second leaf slides up, page beneath dims 8% | 320 ms, existing `fade_from_bottom` curve |
+| gauge fill | width | 600 ms ease-out, once, on data change only |
+| skeleton | shimmer sweep | 1.6 s linear, static under reduce-motion |
+
+Press-out is slower than press-in on purpose: a real impression relaxes, it does not snap.
+
+## 9. The modal exception to the plane law
+
+"Nothing floats above the page" is a rule about **chrome**, and a modal is not chrome — it is a
+different page. The existing `fade_from_bottom` stack already replaces rather than hovers, so screens
+need no exception.
+
+The bottom sheet is the one hard case, and a floating panel would break the law outright.
+**Resolution: the sheet is a second leaf of vellum slid over the first.** It carries its own ground
+(same material, its own light sample) and the page beneath dims ~8%. Two leaves of the same substance,
+never glass over paper. This also means the sheet's own surfaces nest correctly under §4's alternation
+rule, because it starts a fresh depth level at the page plane.
+
+## 10. Rects under scroll, and the budget
+
+**Never re-measure per frame.** Measure on layout, keep rects in a Reanimated shared value, and
+subtract the scroll offset inside `useAnimatedScrollHandler` before the uniforms are written — the
+whole point of JS owning the light state is that scrolling costs a subtraction, not a layout pass.
+
+Re-measure on exactly these: `onLayout`, font-scale change (§11), rotation, list data change, and
+disclosure open/close.
+
+**Budget policy (resolves O-9).** 24 uniform slots ≈ one screen. Only surfaces intersecting the
+viewport (plus one screen of margin) occupy a slot; slots are recycled by index in scroll order. A
+list long enough to exceed 24 visible surfaces must virtualize — which the four screens do not
+currently do (`ScrollView`, 14 usages), so **`library.tsx` and `recap.tsx` need a slot audit before
+Act 1 ships**. If a screen genuinely exceeds the budget, the overflow surfaces degrade to a hairline
+border rather than disappearing.
+
+## 11. Dynamic Type
+
+`VivaText` already sets `maxFontSizeMultiplier` (1.45 display / 1.8 otherwise). Because surfaces are
+measured, a font-scale change is a **layout event, not a style event** — it must trigger
+re-measurement or the wells will sit behind text that has outgrown them. At 1.8× the two-column rows
+in §5 (title + folio) will wrap; the folio moves below the title rather than compressing.
+
+## 12. Haptics must agree with depth
+
+`ActionButton` currently fires `Haptics.impactAsync` inside `onPress` — which is **release**. The
+visual deepening happens at **press-in**. As written, the tap you feel and the dent you see are
+different events, roughly 100–300 ms apart.
+
+**Fix: move the haptic to `onPressIn`,** so the impact coincides with the well deepening. Keep the
+existing tone mapping (Medium for primary, Light otherwise). This is a two-line change and it is the
+difference between a system that feels physical and one that feels merely animated.
+
+## 13. Icons are inked, not impressed
+
+`SparkIcon` and `ArrowUpRightIcon` stay `react-native-svg` and are drawn *on* the page in ink or
+accent. **An icon is a mark, not a surface** — impressing it would put it in the same category as a
+container and dilute the state language, where depth means interactive. Marks have no depth.
+
+## 14. Content edge cases
+
+- A well **grows with its content and never scrolls internally.** Internal scroll would put a moving
+  surface inside a fixed impression, which is incoherent.
+- Long concept titles wrap to two lines maximum, then truncate with a tail ellipsis; the folio never
+  truncates.
+- Missing folio renders an em dash in the same slot, so the dot leader still terminates.
+- Zero rows: the group renders its heading and an empty-state line *inside* the well — the well does
+  not collapse, because a group that vanishes reads as a bug.
+- The repair block has no length cap; it is the one element allowed to be as long as it needs.
+
+## 15. Testing
+
+- **Unit:** depth resolution per state (`selected`, `disabled`, `pressed`, `expanded`); the rect
+  measurement → p-space transform; slot recycling; budget overflow degradation.
+- **Golden frames:** each primitive at each state, at 1× and 1.8× font scale.
+- **Accessibility assertions:** every depth-encoded state also sets the matching `accessibilityState`
+  (atmosphere spec §12) — assertable in the existing `bun test` suite.
+- **Contrast:** the atmosphere spec §11.3 table test covers the tokens these components consume.
+
+## 16. Build readiness
+
+**Decided and buildable now:** the treatment and its five parameters; the plane law; the depth state
+language and its nesting alternation; the grouping configuration; the surface token layer (§7); motion
+(§8); the sheet resolution (§9); scroll and budget policy (§10); haptics (§12); icons (§13).
+
+**Blocking a first commit — small, and mine to do:**
+- Apply the `*Ink` token split from atmosphere spec §11 to `theme/tokens.ts` and `packages/tokens`.
+- Swap the locked `folio acc` to `copperInk` (§11.2 of the atmosphere spec).
+- Move the haptic to `onPressIn`.
+
+**Blocking, and needs the owner:**
+- **O-7 type pairing** — cannot be judged off-device. Proposal: build Act 1 on Cormorant unchanged;
+  the pairing is a token swap afterwards, so it is not on the critical path.
+- **O-8 global accent** — needed before the correction screen, not before Act 1.
+- **O-6 one grouping device or two** — needed before `library.tsx` and `recap.tsx`, not before home.
+
+**Blocking, and needs a device:** the atmosphere spec's §14 acceptance criteria, and G-1 (the physical
+iPhone gate carried over from Stage 0) — tilt is the largest aliveness lever and *cannot* be validated
+in a simulator.
+
+None of these block **Act 1** (surface, vignette, grain, on every screen), which is the point of the
+staging: it can start immediately.
+
+## 17. Open questions
 
 - **O-7 — Type pairing.** Six pairings built (Cormorant/EB Garamond/Spectral/Newsreader/Fraunces/
   Crimson Pro). Undecided, and **cannot be settled at desktop preview scale** — Cormorant's thinness
@@ -131,12 +275,12 @@ status banner, empty state, skeleton, correction/marginalia block, disclosure, b
   brass is structure and a second colour is rubrication — reserved for correction and repair.
   **The Prussian preference was formed under uneven light** (it was the rightmost, dimmest, coolest
   cell) and should be re-confirmed before it is treated as decided.
-- **O-9 — Rect budget.** Surfaces are measured rects passed as shader uniforms. 24 slots is roughly
+- ~~**O-9 — Rect budget.**~~ **Resolved in §10.** Original note: surfaces are measured rects passed as shader uniforms. 24 slots is roughly
   one screen. Needs a real per-screen count, and a policy for what happens when a long list exceeds it.
 - **O-10 — Layout measurement cost.** Surfaces stop being styled RN Views; they require a measurement
   pass to hand rects to the shader. Cost unmeasured on device, and it interacts with scrolling.
 
-## 8. Implementation notes earned the hard way
+## 18. Implementation notes earned the hard way
 
 - **Every length in the shader is in dp, never a fraction of the viewport.** Edge softness, height
   amplitude and the normal's sample epsilon were all viewport-relative; moving from a 252 pt phone to
