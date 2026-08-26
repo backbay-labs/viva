@@ -18,7 +18,16 @@ export const WELL = {
   peakOpacity: 0.13,
 } as const;
 
-/** A cool sink at the extreme edge, so the page reads as embedded. */
+/**
+ * A cool sink at the extreme edge, so the page reads as embedded.
+ *
+ * **Layout rule: only `colors.inkStrong` may carry body-size text inside this
+ * band.** At the corners both tiers clamp to the full `edgeOpacity`, which puts
+ * the ground at `VELLUM_VIGNETTED` (#AA9E99) — dark enough that every other text
+ * token lands between 3:1 and 4.5:1 there. Keep other tokens clear of the band,
+ * or make the text large (>=24dp, or >=18.7dp bold), where 3:1 is the bar.
+ * `src/theme/contrast.test.ts` pins this rule so it cannot rot.
+ */
 export const VIGNETTE = {
   cx: 0.5,
   cy: 0.5,

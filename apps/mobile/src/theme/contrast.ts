@@ -14,6 +14,18 @@ export type Rgb = readonly [number, number, number];
 export const VELLUM_BRIGHTEST = "#FFF5DD";
 /** Shadow tint x multiply field x occlusion inside a well. The binding case. */
 export const VELLUM_DARKEST = "#C2B7AC";
+/**
+ * The worst case *inside the vignette band*, where the SVG vignette composites
+ * its full `edgeOpacity` of #2B1D34 over the plate floor. Both tiers clamp here
+ * at the corners: a corner sits at objectBoundingBox distance 0.707, past the
+ * last gradient stop, so `r`/`rx`/`ry` cannot lighten it on either platform.
+ *
+ * Derived, not sampled — it is VELLUM_DARKEST composited at edgeOpacity 0.16,
+ * and ./contrast.test.ts pins that arithmetic so the constant cannot go stale.
+ * Only inkStrong clears 4.5:1 against it; everything else needs to stay out of
+ * the band or be large text.
+ */
+export const VELLUM_VIGNETTED = "#AA9E99";
 
 export const AA_BODY = 4.5;
 export const AA_LARGE = 3;
