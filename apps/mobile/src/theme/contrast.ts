@@ -10,7 +10,15 @@
  */
 export type Rgb = readonly [number, number, number];
 
-/** Light tint + readability well, the most light content ever sits in. */
+/**
+ * A representative bright excursion, reported to show the span.
+ *
+ * Not a ceiling: decoding the committed plate puts 2.94% of it already brighter
+ * than this before the readability well adds anything, and its brightest pixel
+ * is #FFFFE6. Nothing binding is asserted against this constant — the floor is
+ * what every check runs at — so it stays as a companion to VELLUM_DARKEST
+ * rather than as a claim about the light.
+ */
 export const VELLUM_BRIGHTEST = "#FFF5DD";
 /** Shadow tint x multiply field x occlusion inside a well. The binding case. */
 export const VELLUM_DARKEST = "#C2B7AC";

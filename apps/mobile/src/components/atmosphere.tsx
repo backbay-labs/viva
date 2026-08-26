@@ -67,7 +67,7 @@ export function VivaAtmosphere() {
               <Stop
                 key={stop.offset}
                 offset={stop.offset}
-                stopColor="#FFFDFA"
+                stopColor={WELL.color}
                 stopOpacity={stop.opacity}
               />
             ))}
@@ -80,8 +80,8 @@ export function VivaAtmosphere() {
             rx={`${VIGNETTE.rx * 100}%`}
             ry={`${VIGNETTE.ry * 100}%`}
           >
-            <Stop offset={VIGNETTE.innerStop} stopColor="#2B1D34" stopOpacity={0} />
-            <Stop offset={1} stopColor="#2B1D34" stopOpacity={VIGNETTE.edgeOpacity} />
+            <Stop offset={VIGNETTE.innerStop} stopColor={VIGNETTE.color} stopOpacity={0} />
+            <Stop offset={1} stopColor={VIGNETTE.color} stopOpacity={VIGNETTE.edgeOpacity} />
           </RadialGradient>
         </Defs>
         <Rect fill={`url(#${gradientId}Well)`} height="100%" width="100%" />

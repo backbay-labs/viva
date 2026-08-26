@@ -72,6 +72,14 @@ describe("locked geometry", () => {
     expect(VIGNETTE.rx).toBe(0.74);
     expect(VIGNETTE.ry).toBe(0.64);
   });
+
+  test("both stop colours live here, so the component and the contrast suite agree", () => {
+    // They used to be literals inside atmosphere.tsx, with contrast.test.ts
+    // restating the vignette's independently. Changing the component's copy
+    // moved the ground and left VELLUM_VIGNETTED stale with a green suite.
+    expect(WELL.color).toBe("#FFFDFA");
+    expect(VIGNETTE.color).toBe("#2B1D34");
+  });
 });
 
 describe("meanRadius", () => {

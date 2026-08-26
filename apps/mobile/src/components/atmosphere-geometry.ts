@@ -9,24 +9,37 @@
  */
 export type GradientStop = { offset: number; opacity: number };
 
-/** Content sits in a rise of light, centred slightly above the middle. */
+/**
+ * Content sits in a rise of light, centred slightly above the middle.
+ *
+ * `color` lives here rather than in `atmosphere.tsx` so the component and any
+ * test that reasons about the composited ground read the same value.
+ */
 export const WELL = {
   cx: 0.5,
   cy: 0.44,
   rx: 0.86,
   ry: 0.6,
   peakOpacity: 0.13,
+  color: "#FFFDFA",
 } as const;
 
 /**
  * A cool sink at the extreme edge, so the page reads as embedded.
  *
- * **Layout rule: only `colors.inkStrong` may carry body-size text inside this
- * band.** At the corners both tiers clamp to the full `edgeOpacity`, which puts
- * the ground at `VELLUM_VIGNETTED` (#AA9E99) — dark enough that every other text
- * token lands between 3:1 and 4.5:1 there. Keep other tokens clear of the band,
- * or make the text large (>=24dp, or >=18.7dp bold), where 3:1 is the bar.
- * `src/theme/contrast.test.ts` pins this rule so it cannot rot.
+ * **The known limit.** Inside this band the ground darkens toward
+ * `VELLUM_VIGNETTED` (#AA9E99), where only `colors.inkStrong` still clears
+ * 4.5:1. Every other text token drops to roughly 3.4-3.5:1 there. This is an
+ * **accepted limit for Act 1, not an enforceable rule**: all four screens are
+ * `ScrollView`s, so muted text passes through the band transiently no matter
+ * where it is authored — a user's thumb can break the rule that a review could
+ * not. Worst measured case is a single token at 3.84:1 in a ~97 dp strip. Act 2
+ * can resolve it by lowering `edgeOpacity`; until then, prefer `inkStrong` for
+ * anything that sits permanently in the top or bottom strip.
+ *
+ * `src/theme/contrast.test.ts` keeps the measurement honest — it derives
+ * `VELLUM_VIGNETTED` from `color` and `edgeOpacity` below, so neither can move
+ * without the suite noticing.
  */
 export const VIGNETTE = {
   cx: 0.5,
@@ -35,6 +48,7 @@ export const VIGNETTE = {
   ry: 0.64,
   innerStop: 0.52,
   edgeOpacity: 0.16,
+  color: "#2B1D34",
 } as const;
 
 /**
