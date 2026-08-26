@@ -39,8 +39,8 @@ pub use tts::{parse_sonic_event, sonic_generation_request, SonicConfig, SonicEve
 
 pub(crate) use projection::{
     answer_evaluation_from_outcome, emit_provider_failure, learning_event_projection,
-    outcome_contract_failure, parse_persisted_turn_outcome, recap_from_tool_result,
-    send_fake_unless_cancelled, SessionPhaseTracker,
+    outcome_contract_failure, outcome_contract_parts, parse_persisted_turn_outcome,
+    recap_from_tool_result, send_fake_unless_cancelled, SessionPhaseTracker,
 };
 
 use crate::synthetic::fixture_response_text;
@@ -95,6 +95,98 @@ pub(crate) fn failure_with_latency(error: BrainError, latency: Duration) -> Brai
 
 pub(crate) fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+// ---------------------------------------------------------------------------
+// `A-20.1` (`ADAPTER-06` follow-up): one kind-preserving executor/store
+// classification, shared by every adapter seam that maps one.
+//
+// `PortErrorKind` is the store-side half of Plan 06's classification boundary,
+// and an adapter that drops it reports the wrong incident: a durable-store
+// outage read by an operator as `tool_executor_failure` points at the tool
+// surface instead of the database. Preserving it is only half the rule, though.
+// The vocabulary draws no distinction for the remaining kinds, so answering
+// with a class for them anyway would be the adapter guessing — those return
+// `None` and the seam's own class stands.
+// ---------------------------------------------------------------------------
+
+/// What a typed store failure implies: the class, the stage it belongs to, and
+/// whether that class is worth retrying.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortFailureClassification {
+    pub(crate) failure_class: BrainFailureClass,
+    pub(crate) stage: BrainFailureStage,
+    pub(crate) retry_eligible: bool,
+}
+
+/// The one place a store failure's `PortErrorKind` selects a failure class.
+///
+/// The match is exhaustive on purpose: a kind added to the port vocabulary
+/// cannot compile until someone decides whether the failure vocabulary has a
+/// class for it.
+pub(crate) fn port_error_classification(
+    error: &agent_domain::PortError,
+) -> Option<PortFailureClassification> {
+    match error.kind() {
+        agent_domain::PortErrorKind::Durability => Some(PortFailureClassification {
+            failure_class: BrainFailureClass::DurabilityDegraded,
+            stage: BrainFailureStage::Store,
+            retry_eligible: true,
+        }),
+        agent_domain::PortErrorKind::Unavailable
+        | agent_domain::PortErrorKind::InvalidInput
+        | agent_domain::PortErrorKind::Conflict
+        | agent_domain::PortErrorKind::Internal => None,
+    }
+}
+
+/// The same rule for an executor failure, whose only classified source is the
+/// port error it wraps. Nothing here reads a message to decide.
+pub(crate) fn tool_execution_classification(
+    error: &agent_domain::ToolExecutionError,
+) -> Option<PortFailureClassification> {
+    match error {
+        agent_domain::ToolExecutionError::Store(port_error) => {
+            port_error_classification(port_error)
+        }
+        agent_domain::ToolExecutionError::InvalidArguments(_)
+        | agent_domain::ToolExecutionError::Unavailable(_)
+        | agent_domain::ToolExecutionError::ReviewSchedule(_)
+        | agent_domain::ToolExecutionError::RecapEvidence(_) => None,
+    }
+}
+
+/// Fold a store failure's own classification into the parts a seam prepared.
+///
+/// A classified kind replaces the class, stage, and retry policy the seam would
+/// otherwise have chosen; an unclassified kind leaves the seam's own choice
+/// untouched. Every adapter seam that maps an executor or port error goes
+/// through here, so no seam can claim a durable-store outage the store never
+/// reported — or hide one it did.
+pub(crate) fn classified_failure(
+    classification: Option<PortFailureClassification>,
+    parts: BrainProviderFailureParts,
+) -> BrainError {
+    let Some(classification) = classification else {
+        return brain_failure(parts);
+    };
+    brain_failure(BrainProviderFailureParts {
+        failure_class: classification.failure_class,
+        stage: classification.stage,
+        retry_eligible: classification.retry_eligible,
+        ..parts
+    })
+}
+
+/// One executor failure at the shared tool-contract seam.
+pub(crate) fn executor_stage_failure(
+    error: &agent_domain::ToolExecutionError,
+    error_kind: &'static str,
+) -> BrainError {
+    classified_failure(
+        tool_execution_classification(error),
+        outcome_contract_parts(error_kind),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +488,11 @@ pub(crate) fn websocket_close_code(frame: Option<&CloseFrame>) -> Option<u16> {
 /// question rather than reusing a cached one the cursor may already have moved
 /// past. An exhausted session carries no question and is never filled in with a
 /// fixture one.
+///
+/// `A-20.1`: the progression read is a store read, so a refusal keeps the class
+/// its own `PortErrorKind` selects. Discarding the executor error here reported
+/// a durable-store outage as `tool_executor_failure` and sent the operator to
+/// the wrong system.
 pub(crate) async fn select_session_question(
     executor: &VivaToolExecutor,
     study_set_id: &str,
@@ -408,7 +505,7 @@ pub(crate) async fn select_session_question(
             ToolProposal::select_next_question(study_set_id, voice_session_id, VIVA_STUDY_MODE),
         )
         .await
-        .map_err(|_| outcome_contract_failure("select_next_question_failed"))?;
+        .map_err(|error| executor_stage_failure(&error, "select_next_question_failed"))?;
     let progression: QuestionProgressionResult =
         serde_json::from_value(result.result["progression"].clone())
             .map_err(|_| outcome_contract_failure("question_progression_malformed"))?;
@@ -840,7 +937,7 @@ impl FakeCartesiaGeminiRuntime {
                         break;
                     }
                 };
-                if executor
+                if let Err(error) = executor
                     .record_answer_attempt_envelope(answer_attempt_envelope(
                         &session,
                         &question,
@@ -849,11 +946,10 @@ impl FakeCartesiaGeminiRuntime {
                         &runner_input,
                     ))
                     .await
-                    .is_err()
                 {
                     emit_provider_failure(
                         &event_tx,
-                        outcome_contract_failure("answer_attempt_envelope_failed"),
+                        executor_stage_failure(&error, "answer_attempt_envelope_failed"),
                     )
                     .await;
                     break;

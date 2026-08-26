@@ -42,10 +42,11 @@ use super::tts::SpeechFrameSink;
 use super::{fake_transport_failure, fixture_gemini_stream};
 
 use super::{
-    answer_evaluation_from_outcome, brain_failure, duration_ms, emit_provider_failure,
-    failure_with_latency, fake_interrupt_gemini_stream, gemini_request, learning_event_projection,
-    parse_persisted_turn_outcome, recap_from_tool_result, select_session_question,
-    send_fake_unless_cancelled, CartesiaGeminiConfig, FakeCartesiaGeminiTransports,
+    answer_evaluation_from_outcome, brain_failure, classified_failure, duration_ms,
+    emit_provider_failure, failure_with_latency, fake_interrupt_gemini_stream, gemini_request,
+    learning_event_projection, parse_persisted_turn_outcome, port_error_classification,
+    recap_from_tool_result, select_session_question, send_fake_unless_cancelled,
+    tool_execution_classification, CartesiaGeminiConfig, FakeCartesiaGeminiTransports,
     FakeRuntimeInterrupt, FakeRuntimeReport, GeminiConfig, GeminiStreamEvent, SessionPhaseTracker,
     MAX_GEMINI_EXECUTED_TOOL_STAGES, MAX_GEMINI_TOOL_LOOP_PASSES,
 };
@@ -212,14 +213,20 @@ where
                 "error_kind=missing_study_store",
             )
         })?;
+        // `A-20.1`: the store's own `PortErrorKind` picks the class. A refusal
+        // that never claimed to be a durability fault must not be reported as
+        // one just because it happened at a store call.
         let _ = store
             .record_voice_session(&session_config)
             .await
-            .map_err(|_| {
-                runner_failure(
-                    BrainFailureClass::DurabilityDegraded,
-                    BrainFailureStage::Store,
-                    "error_kind=voice_session_write_failed",
+            .map_err(|error| {
+                classified_failure(
+                    port_error_classification(&error),
+                    runner_failure_parts(
+                        BrainFailureClass::ToolExecutorFailure,
+                        BrainFailureStage::Store,
+                        "error_kind=voice_session_write_failed",
+                    ),
                 )
             })?;
 
@@ -419,11 +426,14 @@ where
                 &input,
             ))
             .await
-            .map_err(|_| {
-                runner_failure(
-                    BrainFailureClass::DurabilityDegraded,
-                    BrainFailureStage::Store,
-                    "error_kind=answer_attempt_envelope_failed",
+            .map_err(|error| {
+                classified_failure(
+                    tool_execution_classification(&error),
+                    runner_failure_parts(
+                        BrainFailureClass::ToolExecutorFailure,
+                        BrainFailureStage::Store,
+                        "error_kind=answer_attempt_envelope_failed",
+                    ),
                 )
             })?;
         // The one-shot fixture replay has no session loop to cancel it.
@@ -1282,12 +1292,12 @@ fn missing_turn_outcome_failure() -> BrainError {
     })
 }
 
-fn runner_failure(
+fn runner_failure_parts(
     failure_class: BrainFailureClass,
     stage: BrainFailureStage,
     metadata: &'static str,
-) -> BrainError {
-    brain_failure(BrainProviderFailureParts {
+) -> BrainProviderFailureParts {
+    BrainProviderFailureParts {
         failure_class,
         stage,
         retry_eligible: true,
@@ -1295,7 +1305,15 @@ fn runner_failure(
         provider: "server".to_owned(),
         model: "viva-tools".to_owned(),
         metadata: metadata.to_owned(),
-    })
+    }
+}
+
+fn runner_failure(
+    failure_class: BrainFailureClass,
+    stage: BrainFailureStage,
+    metadata: &'static str,
+) -> BrainError {
+    brain_failure(runner_failure_parts(failure_class, stage, metadata))
 }
 
 struct GeminiToolLoopJob<'a> {
@@ -1386,8 +1404,8 @@ pub(crate) fn tool_stage_error(
 
 /// Classify one executor failure from its typed variant.
 ///
-/// `PortErrorKind` is the store-side half of the boundary: a durability kind is
-/// a durability-degraded failure at the store stage, and nothing here reads a
+/// The store-side half of the boundary is the shared `A-20.1` classifier: a
+/// kind Plan 06 publishes a class for keeps it, and nothing here reads a
 /// message to decide.
 fn tool_execution_stage_error(
     tool_name: &str,
@@ -1397,17 +1415,15 @@ fn tool_execution_stage_error(
     error: &ToolExecutionError,
     gemini_model: Option<&str>,
 ) -> BrainError {
-    if let ToolExecutionError::Store(port_error) = error {
-        if port_error.is_durability() {
-            return tool_stage_error(
-                tool_name,
-                BrainFailureClass::DurabilityDegraded,
-                BrainFailureStage::Store,
-                true,
-                latency,
-                "durability_degraded",
-            );
-        }
+    if let Some(classification) = tool_execution_classification(error) {
+        return tool_stage_error(
+            tool_name,
+            classification.failure_class,
+            classification.stage,
+            classification.retry_eligible,
+            latency,
+            classification.failure_class.as_str(),
+        );
     }
     if let (Some(model), true) = (gemini_model, gemini_controlled_tool_error(error)) {
         return gemini_tool_stage_error(

@@ -99,8 +99,13 @@ fn phase_machine_failure() -> BrainError {
     })
 }
 
-pub(crate) fn outcome_contract_failure(error_kind: &'static str) -> BrainError {
-    brain_failure(BrainProviderFailureParts {
+/// The unclassified tool-contract failure, as parts.
+///
+/// Seams that hold a typed store error hand these to
+/// [`super::classified_failure`] so a `PortErrorKind` that Plan 06 publishes a
+/// class for overrides the class, stage, and retry policy chosen here.
+pub(crate) fn outcome_contract_parts(error_kind: &'static str) -> BrainProviderFailureParts {
+    BrainProviderFailureParts {
         failure_class: BrainFailureClass::ToolExecutorFailure,
         stage: BrainFailureStage::Tools,
         retry_eligible: false,
@@ -108,7 +113,11 @@ pub(crate) fn outcome_contract_failure(error_kind: &'static str) -> BrainError {
         provider: "server".to_owned(),
         model: "viva-tools".to_owned(),
         metadata: format!("error_kind={error_kind}"),
-    })
+    }
+}
+
+pub(crate) fn outcome_contract_failure(error_kind: &'static str) -> BrainError {
+    brain_failure(outcome_contract_parts(error_kind))
 }
 
 /// Deserialize the Plan 04 executor's `evaluate_spoken_answer` payload.
