@@ -666,6 +666,68 @@ describe("MuseGlyphCanvas effects policy integration", () => {
       expect(browser.vivaEffectsListenerCount()).toBe(0);
     }
   });
+
+  /**
+   * Regression: `MuseGlyphCanvas` used to build its density sampler from a
+   * second, independently-fetched `new Image()` pointed at the exact same
+   * `/viva-muse.webp` URL `MuseBackdrop`'s own `<picture>`/`<img>` already
+   * requests. Real Chromium's CDP `Network` trace showed this as two
+   * genuinely separate transfers that raced each other (`scripts/
+   * frontend-performance.mjs`'s Muse-WebP-transfer budget occasionally
+   * observed exactly 2x the real asset's byte size). The fix reuses the
+   * sibling `.viva-muse__img` DOM node `MuseBackdrop` renders instead of
+   * constructing a second `Image` — asserted here by spying on the global
+   * `Image` constructor, which no test-environment network mocking can
+   * substitute for (happy-dom never performs a real fetch either way, so
+   * this is the one signal that distinguishes "reused the existing element"
+   * from "quietly constructed a second one").
+   */
+  test("samples the sibling MuseBackdrop <img> instead of independently constructing a second Image (regression: real duplicate /viva-muse.webp network fetch)", () => {
+    fakeMuseGlyphBrowser();
+    const RealImage = globalThis.Image;
+    let imageConstructions = 0;
+    overrideGlobal(
+      "Image",
+      class SpyImage extends RealImage {
+        constructor(...args: ConstructorParameters<typeof RealImage>) {
+          super(...args);
+          imageConstructions += 1;
+        }
+      },
+    );
+
+    const container = document.createElement("section");
+    container.className = "viva-hero";
+    const museImg = document.createElement("img");
+    museImg.className = "viva-muse__img";
+    container.append(museImg);
+    document.body.append(container);
+
+    let root: Root | null = null;
+    act(() => {
+      root = createRoot(container);
+      root.render(createElement(MuseGlyphCanvas, {}));
+    });
+    try {
+      expect(container.querySelector(".viva-glyphs")).not.toBeNull();
+      expect(imageConstructions).toBe(0);
+
+      // The sampler must also actually wire up to that sibling element (not
+      // just avoid constructing a redundant one) — dispatching its `load`
+      // event must not throw, proving `MuseGlyphCanvas` attached a real
+      // listener to it rather than silently doing nothing.
+      expect(() => {
+        act(() => {
+          museImg.dispatchEvent(new Event("load"));
+        });
+      }).not.toThrow();
+    } finally {
+      act(() => {
+        root?.unmount();
+      });
+      container.remove();
+    }
+  });
 });
 
 describe("VisualEffectsControl", () => {

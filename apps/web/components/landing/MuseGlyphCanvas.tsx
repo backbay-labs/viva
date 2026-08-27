@@ -260,6 +260,7 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     let animating = false;
     let sampler: { data: Uint8ClampedArray; w: number; h: number } | null = null;
     let samplerReady = false;
+    let museImg: HTMLImageElement | null = null;
 
     const reduceMotionMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
     const reduceTransparencyMQ = window.matchMedia("(prefers-reduced-transparency: reduce)");
@@ -293,20 +294,42 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     let policy = resolvePolicy();
     setEffectsPolicy(policy);
 
-    // --- muse density map (offscreen, same-origin so getImageData is allowed) ---
-    const img = new Image();
-    img.decoding = "async";
+    // --- muse density map (sampled from MuseBackdrop's own <img>, same-origin
+    // so getImageData is allowed) ---
+    //
+    // This used to build the map from a second, independently-constructed
+    // `new Image()` pointed at the identical `/viva-muse.webp` URL
+    // `MuseBackdrop`'s own `<picture>`/`<img>` already requests. Both
+    // components mount together (`LandingHero`/`LiveSessionShell` render
+    // `<MuseBackdrop /><MuseGlyphCanvas .../>` as siblings), so relying on
+    // the browser's HTTP cache to fold the two requests into one was a real
+    // race, not a safe assumption: a real Chromium CDP `Network` trace
+    // showed two genuinely separate transfers of the same asset when the
+    // second request raced the first before either completed
+    // (`scripts/frontend-performance.mjs`'s Muse-WebP-transfer budget
+    // occasionally observed exactly 2x the real asset's byte size).
+    //
+    // Reusing the sibling `.viva-muse__img` DOM node instead of fetching
+    // independently makes this deterministic (exactly one request, ever)
+    // and also means `MuseBackdrop`'s own WebP-decode-failure recovery
+    // (removing the failed `<source>` so the `<img>` loads the PNG
+    // fallback) is the *only* fallback decision point — this sampler simply
+    // reads whatever that element ends up displaying, rather than racing an
+    // independent, potentially-disagreeing fallback of its own.
+    function findMuseImg(): HTMLImageElement | null {
+      return hero?.querySelector<HTMLImageElement>(".viva-muse__img") ?? null;
+    }
 
     function buildSampler() {
-      if (samplerReady) return;
+      if (samplerReady || !museImg) return;
       const ow = 256;
-      const oh = Math.max(1, Math.round((img.naturalHeight / img.naturalWidth) * ow));
+      const oh = Math.max(1, Math.round((museImg.naturalHeight / museImg.naturalWidth) * ow));
       const off = document.createElement("canvas");
       off.width = ow;
       off.height = oh;
       const octx = off.getContext("2d");
       if (octx) {
-        octx.drawImage(img, 0, 0, ow, oh);
+        octx.drawImage(museImg, 0, 0, ow, oh);
         try {
           sampler = { data: octx.getImageData(0, 0, ow, oh).data, w: ow, h: oh };
         } catch {
@@ -321,15 +344,8 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
       rebuild();
     }
 
-    img.onload = handleImageReady;
-    img.onerror = () => {
-      if (img.src.endsWith(".webp")) {
-        img.src = "/viva-muse.png";
-      } else {
-        rebuild();
-      }
-    };
-    img.src = "/viva-muse.webp";
+    museImg = findMuseImg();
+    museImg?.addEventListener("load", handleImageReady);
 
     function inkWeight(u: number, v: number): number {
       if (!sampler) return 0.4;
@@ -714,10 +730,14 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     window.addEventListener("storage", onPolicySignal);
     window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
 
-    // If the muse is already decoded (commonly cached by MuseBackdrop), sample it
-    // now so the very first frame — including the static reduced-motion frame — is
-    // density-aware. Otherwise show a provisional frame and refine on load.
-    if (img.complete && img.naturalWidth > 0) {
+    // `MuseBackdrop`'s <img> is server-rendered and may already be decoded
+    // (or already have failed once) by the time this effect runs — sample it
+    // now so the very first frame, including the static reduced-motion
+    // frame, is density-aware. Otherwise the "load" listener above refines
+    // it once that element's own webp/png resolution finishes, including
+    // after `MuseBackdrop`'s own webp-decode-failure fallback swaps it to
+    // the PNG source (which fires a fresh `load` on the same element).
+    if (museImg?.complete && museImg.naturalWidth > 0) {
       handleImageReady();
     } else {
       rebuild();
@@ -732,8 +752,7 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
       reduceTransparencyMQ.removeEventListener("change", onPolicySignal);
       window.removeEventListener("storage", onPolicySignal);
       window.removeEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
-      img.onload = null;
-      img.onerror = null;
+      museImg?.removeEventListener("load", handleImageReady);
     };
   }, []);
 
