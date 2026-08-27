@@ -4,6 +4,11 @@ import { act, Children, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import Page, { dynamic } from "../../app/page";
+import {
+  clearBrowserSessionCredential,
+  readBrowserSessionCredential,
+  replaceBrowserSessionCredential,
+} from "../../lib/use-viva-agent-session";
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
@@ -462,12 +467,15 @@ describe("LandingEntry", () => {
 
 /**
  * D-07 Branch A (`retain-token-only`, `FRONTEND-011`): function-level proof
- * that `startServerSession` composes the "small local indirection" this task
- * owns in place of Plan 10's not-yet-published `replaceBrowserSessionCredential`
- * (confirmed absent from `apps/web/lib/use-viva-agent-session.ts` in this
- * tree before writing this test) — it must be handed the complete start
- * response and invoked strictly before navigation — and that the same-origin
- * start fetch is bounded so a hung mint can never hang the UI forever.
+ * that `startServerSession` composes the vault seam Plan 10's real
+ * `replaceBrowserSessionCredential` now publishes
+ * (`apps/web/lib/use-viva-agent-session.ts`) — it must be handed the
+ * complete start response and invoked strictly before navigation — and
+ * that the same-origin start fetch is bounded so a hung mint can never
+ * hang the UI forever. Most tests below inject a local double via
+ * `sessionCredentialVault` to pin the exact call shape/ordering in
+ * isolation; the "supplies none" test further down proves the real
+ * production default instead (A-28.4).
  */
 describe("D-07 Branch A session-bootstrap composition: vault seam and fetch bound (FRONTEND-011)", () => {
   test("calls the session credential vault with the complete start response before navigating", async () => {
@@ -577,20 +585,42 @@ describe("D-07 Branch A session-bootstrap composition: vault seam and fetch boun
     }
   });
 
-  test("defaults to the inert Phase-13A vault placeholder without throwing when the caller supplies none", async () => {
+  test("A-28.4: defaults to Plan 10's real browser session credential vault when the caller supplies none", async () => {
     const navigations: string[] = [];
     const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("default-vault-sentinel"))
       .libraryRows[0];
     if (!row) throw new Error("fixture must include a library row");
+
+    // Baseline the real vault's monotonic revision counter (never reset by
+    // `clearBrowserSessionCredential`) with a seeded credential of our own,
+    // so "the default vault was called exactly once" is provable below as
+    // "the revision advanced by exactly 1" — not merely "some credential
+    // exists", which a stale value left by an unrelated earlier test could
+    // also satisfy.
+    replaceBrowserSessionCredential({
+      mode: "retain-token-only",
+      refresh_expires_at: null,
+      refresh_token: null,
+      session_absolute_expires_at: null,
+      session_id: "revision-baseline-session",
+      session_token: "revision-baseline-token",
+      study_set_id: "revision-baseline-study-set",
+      user_id: "revision-baseline-user",
+    });
+    const baselineRevision = readBrowserSessionCredential()?.revision ?? 0;
+    clearBrowserSessionCredential();
     try {
       globalThis.fetch = (async () =>
         new Response(
           JSON.stringify({
+            refresh_expires_at: "2026-09-01T00:00:00Z",
+            refresh_token: "viva1.default-vault-refresh-token",
             session: {
               session_id: "server-session",
               study_set_id: "biology-midterm",
               user_id: "user-1",
             },
+            session_absolute_expires_at: "2026-09-23T00:00:00Z",
             session_token: "viva1.default-vault-token",
           }),
           { headers: { "content-type": "application/json" }, status: 200 },
@@ -598,13 +628,41 @@ describe("D-07 Branch A session-bootstrap composition: vault seam and fetch boun
 
       const outcome = await startServerSession(row, "start", row.start, {
         navigate: (target) => navigations.push(target),
+        // No `sessionCredentialVault` supplied — this is exactly the
+        // production path: `LandingEntry.tsx` mounts `LibraryStatusPanel`
+        // with no such prop, so whatever `startServerSession` falls back to
+        // here is what a real browser calls (A-28.4).
       });
 
       expect(outcome).toEqual({ ok: true });
       expect(navigations).toEqual([
         "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.default-vault-token",
       ]);
+
+      // The complete start response must reach Plan 10's real, published
+      // vault (`browserSessionCredentialVault` /
+      // `replaceBrowserSessionCredential` in `use-viva-agent-session.ts`),
+      // not the inert Phase-13A `pendingBrowserSessionCredentialVault`
+      // stand-in that silently drops every field. `startServerSession`
+      // never exposes which vault object it defaulted to, so this reads
+      // the real vault's own module-memory state back out instead.
+      const stored = readBrowserSessionCredential();
+      if (stored?.mode !== "retain-token-only") {
+        throw new Error("expected the real vault to hold a retain-token-only credential");
+      }
+      expect(stored.accessToken).toBe("viva1.default-vault-token");
+      expect(stored.refreshToken).toBe("viva1.default-vault-refresh-token");
+      expect(stored.refreshExpiresAt).toBe(Date.parse("2026-09-01T00:00:00Z"));
+      expect(stored.sessionAbsoluteExpiresAt).toBe(Date.parse("2026-09-23T00:00:00Z"));
+      expect(stored.identity).toEqual({
+        sessionId: "server-session",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      // Exactly once: a second call would have advanced the revision by 2.
+      expect(stored.revision).toBe(baselineRevision + 1);
     } finally {
+      clearBrowserSessionCredential();
       globalThis.fetch = originalFetch;
     }
   });

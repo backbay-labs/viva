@@ -2,6 +2,7 @@
 
 import { MasteryRing } from "@viva/ui-web";
 import { type RefObject, useEffect, useId, useRef, useState } from "react";
+import { browserSessionCredentialVault } from "../../lib/use-viva-agent-session";
 import {
   deleteVivaSessionHistory,
   deleteVivaStudySet,
@@ -11,7 +12,6 @@ import {
 import {
   type BrowserSessionCredentialVault,
   browserSessionCredentialVaultInputFromStartResponse,
-  pendingBrowserSessionCredentialVault,
   projectLibrarySnapshot,
   type VivaLibrarySnapshot,
   type VivaSessionStartResponse,
@@ -519,7 +519,7 @@ export async function startServerSession(
 ): Promise<StartServerSessionOutcome> {
   if (!action.available) return { ok: false, reason: "unavailable" };
   const navigate = options.navigate ?? navigateToSession;
-  const vault = options.sessionCredentialVault ?? pendingBrowserSessionCredentialVault;
+  const vault = options.sessionCredentialVault ?? browserSessionCredentialVault;
   if (action.sessionToken?.trim()) {
     // A direct session token already available on the snapshot (the D-06/
     // trust-contract fast path) never mints through `/api/viva-session/
@@ -569,8 +569,10 @@ export async function startServerSession(
 
 /**
  * Hands the complete start response to the credential-vault seam — Plan
- * 10's not-yet-published `replaceBrowserSessionCredential`, stood in for by
- * `pendingBrowserSessionCredentialVault` until it lands — strictly before
+ * 10's real `replaceBrowserSessionCredential`
+ * (`apps/web/lib/use-viva-agent-session.ts`), the default every production
+ * caller gets since A-28.4 swapped out the inert Phase-13A
+ * `pendingBrowserSessionCredentialVault` placeholder — strictly before
  * navigating away, exactly once per successful mint.
  */
 function completeServerSessionStart(
