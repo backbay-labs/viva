@@ -2906,6 +2906,65 @@ describe("Viva library destructive capability consumption", () => {
     ]);
   });
 
+  test("one-time delete refuses an unrecognized destructive shape instead of relaying the caller's credentials", async () => {
+    const calls: Array<{ init?: RequestInit; url: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(input) });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    }) as typeof fetch;
+    // A genuine, correctly signed capability. It is the strongest possible caller: if even this is
+    // refused on an unrecognized shape, no weaker one can pass.
+    const token = studySetDeleteToken();
+
+    // Every DELETE shape this deployment does not recognize as a destructive control target. Each
+    // one used to leave controlTarget null, skip the origin/allowlist/store guards entirely, and be
+    // relayed upstream as an ordinary proxied DELETE carrying the caller's `authorization` AND
+    // `x-viva-library-control-token`.
+    const rejections = await Promise.all([
+      unrecognizedDelete(["study-sets"], token),
+      unrecognizedDelete(["study-sets", "biology-midterm", "sessions"], token),
+      unrecognizedDelete(
+        ["study-sets", "biology-midterm", "sessions", "voice-session-1", "x"],
+        token,
+      ),
+    ]);
+
+    expect(rejections.map((response) => response.status)).toEqual([403, 403, 403]);
+    for (const rejection of rejections) {
+      expect(await rejection.json()).toEqual({
+        error: "viva_library_control_scope_not_allowed",
+        failure_class: "access_denied",
+        stage: "pre_loop",
+      });
+    }
+    // Refused before the agent, so neither the caller's bearer nor the browser capability moved.
+    expect(calls).toEqual([]);
+
+    // Refused before the shared store too: the capability is still unspent and still works on the
+    // one shape this deployment actually supports, which is also the positive control proving the
+    // guard did not simply blanket-block DELETE.
+    const accepted = await studySetDelete(token);
+    expect(accepted.status).toBe(200);
+    expect(calls.map(({ url }) => url)).toEqual([
+      "http://agent.test/study-sets/biology-midterm?user_id=user-1",
+    ]);
+    const forwarded = new Headers(calls[0]?.init?.headers);
+    expect(forwarded.get("authorization")).toBe(`Bearer ${SCOPED_LIBRARY_DELETE_BEARER}`);
+    expect(forwarded.get("x-viva-library-control-token")).toBe(null);
+  });
+
+  function unrecognizedDelete(path: string[], token: string): Promise<Response> {
+    return DELETE(
+      destructiveRequest(path, token, {
+        extraHeaders: { authorization: "Bearer caller-supplied-bearer" },
+      }),
+      { params: Promise.resolve({ path }) },
+    );
+  }
+
   function memoryStore(): SessionSecurityStore {
     const selection = vivaSessionSecurityStore();
     if (!selection.ok) throw new Error("fixture requires a selectable bounded security store");

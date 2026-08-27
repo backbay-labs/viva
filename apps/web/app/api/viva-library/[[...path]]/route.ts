@@ -55,13 +55,13 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
-  const unsupportedControlScope = guardUnsupportedControlScope(request.method, path);
-  if (unsupportedControlScope) return unsupportedControlScope;
-
   // The destructive sequence is fixed and fail-closed: canonical origin, route/query allowlist,
   // a selectable shared store, then (inside the authorization step) constant-time capability
   // verification, one-time consumption, and only then the scoped delete credential.
   const controlTarget = libraryControlRouteTarget(request.method, path);
+  const unsupportedControlScope = guardUnsupportedControlScope(request.method, path, controlTarget);
+  if (unsupportedControlScope) return unsupportedControlScope;
+
   const originGuard = guardDestructiveRequestOrigin(request, controlTarget);
   if (originGuard) return originGuard;
   const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
@@ -531,10 +531,23 @@ type LibraryControlRouteTarget = {
  *
  * This is a path-shape match only — it mints and consumes nothing — so the D-04 Branch A absence
  * proof still finds no restore-capability code in this file.
+ *
+ * The same reasoning closes the destructive method itself. `libraryControlRouteTarget` recognizes
+ * exactly the two DELETE shapes this deployment supports; every other DELETE has no control scope
+ * that any capability could ever satisfy. Without this refusal such a request leaves
+ * `controlTarget` null, skips the origin, allowlist, and store guards, and falls through to the
+ * ordinary proxy path, which relays the caller's `authorization` and `x-viva-library-control-token`
+ * upstream with no same-origin check. Deciding "destructive" from the METHOD and TARGET means the
+ * unrecognized target is refused, not relayed.
  */
-function guardUnsupportedControlScope(method: string, path: string[]): NextResponse | null {
+function guardUnsupportedControlScope(
+  method: string,
+  path: string[],
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
   const restoreShape = method === "POST" && path.length === 2 && path[1] === "restore";
-  return restoreShape
+  const unrecognizedDestructiveShape = method === "DELETE" && !controlTarget;
+  return restoreShape || unrecognizedDestructiveShape
     ? libraryAccessDeniedJsonError(403, "viva_library_control_scope_not_allowed")
     : null;
 }
