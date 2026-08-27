@@ -518,6 +518,32 @@
   opacity: 0.48;
 }
 
+/*
+ * `A-31.4(d)`: `SkipToTurnLink` (`LiveSessionShell.tsx`) removes its own
+ * `.sr-only` class on focus, but nothing styled the resulting VISIBLE
+ * state -- an unstyled `<a>` in normal flow measured only 21px tall, under
+ * FRONTEND-002 item 2's 44px floor for "every visible enabled ...
+ * actionable link". `position: relative` + `z-index` keeps it stacked
+ * above the decorative backdrop layers (`.live-session__veil` below is
+ * `z-index: 3`) once it becomes visible.
+ */
+.session-skip-link {
+  position: relative;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--viva-target-min);
+  margin: 0.6rem;
+  padding: 0 1.1rem;
+  border-radius: 8px;
+  background: var(--viva-paper);
+  color: var(--plum);
+  font-family: var(--sans);
+  font-size: 0.86rem;
+  font-weight: 600;
+  box-shadow: 0 8px 24px rgba(70, 46, 24, 0.16);
+}
+
 .live-session__veil {
   position: absolute;
   inset: 0;

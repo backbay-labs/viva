@@ -1116,6 +1116,26 @@ async function checkSessionZoomSafety(page) {
  * forced-colors can neutralize a purely decorative color distinction, so a
  * state that colour alone conveyed would otherwise go silently unreadable.
  *
+ * An adversarial review caught two related defects here: `document.body
+ * .focus()` is a no-op in Chromium (`<body>` carries no `tabindex`, so it is
+ * never itself focusable) — when a caller (`runSessionHandoffCheck`'s own
+ * `A-31.4(c)` disclosure check, on `/session`) has already moved focus
+ * elsewhere before this runs, the very first `Tab` press here just
+ * continues forward from THAT position instead of restarting at the top of
+ * the document, so every control before it in tab order is silently never
+ * visited by either per-stop assertion; and because the loop's only
+ * "reached the end" signal was an early `break`, undercounting like that
+ * produced no failure of its own — a partial sweep and a complete one were
+ * indistinguishable from the outside. Both are fixed here: focus is reset
+ * by giving `<body>` a temporary `tabindex="-1"` (which DOES make `.focus()`
+ * take effect) and removing it again immediately after, so the very next
+ * `Tab` press always starts from the top of the document's real tab order
+ * regardless of where focus previously was; and the number of stops
+ * actually reached is compared against an independently-counted lower
+ * bound (every visible, enabled, non-`aria-hidden` native/`tabindex`
+ * candidate in the DOM at the moment this runs) so an early break can no
+ * longer pass silently.
+ *
  * Restores `forced-colors: none` before returning, whether or not
  * any failure was found.
  *
@@ -1127,12 +1147,70 @@ async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
   const failures = [];
   await page.emulateMedia({ forcedColors: "active" });
   try {
-    await page.evaluate(() => document.body.focus());
+    // Independently counted lower bound for how many stops a sweep that
+    // truly starts at the top of the document must reach — computed BEFORE
+    // resetting focus (forced-colors emulation and focus position affect
+    // neither the set of focusable candidates nor their visibility, so
+    // ordering here is not load-bearing; done first only so the count
+    // reflects the exact same DOM state the loop below then walks).
+    const expectedMinimumStops = await page.evaluate(() => {
+      function isVisible(el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 1 || rect.height <= 1) return false;
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none") return false;
+        if (el.closest('[aria-hidden="true"], [hidden]')) return false;
+        // Kept in step with the per-stop loop below, which treats
+        // `<nextjs-portal>` (`next dev`'s own error-overlay scaffolding,
+        // never present in a production build) as outside this count.
+        if (el.closest("nextjs-portal")) return false;
+        return true;
+      }
+      const selector =
+        'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+        'select:not([disabled]), textarea:not([disabled]), [tabindex]';
+      return [...document.querySelectorAll(selector)].filter((el) => {
+        const tabIndexAttr = el.getAttribute("tabindex");
+        if (tabIndexAttr !== null && Number(tabIndexAttr) < 0) return false;
+        return isVisible(el);
+      }).length;
+    });
+    // The reset itself: `<body>` has no native tabindex, so a bare
+    // `.focus()` on it is silently a no-op and leaves whatever was
+    // previously focused untouched -- confirmed empirically (Chromium):
+    // `document.activeElement` was unchanged before/after. Giving it a
+    // temporary `tabindex="-1"` makes the programmatic `.focus()` take
+    // effect (negative tabindex still allows script-driven focus, it only
+    // excludes the element from Tab's own traversal), then the attribute
+    // is removed again immediately -- `document.activeElement` stays
+    // `<body>` after removal (confirmed empirically), and `<body>` is
+    // never left with a stray `tabindex` attribute.
+    await page.evaluate(() => {
+      const { body } = document;
+      const hadTabIndex = body.hasAttribute("tabindex");
+      const previousTabIndex = body.getAttribute("tabindex");
+      body.setAttribute("tabindex", "-1");
+      body.focus();
+      if (hadTabIndex) {
+        body.setAttribute("tabindex", previousTabIndex);
+      } else {
+        body.removeAttribute("tabindex");
+      }
+    });
+    let stopsReached = 0;
     for (let i = 0; i < maxTabs; i++) {
       await page.keyboard.press("Tab");
       const info = await page.evaluate(async () => {
         const el = document.activeElement;
         if (!el || el === document.body) return null;
+        // `<nextjs-portal>` is `next dev`'s own error-overlay scaffolding —
+        // never present in a production build, so its presence in tab
+        // order is this harness's dev-server environment, not the product.
+        // Skipping it (rather than treating it as "reached the end", which
+        // would wrongly cut the sweep short if it is not actually last)
+        // just consumes one of this loop's `maxTabs` budget without
+        // counting toward `stopsReached` or asserting on it.
+        if (el.closest("nextjs-portal")) return { skip: true };
 
         // Same settled-snapshot technique as the normal-mode traversal
         // below: a focus ring that changes on a CSS transition must not be
@@ -1156,6 +1234,24 @@ async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
           }
           return previous;
         }
+        // Same bounded-poll shape as `settled()`, but over the element's own
+        // rendered size rather than its outline/box-shadow: a component
+        // that toggles a visibility-affecting class from its own focus/blur
+        // handlers (e.g. `SkipToTurnLink`'s `sr-only` swap) can still be
+        // mid-re-render at the instant `el.focus()` returns, and a size read
+        // taken right then would observe the STALE (still visually hidden)
+        // box — not because the control is actually broken, but because
+        // this loop asked too early.
+        async function settledRect() {
+          let previous = el.getBoundingClientRect();
+          for (let attempt = 0; attempt < 32; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 16));
+            const next = el.getBoundingClientRect();
+            if (next.width === previous.width && next.height === previous.height) return next;
+            previous = next;
+          }
+          return previous;
+        }
         const focused = await settled();
         el.blur();
         const blurred = await settled();
@@ -1166,7 +1262,7 @@ async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
         const ariaLabel = el.getAttribute("aria-label");
         const text = (el.textContent ?? "").trim();
         const accessibleNameLength = (ariaLabel?.trim() || text).length;
-        const rect = el.getBoundingClientRect();
+        const rect = await settledRect();
 
         return {
           tag: el.tagName.toLowerCase(),
@@ -1181,6 +1277,8 @@ async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
         };
       });
       if (!info) break;
+      if (info.skip) continue;
+      stopsReached++;
       const name = info.ariaLabel ?? info.text;
       const selector = info.className ? `${info.tag}.${info.className.split(/\s+/).join(".")}` : info.tag;
       if (!info.hasVisibleFocus) {
@@ -1204,6 +1302,19 @@ async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
             `need a name and >= ${TOUCH_TARGET_MIN_PX}x${TOUCH_TARGET_MIN_PX}px)`,
         );
       }
+    }
+    // Without this, a sweep that starts mid-tab-order (or breaks early for
+    // any other reason) silently visits fewer real controls than exist and
+    // still reports a clean pass -- exactly the false-negative shape an
+    // adversarial review caught here (5 of 9 real /session controls, once
+    // a prior check had already moved focus).
+    if (stopsReached < expectedMinimumStops) {
+      failures.push(
+        `[${routeLabel}, forced-colors: active] keyboard sweep reached only ${stopsReached} stop(s) ` +
+          `before losing focus, but ${expectedMinimumStops} focusable control(s) are present in the ` +
+          "document -- the sweep may have started mid-tab-order rather than at the top of the " +
+          "document, silently skipping every control before it",
+      );
     }
 
     const stateIndicators = await page.evaluate(() => {
