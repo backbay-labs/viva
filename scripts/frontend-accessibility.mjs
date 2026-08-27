@@ -102,9 +102,27 @@ import {
  * script's: observing an in-page JS call's exact arguments has no natural
  * black-box browser signal, whereas a real DOM mount gives direct access.
  *
- * Later tasks add the remaining deletion/static-export modes named in their
- * own RED commands; this file's mode dispatch is written so those are
- * additive.
+ * Task 9 adds `--deletion` (`FRONTEND-004`, D-04 Branch A — `CONFIRM_DELETE`,
+ * the only recorded D-04 branch in this program): mounts `/` and proves, for
+ * both a study-set/source row and a session-recap/history row, against real
+ * browser/network state —
+ *
+ * - the first click on "Delete source for …"/"Delete recap for …" opens a
+ *   named `role="alertdialog"` (`getByRole("alertdialog", { name, exact:
+ *   true })`, so the accessible name is computed the same way a screen
+ *   reader would) and issues zero DELETE requests;
+ * - focus lands on the confirm action when the dialog opens;
+ * - Escape and Cancel each close the dialog without deleting and restore
+ *   focus to that row's own initiating button;
+ * - confirming issues the row's exact DELETE endpoint exactly once — proved
+ *   under a real Playwright `dblclick()`, with the intercepted route
+ *   deliberately delayed so the second click of a genuine double-click
+ *   lands while the first request is still in flight — and completion is
+ *   announced through a `role="status"` region with fixed copy.
+ *
+ * Task 8 (`FRONTEND-010`, D-06 Branch B — `DELETE`, the only recorded D-06
+ * branch in this program) adds no mode here: Branch A's `--static-export`
+ * proof is not implemented, since that branch was not selected.
  */
 
 const ALLOWLISTED_COMPUTED_PROPERTIES = [
@@ -332,6 +350,18 @@ async function main() {
     return;
   }
 
+  if (args.includes("--deletion")) {
+    const failures = await runDeletionCheck();
+    if (failures.length > 0) {
+      console.error(`--deletion FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("--deletion OK: 0 issues");
+    return;
+  }
+
   if (args.includes("--session-handoff")) {
     const scopeFlagIndex = args.indexOf("--disclosure-scope");
     const disclosureScope = scopeFlagIndex !== -1 ? args[scopeFlagIndex + 1] : undefined;
@@ -393,7 +423,7 @@ async function main() {
     "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
       "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
       "--disclosure-scope all-live-content, --assets, --landing-affordance, " +
-      "--session-bootstrap; later tasks add more modes.",
+      "--session-bootstrap, --deletion; later tasks add more modes.",
   );
 }
 
@@ -1525,6 +1555,214 @@ async function checkSessionBootstrapFetchBound(browser, baseUrl) {
             `timeout: ${text}`,
         );
       }
+    }
+  } finally {
+    await context.close();
+  }
+  return failures;
+}
+
+/* --------------------------------------------------------------------- *
+ * Task 9 (`FRONTEND-004`): `--deletion`.
+ * -------------------------------------------------------------------- */
+
+/** The two D-04 CONFIRM_DELETE table rows this program's `LIBRARY_SNAPSHOT_FIXTURE` supports end to end. */
+const DELETION_CHECK_TARGETS = [
+  {
+    completeStatus: "Delete source complete.",
+    deletePathSuffix: "/api/viva-library/study-sets/biology-midterm",
+    dialogTitle: "Delete Biology Midterm?",
+    initiatingAccessibleName: "Delete source for Biology Midterm",
+    kind: "study_set",
+  },
+  {
+    completeStatus: "Delete recap complete.",
+    deletePathSuffix: "/api/viva-library/study-sets/biology-midterm/sessions/voice-session-1",
+    dialogTitle: "Delete Biology Midterm session recap?",
+    initiatingAccessibleName: "Delete recap for Biology Midterm",
+    kind: "session_history",
+  },
+];
+
+async function runDeletionCheck() {
+  const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
+  mkdirSync(artifactDir, { recursive: true });
+  const stub = await startLibrarySnapshotStub(LIBRARY_SNAPSHOT_FIXTURE);
+  const failures = [];
+  try {
+    await withFrontendDevServer(
+      { artifactDir, extraEnv: harnessExtraEnv(stub.url) },
+      async ({ baseUrl }) => {
+        const hydratableBaseUrl = toHydratableUrl(baseUrl);
+        const browser = await launchChromium();
+        try {
+          for (const target of DELETION_CHECK_TARGETS) {
+            failures.push(...(await checkDeliberateDeletionFlow(browser, hydratableBaseUrl, target)));
+          }
+        } finally {
+          await browser.close();
+        }
+      },
+    );
+  } finally {
+    await stub.close();
+  }
+  return failures;
+}
+
+/**
+ * D-04 CONFIRM_DELETE's real-browser proof for one table row: the first
+ * click only opens a named `role="alertdialog"` confirmation (zero DELETE
+ * requests, since the row's DELETE route is intercepted and only fulfilled
+ * from inside this check, never reached by an unconfirmed click), focus
+ * moves to the confirm action, Escape and Cancel each close it without
+ * deleting and restore focus to the row's own initiating button, and
+ * confirming issues the table's exact DELETE endpoint exactly once — proved
+ * under a real Playwright `dblclick()` against a deliberately delayed route,
+ * so the guard is exercised by a genuine double-activation, not merely a
+ * disabled-attribute snapshot — before completion is announced through a
+ * `role="status"` region with fixed copy.
+ *
+ * @param {import("playwright").Browser} browser
+ * @param {string} baseUrl
+ * @param {{completeStatus: string, deletePathSuffix: string, dialogTitle: string, initiatingAccessibleName: string, kind: string}} target
+ */
+async function checkDeliberateDeletionFlow(browser, baseUrl, target) {
+  const failures = [];
+  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+  const deleteRequests = [];
+  // A deliberate delay before fulfilling: a real Playwright `dblclick()`
+  // fires its two clicks only tens of milliseconds apart, so without this
+  // margin the first request could already have settled (and the confirm
+  // button already be disabled) before the second click lands, making the
+  // double-activation guard untested rather than proved.
+  await page.route(`**${target.deletePathSuffix}*`, async (route) => {
+    const request = route.request();
+    if (request.method() !== "DELETE") {
+      await route.continue();
+      return;
+    }
+    deleteRequests.push(request.url());
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.fulfill({ body: "{}", contentType: "application/json", status: 200 });
+  });
+
+  try {
+    await gotoRouteReady(page, baseUrl, "/");
+
+    const initiatingButton = page.getByRole("button", {
+      exact: true,
+      name: target.initiatingAccessibleName,
+    });
+    await initiatingButton.click();
+
+    if (deleteRequests.length !== 0) {
+      failures.push(
+        `[deletion:${target.kind}] the first click issued ${deleteRequests.length} DELETE ` +
+          "request(s) before confirmation",
+      );
+    }
+
+    const dialog = page.getByRole("alertdialog", { exact: true, name: target.dialogTitle });
+    const dialogVisible = await dialog
+      .waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!dialogVisible) {
+      failures.push(
+        `[deletion:${target.kind}] no named "${target.dialogTitle}" alertdialog opened on the ` +
+          "first click",
+      );
+      await context.close();
+      return failures;
+    }
+
+    const confirmHasFocus = await page.evaluate(
+      () => document.activeElement?.textContent?.trim() === "Delete",
+    );
+    if (!confirmHasFocus) {
+      failures.push(`[deletion:${target.kind}] focus did not move to the confirm action on open`);
+    }
+
+    await page.keyboard.press("Escape");
+    const closedOnEscape = await dialog
+      .waitFor({ state: "hidden", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!closedOnEscape) {
+      failures.push(`[deletion:${target.kind}] Escape did not close the dialog`);
+    }
+    if (
+      !(await page.evaluate(
+        (name) => document.activeElement?.getAttribute("aria-label") === name,
+        target.initiatingAccessibleName,
+      ))
+    ) {
+      failures.push(
+        `[deletion:${target.kind}] focus was not restored to the initiating button after Escape`,
+      );
+    }
+    if (deleteRequests.length !== 0) {
+      failures.push(`[deletion:${target.kind}] Escape issued a DELETE request`);
+    }
+
+    await initiatingButton.click();
+    await dialog.waitFor({ state: "visible", timeout: 5_000 }).catch(() => {});
+    await dialog.getByRole("button", { exact: true, name: "Cancel" }).click();
+    const closedOnCancel = await dialog
+      .waitFor({ state: "hidden", timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!closedOnCancel) {
+      failures.push(`[deletion:${target.kind}] Cancel did not close the dialog`);
+    }
+    if (
+      !(await page.evaluate(
+        (name) => document.activeElement?.getAttribute("aria-label") === name,
+        target.initiatingAccessibleName,
+      ))
+    ) {
+      failures.push(
+        `[deletion:${target.kind}] focus was not restored to the initiating button after Cancel`,
+      );
+    }
+    if (deleteRequests.length !== 0) {
+      failures.push(`[deletion:${target.kind}] Cancel issued a DELETE request`);
+    }
+
+    await initiatingButton.click();
+    await dialog.waitFor({ state: "visible", timeout: 5_000 }).catch(() => {});
+    await dialog.getByRole("button", { exact: true, name: "Delete" }).dblclick();
+    await page
+      .waitForFunction(
+        (expected) => document.querySelector(".viva-library__status")?.textContent === expected,
+        target.completeStatus,
+        { timeout: 8_000 },
+      )
+      .catch(() => {});
+
+    if (deleteRequests.length !== 1) {
+      failures.push(
+        `[deletion:${target.kind}] expected exactly one DELETE request after confirming (a real ` +
+          `double click included), saw ${deleteRequests.length}`,
+      );
+    }
+
+    const statusNode = page.locator(".viva-library__status");
+    const statusText = await statusNode.textContent().catch(() => null);
+    if (statusText !== target.completeStatus) {
+      failures.push(
+        `[deletion:${target.kind}] expected the status region to read "${target.completeStatus}", ` +
+          `saw ${JSON.stringify(statusText)}`,
+      );
+    }
+    const statusRole = await statusNode.getAttribute("role").catch(() => null);
+    if (statusRole !== "status") {
+      failures.push(
+        `[deletion:${target.kind}] the completion status region is missing role="status" (saw ` +
+          `${JSON.stringify(statusRole)})`,
+      );
     }
   } finally {
     await context.close();

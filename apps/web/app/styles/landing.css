@@ -1095,6 +1095,62 @@
   color: #a14a4a;
 }
 
+/* D-04 CONFIRM_DELETE (FRONTEND-004): the named inline confirmation a
+ * study-set/source row and a session-recap/history row each open on their
+ * first delete click. `grid-column: 1 / -1` spans it beneath the row's own
+ * columns whichever grid-template-columns the owning row uses. */
+.viva-library__delete-dialog {
+  background: rgba(255, 253, 248, 0.96);
+  border: 1px solid rgba(176, 74, 74, 0.35);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.6rem;
+  grid-column: 1 / -1;
+  padding: 0.9rem;
+}
+
+.viva-library__delete-dialog-title {
+  color: var(--viva-ink);
+  font-weight: 750;
+  margin: 0;
+}
+
+.viva-library__delete-dialog-description {
+  color: var(--viva-muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.viva-library__delete-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.viva-library__delete-dialog-actions button {
+  background: transparent;
+  border: 1px solid rgba(64, 42, 82, 0.22);
+  border-radius: 8px;
+  color: var(--viva-ink);
+  cursor: pointer;
+  font-weight: 750;
+  min-height: var(--viva-target-min);
+  padding: 0.48rem 0.72rem;
+}
+
+.viva-library__delete-dialog-actions button:last-child {
+  background: #a14a4a;
+  border-color: #a14a4a;
+  color: var(--viva-paper);
+}
+
+.viva-library__delete-dialog-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .viva-library__row--session {
   grid-template-columns: auto minmax(9rem, 1fr) minmax(12rem, 2fr) auto;
 }
