@@ -27,6 +27,7 @@ import {
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_NORMAL_CLOSE_CODE,
   VIVA_VOICE_PROTOCOL_VERSION,
+  type VivaBrowserClientFrame,
   type VivaCancelClientFrame,
   type VivaClientFrame,
   type VivaClientTurnIntent,
@@ -59,14 +60,28 @@ export type VivaAgentClientOptions = {
   WebSocketImpl?: typeof WebSocket;
 };
 
+/**
+ * `WEBSESSION-PASTE-01`. Exactly the four members the server's ingestion contract
+ * owns, and no identity. `PasteStudySetRequest` is `#[serde(deny_unknown_fields)]`
+ * over `{title, course, exam_date, pasted_text}`, so a `user_id`/`session_id`
+ * member is no longer merely ignored — it is a rejected request. The browser
+ * never held authority over who a study set belongs to: the server derives that
+ * from the authenticated caller.
+ */
 export type VivaPasteStudySetInput = {
-  userId: string;
   title: string;
-  course: string | null;
+  course?: string;
   examDate?: string;
   pastedText: string;
-  sessionId?: string;
 };
+
+/** The wire body, reconstructed field by field — never a spread of the input. */
+type VivaPasteStudySetRequestBody = Readonly<{
+  title: string;
+  course?: string;
+  exam_date?: string;
+  pasted_text: string;
+}>;
 
 export type VivaPasteStudySetOptions = {
   apiBaseUrl?: string;
@@ -722,17 +737,19 @@ export async function pasteStudySetToVivaApi(
     throw new Error("Viva API URL is unavailable");
   }
   const fetchImpl = options.fetchImpl ?? fetch;
+  // Reconstructed member by member from the four contract fields. A spread of
+  // `input` would carry whatever a runtime caller attached to it — exactly the
+  // shape `deny_unknown_fields` now refuses — so there is no spread here.
+  const requestBody: VivaPasteStudySetRequestBody = {
+    pasted_text: input.pastedText,
+    title: input.title,
+    ...(input.course === undefined ? {} : { course: input.course }),
+    ...(input.examDate === undefined ? {} : { exam_date: input.examDate }),
+  };
   const response = await fetchImpl(`${trimTrailingSlash(apiBaseUrl)}/study-sets/paste`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      user_id: input.userId,
-      title: input.title,
-      course: input.course,
-      ...(input.examDate ? { exam_date: input.examDate } : {}),
-      pasted_text: input.pastedText,
-      ...(input.sessionId ? { session_id: input.sessionId } : {}),
-    }),
+    body: JSON.stringify(requestBody),
   });
   if (!response.ok) {
     throw new Error(`Viva paste ingestion failed with HTTP ${response.status}`);
@@ -1350,6 +1367,73 @@ function diagnosticForCaughtError(error: unknown): VivaAgentDiagnostic {
   return WEB_INTERNAL_DIAGNOSTIC;
 }
 
+export type VivaBrowserFrameSerializationResult =
+  | Readonly<{ status: "serialized"; payload: string }>
+  | Readonly<{
+      status: "rejected";
+      diagnostic: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }>;
+    }>;
+
+/**
+ * `WEBSESSION-AUTHORITY-01`: the browser's outbound boundary, and the only way a
+ * frame becomes bytes.
+ *
+ * Order matters. The envelope is serialized ONCE, measured in UTF-8 bytes against
+ * Plan 05's exported `VIVA_VOICE_MAX_TEXT_FRAME_BYTES`, and only then handed to
+ * Plan 05's own parser — so an oversized payload is refused before anything
+ * parses it, and a forged one (a `tool_result` the browser has no authority to
+ * send) is refused before anything transmits it. There is no second validator
+ * and no local re-derivation of the taxonomy: only `{code, path}` survives, so a
+ * refused frame's own content can never reach state, a log, or the DOM.
+ *
+ * Audio frames do NOT come through here. Plan 03 owns their chunk/turn bounds,
+ * queue, retained ledger, and backpressure, and a second size check on that path
+ * would be a second, drifting authority.
+ */
+export function serializeVivaBrowserClientFrame(
+  frame: VivaBrowserClientFrame,
+): VivaBrowserFrameSerializationResult {
+  let payload: string;
+  try {
+    payload = JSON.stringify(frame);
+  } catch {
+    return { diagnostic: WEB_INTERNAL_FRAME_DIAGNOSTIC, status: "rejected" };
+  }
+  if (typeof payload !== "string") {
+    return { diagnostic: WEB_INTERNAL_FRAME_DIAGNOSTIC, status: "rejected" };
+  }
+  if (new TextEncoder().encode(payload).byteLength > VIVA_VOICE_MAX_TEXT_FRAME_BYTES) {
+    return {
+      diagnostic: { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
+      status: "rejected",
+    };
+  }
+  try {
+    parseVivaClientFrameJson(payload);
+  } catch (error) {
+    return { diagnostic: outboundFrameDiagnostic(error), status: "rejected" };
+  }
+  return { payload, status: "serialized" };
+}
+
+/**
+ * The frame-shaped counterpart of `WEB_INTERNAL_DIAGNOSTIC`. The serialization
+ * result's diagnostic is a `{code, path}` pair with a non-null path, so a local
+ * failure that is not one of Plan 05's typed rejections collapses to this fixed
+ * envelope-level value rather than to anything derived from the exception.
+ */
+const WEB_INTERNAL_FRAME_DIAGNOSTIC: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> = {
+  code: "VOICE_PROTOCOL_INVALID_FIELD",
+  path: "$",
+};
+
+function outboundFrameDiagnostic(
+  error: unknown,
+): Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> {
+  if (error instanceof VivaVoiceProtocolError) return { code: error.code, path: error.path };
+  return WEB_INTERNAL_FRAME_DIAGNOSTIC;
+}
+
 export function createVivaAgentSessionController(
   options: VivaAgentSessionControllerOptions,
 ): VivaAgentSessionController {
@@ -1524,19 +1608,46 @@ export function createVivaAgentSessionController(
     return socket === nextSocket && activeGeneration?.id === generation.id;
   }
 
-  function sendFrame(frame: VivaClientFrameDraft): boolean {
-    const generationId = activeGeneration?.id;
-    if (socket?.readyState !== 1 || !generationId) {
-      setState({
-        ...state,
-        status: "error",
-        pendingSubmission: undefined,
-        diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
-      });
+  function recordSendRejection(diagnostic: VivaAgentDiagnostic) {
+    setState({
+      ...state,
+      status: "error",
+      pendingSubmission: undefined,
+      diagnostics: [...state.diagnostics, diagnostic],
+    });
+  }
+
+  /**
+   * The controller's ONLY sender. Its parameter is Plan 05's browser-sendable
+   * union, and every byte it transmits comes from
+   * `serializeVivaBrowserClientFrame` — so an oversized or forged frame is
+   * refused here, before `WebSocket.send`, with only a typed `{code, path}`.
+   */
+  function sendFrame(frame: VivaBrowserClientFrame): boolean {
+    if (socket?.readyState !== 1 || !activeGeneration) {
+      recordSendRejection(WEB_INTERNAL_DIAGNOSTIC);
       return false;
     }
-    socket.send(JSON.stringify(withClientGeneration(frame, generationId)));
+    const serialized = serializeVivaBrowserClientFrame(frame);
+    if (serialized.status === "rejected") {
+      recordSendRejection(serialized.diagnostic);
+      return false;
+    }
+    socket.send(serialized.payload);
     return true;
+  }
+
+  /**
+   * `client_generation_id` is never the caller's to choose, so a command frame is
+   * stamped with the live generation here and only then handed to `sendFrame`.
+   */
+  function sendGenerationFrame(draft: VivaClientFrameDraft): boolean {
+    const generationId = activeGeneration?.id;
+    if (socket?.readyState !== 1 || !generationId) {
+      recordSendRejection(WEB_INTERNAL_DIAGNOSTIC);
+      return false;
+    }
+    return sendFrame(withClientGeneration(draft, generationId));
   }
 
   /**
@@ -1551,7 +1662,7 @@ export function createVivaAgentSessionController(
     const generationId = activeGeneration?.id;
     if (!generationId || state.pendingSubmission) return false;
     if (state.recap || state.terminalReason) return false;
-    if (sendFrame(frame)) {
+    if (sendGenerationFrame(frame)) {
       setState({ ...state, pendingSubmission: { generationId, kind } });
       return true;
     }
@@ -1692,18 +1803,15 @@ export function createVivaAgentSessionController(
       if (!generationId) {
         return intentSocketClosedResult(turnId, "Viva voice session has no open generation");
       }
-      let json: string;
-      try {
-        json = JSON.stringify({
-          client_generation_id: generationId,
-          intent: input.intent,
-          turn_id: turnId,
-          type: "turn_intent",
-          version: VIVA_VOICE_PROTOCOL_VERSION,
-        });
-        parseVivaClientFrameJson(json);
-      } catch (error) {
-        const diagnostic = outboundIntentDiagnostic(error);
+      const serialized = serializeVivaBrowserClientFrame({
+        client_generation_id: generationId,
+        intent: input.intent,
+        turn_id: turnId,
+        type: "turn_intent",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      });
+      if (serialized.status === "rejected") {
+        const diagnostic = serialized.diagnostic;
         setState({ ...state, diagnostics: [...state.diagnostics, diagnostic] });
         return { diagnostic, status: "rejected", turnId } as const;
       }
@@ -1714,7 +1822,7 @@ export function createVivaAgentSessionController(
       if (socket?.readyState !== 1) {
         return intentSocketClosedResult(turnId, "Viva voice WebSocket is not open");
       }
-      socket.send(json);
+      socket.send(serialized.payload);
       setState({ ...state, pendingSubmission: { generationId, kind: "text" } });
       return { status: "sent", turnId } as const;
     },
@@ -1845,10 +1953,10 @@ export function createVivaAgentSessionController(
       setState({ ...state, audio: state.audio.filter((output) => !drop.has(output)) });
     },
     cancel() {
-      sendFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });
+      sendGenerationFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });
     },
     stop() {
-      sendFrame({ type: "stop", version: VIVA_VOICE_PROTOCOL_VERSION });
+      sendGenerationFrame({ type: "stop", version: VIVA_VOICE_PROTOCOL_VERSION });
     },
     getState() {
       return state;
@@ -1943,8 +2051,14 @@ type VivaClientFrameDraft =
   | Omit<VivaCancelClientFrame, "client_generation_id">
   | Omit<VivaStopClientFrame, "client_generation_id">;
 
-function withClientGeneration(frame: VivaClientFrameDraft, generationId: string): VivaClientFrame {
-  return { ...frame, client_generation_id: generationId } as VivaClientFrame;
+function withClientGeneration(
+  frame: VivaClientFrameDraft,
+  generationId: string,
+): VivaBrowserClientFrame {
+  // The draft union is built FROM the browser union, so this narrowing can only
+  // ever produce a browser-sendable frame; it cannot widen one into tool
+  // authority. `serializeVivaBrowserClientFrame` re-proves that at runtime.
+  return { ...frame, client_generation_id: generationId } as VivaBrowserClientFrame;
 }
 
 /**
@@ -1959,17 +2073,6 @@ function intentSocketClosedResult(turnId: string, message: string): VivaTurnInte
     status: "socket_closed",
     turnId,
   };
-}
-
-/**
- * Plan 05's typed rejection, or one fixed local field diagnostic. A thrown
- * serialization failure is a malformed intent, never a message to display.
- */
-function outboundIntentDiagnostic(
-  error: unknown,
-): Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> {
-  if (error instanceof VivaVoiceProtocolError) return { code: error.code, path: error.path };
-  return { code: "VOICE_PROTOCOL_INVALID_FIELD", path: "$.intent" };
 }
 
 function createTurnIntentId(): string {

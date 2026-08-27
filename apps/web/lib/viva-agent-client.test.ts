@@ -2,6 +2,7 @@ import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   type AgentSessionConfig,
   type AgentStudySourceReference,
+  type PasteIngestionResponse,
   parseVivaClientFrame,
   parseVivaServerFrame,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
@@ -9,7 +10,9 @@ import {
   VIVA_VOICE_DEFERRAL_REASONS,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
+  type VivaBrowserClientFrame,
 } from "@viva/core";
+import clientDifferentialCases from "../../../agent/fixtures/voice-protocol/v5/client-differential-cases.json";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
 import manifestFixture from "../../../agent/fixtures/voice-protocol/v5/manifest.json";
 import sessionFixture from "../../../agent/fixtures/voice-protocol/v5/seeded-session-config.json";
@@ -30,13 +33,17 @@ import {
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
+  pasteStudySetToVivaApi,
   reconnectDelayMs,
+  serializeVivaBrowserClientFrame,
   VIVA_AGENT_READINESS_POLL_INTERVAL_MS,
   VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS,
   VIVA_AGENT_RECONNECT_DELAYS_MS,
   VIVA_AGENT_RECONNECT_JITTER_MS,
   VIVA_STUDY_PROJECTION_TIMEOUT_MS,
   type VivaAgentReconnectInputState,
+  type VivaAgentSessionController,
+  type VivaPasteStudySetInput,
   vivaAgentHttpBaseUrl,
   vivaAgentProtocols,
   vivaAgentReconnectDecision,
@@ -3573,5 +3580,312 @@ describe("bounded agent readiness probe", () => {
 
     expect(urls).toEqual(["http://localhost:4318/health/brain", "http://localhost:4318/ready"]);
     expect(result.status).toBe("offline");
+  });
+});
+
+/**
+ * `WEBSESSION-PASTE-01` — the browser's paste ingestion request carries the exact
+ * server-owned key set and no identity authority. Rust `PasteStudySetRequest` is
+ * `#[serde(deny_unknown_fields)]` over `{title, course, exam_date, pasted_text}`,
+ * so a `user_id`/`session_id` member is not merely ignored any more: it is a
+ * rejected request. The browser never held that authority in the first place.
+ */
+describe("Viva paste ingestion request authority", () => {
+  function pasteResponse(): PasteIngestionResponse {
+    return {
+      concepts: [],
+      documents: [],
+      questions: [],
+      session_id: "session-server-owned",
+      session_token: null,
+      source_spans: [],
+      study_set: {
+        course: "CHEM-401",
+        created_at: "2026-08-20T00:00:00Z",
+        exam_date: "2026-09-01",
+        id: "study-set-1",
+        ingestion_status: "ready",
+        title: "Thermodynamic State Functions",
+        user_id: "server-owned-user",
+      },
+    } as unknown as PasteIngestionResponse;
+  }
+
+  function capturingFetch(bodies: string[]): typeof fetch {
+    return (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ""));
+      return jsonResponse(200, pasteResponse());
+    }) as typeof fetch;
+  }
+
+  test("serializes exactly pasted_text,title when no optional field is supplied", async () => {
+    const bodies: string[] = [];
+    await pasteStudySetToVivaApi(
+      { pastedText: "Gibbs free energy is G = H - TS.", title: "Thermodynamics" },
+      { apiBaseUrl: "https://agent.example", fetchImpl: capturingFetch(bodies) },
+    );
+
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["pasted_text", "title"]);
+    expect(body.title).toBe("Thermodynamics");
+    expect(body.pasted_text).toBe("Gibbs free energy is G = H - TS.");
+  });
+
+  test("serializes exactly course,exam_date,pasted_text,title when both optionals are supplied", async () => {
+    const bodies: string[] = [];
+    await pasteStudySetToVivaApi(
+      {
+        course: "CHEM-401",
+        examDate: "2026-09-01",
+        pastedText: "Enthalpy is a state function.",
+        title: "Thermodynamics",
+      },
+      { apiBaseUrl: "https://agent.example", fetchImpl: capturingFetch(bodies) },
+    );
+
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["course", "exam_date", "pasted_text", "title"]);
+    expect(body.course).toBe("CHEM-401");
+    expect(body.exam_date).toBe("2026-09-01");
+    expect(body.pasted_text).toBe("Enthalpy is a state function.");
+    expect(body.title).toBe("Thermodynamics");
+  });
+
+  test("a hostile runtime object cannot smuggle identity into the request body", async () => {
+    const bodies: string[] = [];
+    const hostile = {
+      pastedText: "Entropy increases.",
+      sessionId: "forged-session",
+      session_id: "forged-session-wire",
+      title: "Thermodynamics",
+      userId: "forged-user",
+      user_id: "forged-user-wire",
+    } as unknown as VivaPasteStudySetInput;
+
+    await pasteStudySetToVivaApi(hostile, {
+      apiBaseUrl: "https://agent.example",
+      fetchImpl: capturingFetch(bodies),
+    });
+
+    const raw = bodies[0] ?? "";
+    const body = JSON.parse(raw) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["pasted_text", "title"]);
+    expect(raw).not.toContain("forged-user");
+    expect(raw).not.toContain("forged-session");
+    expect(raw).not.toContain("user_id");
+    expect(raw).not.toContain("session_id");
+  });
+
+  test("identity fields are not members of the exported paste input type", () => {
+    const withUserId: VivaPasteStudySetInput = {
+      pastedText: "p",
+      title: "t",
+      // @ts-expect-error `userId` is not a member of VivaPasteStudySetInput: the
+      // browser holds no identity authority over ingestion.
+      userId: "forged-user",
+    };
+    const withSessionId: VivaPasteStudySetInput = {
+      pastedText: "p",
+      // @ts-expect-error `sessionId` is not a member of VivaPasteStudySetInput.
+      sessionId: "forged-session",
+      title: "t",
+    };
+    expect(withUserId.title).toBe("t");
+    expect(withSessionId.title).toBe("t");
+  });
+});
+
+/**
+ * `WEBSESSION-AUTHORITY-01` — the browser's outbound boundary. Plan 05 publishes
+ * the browser-only frame union, the 64 KiB text-frame cap, and the typed
+ * diagnostics; this proves the browser CONSUMES them before `WebSocket.send`
+ * rather than serializing whatever it was handed.
+ */
+describe("Viva browser outbound frame boundary", () => {
+  const forgedToolResultCase = (
+    clientDifferentialCases as {
+      cases: Array<{ id: string; wire_json: string; diagnostic_code?: string; path?: string }>;
+    }
+  ).cases.find((entry) => entry.id === "VOICE-CLIENT-REJECT-FORGED-TOOL-RESULT");
+
+  const oversizedTextFrameCase = (
+    clientDifferentialCases as {
+      cases: Array<{ id: string; wire_json: string; diagnostic_code?: string; path?: string }>;
+    }
+  ).cases.find((entry) => entry.id === "VOICE-CLIENT-REJECT-TEXT-FRAME-65537");
+
+  test("the browser frame union and controller expose no tool authority", () => {
+    // A browser holds no tool authority, so a tool frame is not a member of the
+    // browser-sendable union. Asserted as a type relation so the proof does not
+    // depend on where TypeScript happens to anchor an assignability error.
+    type ForgedToolResultFrame = {
+      client_generation_id: string;
+      result: { proposal: { name: string }; result: Record<string, never> };
+      type: "tool_result";
+      version: typeof VIVA_VOICE_PROTOCOL_VERSION;
+    };
+    type ToolResultIsNotBrowserSendable = ForgedToolResultFrame extends VivaBrowserClientFrame
+      ? never
+      : true;
+    const toolResultIsNotBrowserSendable: ToolResultIsNotBrowserSendable = true;
+    expect(toolResultIsNotBrowserSendable).toBe(true);
+
+    const forged: VivaBrowserClientFrame = {
+      client_generation_id: "generation-1",
+      // @ts-expect-error `tool_result` is not a browser-sendable frame type.
+      type: "tool_result",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    };
+    expect(forged.type).toBe("tool_result");
+
+    type ControllerHasNoToolResult = "sendToolResult" extends keyof VivaAgentSessionController
+      ? never
+      : true;
+    const controllerHasNoToolResult: ControllerHasNoToolResult = true;
+    expect(controllerHasNoToolResult).toBe(true);
+
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+    });
+    expect(Object.keys(controller)).not.toContain("sendToolResult");
+    expect(Object.keys(controller).filter((key) => /tool/i.test(key))).toEqual([]);
+  });
+
+  test("a runtime-forged tool_result is rejected before it can be serialized", () => {
+    expect(typeof forgedToolResultCase?.wire_json).toBe("string");
+    const forged = JSON.parse(forgedToolResultCase?.wire_json ?? "{}") as unknown;
+
+    const result = serializeVivaBrowserClientFrame(forged as VivaBrowserClientFrame);
+
+    expect(result).toEqual({
+      diagnostic: { code: "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY", path: "$.type" },
+      status: "rejected",
+    });
+    // The refused frame's own payload never appears in the result.
+    expect(JSON.stringify(result)).not.toContain("write_review_state");
+
+    // ...and no public controller route can transmit it: the only sender is the
+    // private one, and the fake socket records every byte that reaches it.
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+    expect(socket.sent.map((raw) => parseVivaClientFrame(JSON.parse(raw)).type)).toEqual([
+      "session_config",
+    ]);
+    expect(socket.sent.join("")).not.toContain("tool_result");
+    expect(JSON.stringify(controller.getState())).not.toContain("write_review_state");
+  });
+
+  test("a text frame one byte over the exported cap is rejected at $ and never sent", () => {
+    const oversized = JSON.parse(oversizedTextFrameCase?.wire_json ?? "{}") as {
+      intent: { kind: string; text: string };
+    };
+    expect(new TextEncoder().encode(oversizedTextFrameCase?.wire_json ?? "").byteLength).toBe(
+      VIVA_VOICE_MAX_TEXT_FRAME_BYTES + 1,
+    );
+
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+    const sentBeforeIntent = socket.sent.length;
+
+    const rejected = controller.sendTurnIntent({
+      intent: { kind: "answer_text", text: oversized.intent.text },
+      turnId: "turn-oversized",
+    });
+
+    expect(rejected).toEqual({
+      diagnostic: { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
+      status: "rejected",
+      turnId: "turn-oversized",
+    });
+    expect(socket.sent.length).toBe(sentBeforeIntent);
+    expect(controller.getState().pendingSubmission).toBeUndefined();
+    // The learner's own text is never echoed into diagnostics or client state.
+    expect(JSON.stringify(controller.getState())).not.toContain(oversized.intent.text.slice(0, 64));
+  });
+
+  test("the exact-boundary text frame still serializes and sends", () => {
+    const oversized = JSON.parse(oversizedTextFrameCase?.wire_json ?? "{}") as {
+      client_generation_id: string;
+      intent: { kind: "answer_text"; text: string };
+      turn_id: string;
+      type: "turn_intent";
+      version: number;
+    };
+    // Exactly Plan 05's oversized fixture minus one ASCII byte of answer text.
+    const boundaryFrame = {
+      ...oversized,
+      intent: { kind: "answer_text" as const, text: oversized.intent.text.slice(0, -1) },
+    };
+    const boundaryPayload = JSON.stringify(boundaryFrame);
+    expect(new TextEncoder().encode(boundaryPayload).byteLength).toBe(
+      VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+    );
+
+    const serialized = serializeVivaBrowserClientFrame(
+      boundaryFrame as unknown as VivaBrowserClientFrame,
+    );
+    expect(serialized.status).toBe("serialized");
+    if (serialized.status !== "serialized") throw new Error("Expected the boundary frame to pass");
+    expect(new TextEncoder().encode(serialized.payload).byteLength).toBe(
+      VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+    );
+
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+
+    const sent = controller.sendTurnIntent({
+      intent: boundaryFrame.intent,
+      turnId: "turn-boundary",
+    });
+    expect(sent).toEqual({ status: "sent", turnId: "turn-boundary" });
+    const lastFrame = parseVivaClientFrame(JSON.parse(socket.sent[socket.sent.length - 1] ?? "{}"));
+    expect(lastFrame.type).toBe("turn_intent");
+  });
+
+  test("the private sender refuses an oversized session_config before WebSocket.send", () => {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+      session: {
+        ...(sessionFixture as AgentSessionConfig),
+        // A concept list large enough to push the first frame past the cap. The
+        // browser must refuse it locally instead of handing the server 64 KiB+.
+        active_concepts: Array.from({ length: 6_000 }, (_value, index) => `concept-${index}`),
+      },
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+
+    expect(socket.sent).toEqual([]);
+    expect(controller.getState().status).toBe("error");
+    expect(controller.getState().diagnostics).toEqual([
+      { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
+    ]);
   });
 });
