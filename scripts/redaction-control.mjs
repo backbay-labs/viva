@@ -2585,6 +2585,96 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*\/\/\ rather\ than\ serialized\ as\ `session_token:\ null`\ for\ the\ server\ to\s*$/,
     ]),
   },
+  // A-29 (2026-08-27): coordinator-applied sanction rows for Plan 13 Phase-13B
+  // sources (node 13B admission). Dual-keyed, file-filtered, anchored literals:
+  // env-var NAMES defensively cleared from child environments, wire-shape field
+  // NAMES, fake harness literals, curriculum-fixture keys. Plan 12 reconciles
+  // at 12B.
+  {
+    file: "apps/web/components/landing/LibraryStatusPanel.tsx",
+    marker: "control_token",
+    patterns: Object.freeze([
+      /^\s*controlToken:\ libraryActionControlToken\(row\.delete\),\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-library.ts",
+    marker: "control_token",
+    patterns: Object.freeze([
+      /^\s*controlToken:\ true,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-library.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*sessionToken:\ !options\.directSessionTokens,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\*\ \ \ and\ the\ agent's\ own\ WS\ bearer\ token\.\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([
+      /^\s*\*\ \ \ real\ provider\-key\ names\ this\ app\ actually\ reads\ \(`CARTESIA_API_KEY`,\s*$/,
+      /^\s*"CARTESIA_API_KEY",\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "GEMINI_API_KEY",
+    patterns: Object.freeze([
+      /^\s*\*\ \ \ `GEMINI_API_KEY`\ —\ `redaction\-control\.mjs`'s\ own\ denylist\ names\ the\s*$/,
+      /^\s*"GEMINI_API_KEY",\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*prompt:\ "Explain\ the\ role\ of\ NADH\ in\ oxidative\ phosphorylation\.",\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\*\ \ \ `VIVA_VOICE_SESSION_TOKEN_SECRET`\/`VIVA_VOICE_WS_BEARER_TOKEN`\ both\ left\s*$/,
+      /^\s*"NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN",\s*$/,
+      /^\s*\*\ By\ default\ this\ leaves\ `VIVA_VOICE_SESSION_TOKEN_SECRET`\/\s*$/,
+      /^\s*\*\ the\ moment\ \*any\*\ `VIVA_VOICE_SESSION_TOKEN_SECRET`\ is\ configured,\ unless\s*$/,
+      /^\s*\*\ study\-set's\ `session_bootstrap_token`\/`session_token`\ and\ the\ library\s*$/,
+      /^\s*source\.VIVA_VOICE_SESSION_TOKEN_SECRET\ =\ sessionTokenSecret;\s*$/,
+      /^\s*"\#session_token=harness\-unsigned\-session\-token\&fold=open"\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "session_token_secret",
+    patterns: Object.freeze([
+      /^\s*export\ async\ function\ startSyntheticAgent\(\{\ artifactDir,\ port,\ sessionTokenSecret\ \}\)\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-harness.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([
+      /^\s*source\.VIVA_VOICE_SESSION_TOKEN_SECRET\ =\ sessionTokenSecret;\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/frontend-performance.mjs",
+    marker: "viva_agent_rest_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_REST_BEARER_TOKEN:\ "local\-frontend\-harness\-bearer",\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
