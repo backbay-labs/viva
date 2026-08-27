@@ -179,3 +179,59 @@ test("every Rust workspace package reports Apache-2.0", () => {
     true,
   );
 });
+
+test("D-06 STATIC_EXPORT is either fully gated or fully deleted", async () => {
+  const rootPackage = await readJson("package.json");
+  const turbo = await readJson("turbo.json");
+  const sourcePaths = [
+    "apps/web/next.config.ts",
+    "apps/web/lib/viva-agent-client.ts",
+    "apps/web/lib/viva-agent-client.test.ts",
+    "apps/web/lib/viva-library.ts",
+    "apps/web/lib/viva-library.test.ts",
+    "apps/web/app/page.tsx",
+    "apps/web/components/landing/LandingEntry.test.tsx",
+  ];
+  const source = (
+    await Promise.all(sourcePaths.map((path) => readFile(join(root, path), "utf8")))
+  ).join("\n");
+  const hasStaticFlag = /(?:NEXT_PUBLIC_)?VIVA_STATIC_EXPORT/.test(source);
+  const baseBuildEnv = [
+    "NEXT_PUBLIC_VIVA_AGENT_HTTP_URL",
+    "NEXT_PUBLIC_VIVA_AGENT_WS_URL",
+    "NEXT_PUBLIC_VIVA_API_URL",
+    "NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID",
+    "NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID",
+  ];
+
+  if (hasStaticFlag) {
+    assert.equal(
+      rootPackage.scripts?.["build:static"],
+      "VIVA_STATIC_EXPORT=1 NEXT_PUBLIC_VIVA_STATIC_EXPORT=1 turbo run build --filter=@viva/web",
+    );
+    assert.equal(
+      rootPackage.scripts?.["e2e:static"],
+      "node scripts/static-export-browser-gate.mjs",
+    );
+    assert.equal(turbo.tasks["build:static"], undefined);
+    assert.deepEqual(turbo.tasks.build.env, [
+      ...baseBuildEnv,
+      "NEXT_PUBLIC_VIVA_STATIC_EXPORT",
+      "VIVA_STATIC_EXPORT",
+    ]);
+    assert.deepEqual(turbo.tasks.build.outputs, [
+      ".next/**",
+      "!.next/cache/**",
+      "out/**",
+    ]);
+  } else {
+    assert.equal(rootPackage.scripts?.["build:static"], undefined);
+    assert.equal(rootPackage.scripts?.["e2e:static"], undefined);
+    assert.equal(turbo.tasks["build:static"], undefined);
+    assert.deepEqual(turbo.tasks.build.env, baseBuildEnv);
+    assert.deepEqual(turbo.tasks.build.outputs, [".next/**", "!.next/cache/**"]);
+    assert.doesNotMatch(JSON.stringify(turbo), /(?:NEXT_PUBLIC_)?VIVA_STATIC_EXPORT/);
+  }
+});

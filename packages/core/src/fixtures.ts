@@ -1,1 +1,1 @@
-export { sampleQuestion, seedStudySets, sourceConflictExample } from "./index";
+export { sampleQuestion, seedStudySets, sourceConflictExample } from "./study-set";

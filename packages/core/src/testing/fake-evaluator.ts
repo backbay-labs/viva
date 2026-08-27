@@ -1,1 +1,1 @@
-export { buildSessionRecap, evaluateAnswer } from "../index";
+export { buildSessionRecap, evaluateAnswer } from "../study-set";
