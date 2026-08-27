@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod dev_seed;
 mod http;
 mod protocol;
 mod ws;
@@ -11,14 +12,16 @@ pub use app::{
     VoiceUsageRecorder, WsTimeouts,
 };
 pub use config::{
-    build_brain, build_study_store, dev_fixture_seed_request, seed_dev_fixture,
-    validate_runtime_store_preflight, verify_session_token_at, AccessError, DevFixtureSeedError,
-    DevFixtureSeedRequest, ExpectedSessionBinding, FailureControlConfig, FailureControlScenario,
-    IpNetwork, IpNetworkError, OperatorAccess, ProjectionReadAccess, ProjectionRejection,
-    RealtimeProvider, RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError,
-    SessionTokenClaims, SessionTokenError, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
-    EXPIRY_CLOCK_SKEW_SECONDS, VIVA_DEV_FIXTURE_SEED_ACKNOWLEDGED,
-    VIVA_DEV_FIXTURE_SEED_ACKNOWLEDGEMENT, VIVA_SESSION_TOKEN_HEADER,
+    build_brain, build_study_store, validate_runtime_store_preflight, verify_session_token_at,
+    AccessError, ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, IpNetwork,
+    IpNetworkError, OperatorAccess, ProjectionReadAccess, ProjectionRejection, RealtimeProvider,
+    RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError, SessionTokenClaims,
+    SessionTokenError, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
+    EXPIRY_CLOCK_SKEW_SECONDS, VIVA_SESSION_TOKEN_HEADER,
+};
+pub use dev_seed::{
+    dev_fixture_seed_request, seed_dev_fixture, DevFixtureSeedError, DevFixtureSeedRequest,
+    VIVA_DEV_FIXTURE_SEED_ACKNOWLEDGED, VIVA_DEV_FIXTURE_SEED_ACKNOWLEDGEMENT,
 };
 pub use protocol::{
     classify_voice_termination, negotiate_voice_protocol_version, parse_client_frame_json,
