@@ -512,9 +512,16 @@ function readEffectsPreference(): "reduced" | null {
 }
 
 /**
- * Identity of the concept set as the label planner sees it: which concepts, in
- * what order, with what label, status, and emphasis tier (the planner's only
- * use of `emphasis` is its `>= 1` size bump).
+ * Identity of the concept set as the LABEL PLANNER sees it: which concepts, in
+ * what order, with what label and emphasis tier (the planner's only use of
+ * `emphasis` is its `>= 1` size bump).
+ *
+ * `status` is deliberately absent. The planner is handed `{emphasis, label,
+ * point}` and never reads mastery; mastery is chosen as ink inside `draw()`, per
+ * frame. Including it here made every mastery flip — a routine, mid-session
+ * event — a generation bump and therefore a full `rebuild()`, whose
+ * `makeParticles()` re-seeds the drifting particle field and pops it visibly.
+ * A status change now takes the repaint path instead (see `conceptInkSignature`).
  *
  * The parts are JSON-encoded rather than joined on a separator character, so
  * the encoding is INJECTIVE and visibly so: quoting and escaping keep id `a` +
@@ -526,8 +533,18 @@ function readEffectsPreference(): "reduced" | null {
  */
 function conceptSetSignature(nodes: ConceptNode[] | undefined): string {
   return JSON.stringify(
-    (nodes ?? []).map((node) => [node.id, node.label, node.status, node.emphasis >= 1 ? 1 : 0]),
+    (nodes ?? []).map((node) => [node.id, node.label, node.emphasis >= 1 ? 1 : 0]),
   );
+}
+
+/**
+ * Identity of the concept set as the PAINT sees it: the mastery each node is
+ * inked in. A change here needs one repaint and nothing else — no lane re-solve,
+ * no resize, no new particles. It matters because under the static effects
+ * policy no animation frame will otherwise arrive to carry the new colour.
+ */
+function conceptInkSignature(nodes: ConceptNode[] | undefined): string {
+  return JSON.stringify((nodes ?? []).map((node) => node.status));
 }
 
 export function VoiceTraceCanvas({
@@ -553,7 +570,9 @@ export function VoiceTraceCanvas({
   const conceptNodesRef = useRef<ConceptNode[]>(conceptNodes ?? []);
   const conceptGenerationRef = useRef(0);
   const conceptSignatureRef = useRef<string | null>(null);
+  const conceptInkSignatureRef = useRef<string | null>(null);
   const rebuildRef = useRef<(() => void) | null>(null);
+  const repaintRef = useRef<(() => void) | null>(null);
   const levelRefHolder = useRef<VoiceTraceLevelRef | null>(levelRef ?? null);
   const [effectsPolicy, setEffectsPolicy] = useState<VivaEffectsPolicy | null>(null);
   levelRefHolder.current = levelRef ?? null;
@@ -565,16 +584,24 @@ export function VoiceTraceCanvas({
     highlightRef.current = new Set(highlightedTokens ?? []);
   }, [highlightedTokens]);
 
-  // Only a change to the *semantic* concept set invalidates a label plan: a new
-  // array holding the same concepts is a React identity change, not a layout
-  // change, and must not force a replan or a repaint.
+  // Three tiers, cheapest last. A new array holding the same concepts is a React
+  // identity change, not a data change, and buys nothing. A mastery flip is a
+  // change of ink and buys exactly one repaint. Only a change to the *layout*
+  // set — which concepts, in what order, with what label and size tier —
+  // invalidates the label plan and earns a full rebuild.
   useEffect(() => {
     conceptNodesRef.current = conceptNodes ?? [];
     const signature = conceptSetSignature(conceptNodes);
-    if (conceptSignatureRef.current === signature) return;
-    conceptSignatureRef.current = signature;
-    conceptGenerationRef.current += 1;
-    rebuildRef.current?.();
+    const inkSignature = conceptInkSignature(conceptNodes);
+    const inkChanged = conceptInkSignatureRef.current !== inkSignature;
+    conceptInkSignatureRef.current = inkSignature;
+    if (conceptSignatureRef.current !== signature) {
+      conceptSignatureRef.current = signature;
+      conceptGenerationRef.current += 1;
+      rebuildRef.current?.();
+      return;
+    }
+    if (inkChanged) repaintRef.current?.();
   }, [conceptNodes]);
 
   useEffect(() => {
@@ -960,6 +987,16 @@ export function VoiceTraceCanvas({
     }
 
     /**
+     * One frame with the current data, keeping the geometry that is already on
+     * screen: no `resize()`, no `makeParticles()`, no cache invalidation, so the
+     * cached lane plan and the drifting particle field both survive. This is the
+     * whole cost of a concept changing mastery.
+     */
+    function repaint() {
+      draw(performance.now() / 1000, 0.016);
+    }
+
+    /**
      * One policy path for every signal that can change it — media query, stored
      * preference, viewport. A changed policy stops the current loop before
      * rebuilding, so a mode flip can never leave two animation loops running.
@@ -997,10 +1034,12 @@ export function VoiceTraceCanvas({
     window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
 
     rebuildRef.current = rebuild;
+    repaintRef.current = repaint;
     rebuild();
 
     return () => {
       rebuildRef.current = null;
+      repaintRef.current = null;
       stopAnim();
       clearTimeout(resizeTimer);
       ro.disconnect();

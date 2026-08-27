@@ -7,6 +7,7 @@ import {
   VIVA_EFFECTS_PREFERENCE_STORAGE_KEY,
   type VivaEffectsPolicyInput,
 } from "../../lib/viva-effects";
+import { conceptStatusColor } from "../../lib/viva-session-projection";
 import { installVivaTestDom, resetVivaTestDom, uninstallVivaTestDom } from "../../test/setup-dom";
 import type { ConceptNode } from "./session-data";
 import {
@@ -88,6 +89,32 @@ function cacheInput(
     items: planItems(),
     ...overrides,
   };
+}
+
+/**
+ * The exact ink `draw()` paints a concept's marker dot and breathing ring in.
+ * Read from the shared palette rather than restated as a literal, so the assertion
+ * follows `conceptStatusColor` instead of forking from it.
+ */
+function statusInk(status: ConceptNode["status"]): string {
+  const { b, g, r } = conceptStatusColor(status);
+  return `rgba(${r},${g},${b},1)`;
+}
+
+/** How many nodes a repaint painted in `status`'s ink (marker + ring = 2 each). */
+function inkCount(inks: readonly string[], status: ConceptNode["status"]): number {
+  const ink = statusInk(status);
+  return inks.filter((entry) => entry === ink).length;
+}
+
+/**
+ * `resize()` is the canvas's only caller of `setTransform`, and `rebuild()` is
+ * the only caller of `resize()`, so this counts FULL REBUILDS — the
+ * resize + `makeParticles()` + draw cycle that restarts the drifting particle
+ * field. A repaint that carries new ink is not one of these.
+ */
+function rebuildCount(record: FakeCanvasContext): number {
+  return record.calls.filter((call) => call.op === "setTransform").length;
 }
 
 /**
@@ -198,11 +225,13 @@ type FakeContextCall = { op: string; args: unknown[] };
 type FakeCanvasContext = {
   calls: FakeContextCall[];
   fillTexts: Array<{ text: string; x: number; y: number }>;
+  /** Every `fillStyle`/`strokeStyle` assignment, in order — the drawn ink. */
+  inks: string[];
   moveTos: Array<{ x: number; y: number }>;
 };
 
 function createFakeContext(): { ctx: CanvasRenderingContext2D; record: FakeCanvasContext } {
-  const record: FakeCanvasContext = { calls: [], fillTexts: [], moveTos: [] };
+  const record: FakeCanvasContext = { calls: [], fillTexts: [], inks: [], moveTos: [] };
   const gradient = {
     addColorStop() {},
   };
@@ -233,7 +262,14 @@ function createFakeContext(): { ctx: CanvasRenderingContext2D; record: FakeCanva
       return fn;
     },
     set(target, property, value) {
-      if (typeof property === "string") target[property] = value;
+      if (typeof property === "string") {
+        // A concept's live mastery reaches the canvas as ink, not as an
+        // argument, so the colour a node is painted in is only observable here.
+        if ((property === "fillStyle" || property === "strokeStyle") && typeof value === "string") {
+          record.inks.push(value);
+        }
+        target[property] = value;
+      }
       return true;
     },
   };
@@ -861,5 +897,67 @@ describe("VoiceTraceCanvas label planning inside the frame budget", () => {
     const repainted = harness.context.fillTexts.slice(textsBefore).map((entry) => entry.text);
     expect(repainted.some((text) => isDrawOfLabel(text, "nthalpy"))).toBe(true);
     expect(repainted.some((text) => isDrawOfLabel(text, "Enthalpy"))).toBe(false);
+  });
+
+  test("a status-only change repaints the new mastery ink without replanning", () => {
+    harness = createHarness({ media: { reducedMotion: true } });
+    harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
+    const drawsBefore = harness.drawCount();
+    const plannedBefore = voiceTraceLabelPlanComputations();
+    const rebuildsBefore = rebuildCount(harness.context);
+    const inksBefore = harness.context.inks.length;
+    // `c-4 Standard states` is the only concept starting out `missed`: one
+    // marker dot + one breathing ring.
+    expect(inkCount(harness.context.inks, "missed")).toBe(2);
+
+    // `c-1 Enthalpy` slips from `strong` to `missed`. Same concepts, same ids,
+    // same labels, same order, same emphasis tiers: NOTHING the label planner
+    // reads has changed — it is handed `{emphasis, label, point}` only, and
+    // mastery reaches the canvas as ink chosen per frame.
+    harness.rerender(
+      <VoiceTraceCanvas
+        conceptNodes={conceptNodes.map((node) =>
+          node.id === "c-1" ? { ...node, status: "missed" } : { ...node },
+        )}
+        state="listening"
+      />,
+    );
+
+    // The obligation: a status flip costs one repaint, not a lane re-solve...
+    expect(voiceTraceLabelPlanComputations() - plannedBefore).toBe(0);
+    // ...and not a full rebuild, whose `makeParticles()` re-seeds the drifting
+    // particle field and pops it visibly mid-session.
+    expect(rebuildCount(harness.context) - rebuildsBefore).toBe(0);
+
+    // It must still REACH the canvas: under the static policy no animation
+    // frame will otherwise arrive to carry the new colour.
+    expect(harness.drawCount()).toBe(drawsBefore + 1);
+    const repainted = harness.context.inks.slice(inksBefore);
+    expect(inkCount(repainted, "missed")).toBe(4); // c-1 and c-4
+    expect(inkCount(repainted, "strong")).toBe(2); // c-6 alone
+  });
+
+  test("an emphasis-tier change still replans and rebuilds", () => {
+    harness = createHarness({ media: { reducedMotion: true } });
+    harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
+    const drawsBefore = harness.drawCount();
+    const plannedBefore = voiceTraceLabelPlanComputations();
+    const rebuildsBefore = rebuildCount(harness.context);
+
+    // `emphasis >= 1` is the planner's own font-size tier, so it changes the
+    // label box and therefore the lane solve. Removing `status` from the set
+    // identity must not take the tier with it.
+    harness.rerender(
+      <VoiceTraceCanvas
+        conceptNodes={conceptNodes.map((node) =>
+          node.id === "c-3" ? { ...node, emphasis: 1.4 } : { ...node },
+        )}
+        state="listening"
+      />,
+    );
+
+    expect(harness.drawCount()).toBe(drawsBefore + 1);
+    expect(voiceTraceLabelPlanComputations() - plannedBefore).toBe(1);
+    expect(rebuildCount(harness.context) - rebuildsBefore).toBe(1);
   });
 });
