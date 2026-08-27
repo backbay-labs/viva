@@ -4,6 +4,18 @@ import fs from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { vivaContrastPairs } from "../packages/tokens/src/index.ts";
+import {
+  checkMainLandmarkCount,
+  checkNoPngDuringHealthyLoad,
+  checkTranscriptButtonSemantics,
+} from "./frontend-accessibility.mjs";
+import {
+  checkAnimatedCanvasCount,
+  checkCumulativeLayoutShift,
+  checkFrameIntervalP95,
+  checkHeapGrowthBytes,
+  checkTotalBlockingTime,
+} from "./frontend-performance.mjs";
 
 /**
  * Frontend quality: static, source-level checks over the frontend's CSS
@@ -288,6 +300,45 @@ test("does not let a comment containing literal ':root {' text hijack block pars
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
   assert.ok(result.contrastRatios["--viva-ochre-text on --viva-paper"] >= 4.5);
+});
+
+/**
+ * Task 11 (`FRONTEND-009`) boundary control: a pair computed to land just
+ * *below* 4.5:1 must be rejected, and a pair computed to land just *at or
+ * above* it must be accepted — both hex pairs below are grayscale, chosen
+ * by exhaustive search over every 0-255 foreground/background pair for the
+ * ratio (via this same file's own `contrastRatio`) closest to the named
+ * value from its own side of the boundary, so this is a real numeric
+ * boundary rather than a round, comfortably-clear-of-the-line example.
+ */
+test("rejects a contrast pair computed at ~4.49:1, just below the 4.5:1 minimum", () => {
+  const fixture = `
+    :root {
+      --viva-paper: #9a9a9a;
+      --viva-ink: #333333;
+    }
+  `;
+  const result = checkTokenAuthority(fixture);
+  const ratio = result.contrastRatios["--viva-ink on --viva-paper"];
+  assert.equal(typeof ratio, "number");
+  assert.ok(ratio < 4.5, `expected < 4.5, got ${ratio}`);
+  assert.ok(ratio > 4.48, `expected the boundary fixture to land near 4.49, got ${ratio}`);
+  assert.equal(result.ok, false);
+});
+
+test("accepts a contrast pair computed at ~4.50:1, right at the 4.5:1 minimum", () => {
+  const fixture = `
+    :root {
+      --viva-paper: #8e8e8e;
+      --viva-ink: #282828;
+    }
+  `;
+  const result = checkTokenAuthority(fixture);
+  const ratio = result.contrastRatios["--viva-ink on --viva-paper"];
+  assert.equal(typeof ratio, "number");
+  assert.ok(ratio >= 4.5, `expected >= 4.5, got ${ratio}`);
+  assert.ok(ratio < 4.51, `expected the boundary fixture to land near 4.50, got ${ratio}`);
+  assert.equal(result.ok, true);
 });
 
 test("checkTokenAuthority scans every declared vivaContrastPairs entry, not a one-off ochre assertion (FRONTEND-002)", () => {
@@ -1733,4 +1784,121 @@ test("checkTargetSize accepts the real, committed .button/.button-primary rules 
     result.resolvedBlockSizePx >= 44,
     `expected the real .button/.button-primary rules to resolve to >= 44px, got: ${result.resolvedBlockSizePx}`,
   );
+});
+
+/* -------------------------------------------------------------------------
+ * Task 11 (`FRONTEND-009`): hostile-fixture proof for every pure assertion
+ * function `scripts/frontend-accessibility.mjs` and
+ * `scripts/frontend-performance.mjs` export. Each import runs neither a
+ * browser nor a build; every function here is the exact one the real
+ * mounted scripts call, so a passing quality-test run and a passing
+ * mounted run can never silently disagree about a threshold's direction.
+ * ---------------------------------------------------------------------- */
+
+test("checkMainLandmarkCount rejects two main landmarks", () => {
+  assert.equal(checkMainLandmarkCount(2), false);
+});
+
+test("checkMainLandmarkCount rejects zero main landmarks", () => {
+  assert.equal(checkMainLandmarkCount(0), false);
+});
+
+test("checkMainLandmarkCount accepts exactly one main landmark", () => {
+  assert.equal(checkMainLandmarkCount(1), true);
+});
+
+test("checkTranscriptButtonSemantics rejects a missing aria-expanded", () => {
+  assert.equal(
+    checkTranscriptButtonSemantics({
+      hasAriaControls: true,
+      hasAriaExpanded: false,
+      kind: "button",
+    }),
+    false,
+  );
+});
+
+test("checkTranscriptButtonSemantics rejects a missing aria-controls", () => {
+  assert.equal(
+    checkTranscriptButtonSemantics({
+      hasAriaControls: false,
+      hasAriaExpanded: true,
+      kind: "button",
+    }),
+    false,
+  );
+});
+
+test("checkTranscriptButtonSemantics rejects a details/summary pair, even with both attributes claimed", () => {
+  assert.equal(
+    checkTranscriptButtonSemantics({
+      hasAriaControls: true,
+      hasAriaExpanded: true,
+      kind: "details-summary",
+    }),
+    false,
+  );
+});
+
+test("checkTranscriptButtonSemantics accepts a real button with both attributes", () => {
+  assert.equal(
+    checkTranscriptButtonSemantics({
+      hasAriaControls: true,
+      hasAriaExpanded: true,
+      kind: "button",
+    }),
+    true,
+  );
+});
+
+test("checkNoPngDuringHealthyLoad rejects a single PNG transfer during a healthy WebP load", () => {
+  assert.equal(checkNoPngDuringHealthyLoad(1), false);
+});
+
+test("checkNoPngDuringHealthyLoad accepts zero PNG transfers", () => {
+  assert.equal(checkNoPngDuringHealthyLoad(0), true);
+});
+
+test("checkFrameIntervalP95 rejects 50.01ms, just over the 50ms budget", () => {
+  assert.equal(checkFrameIntervalP95(50.01), false);
+});
+
+test("checkFrameIntervalP95 accepts exactly 50ms", () => {
+  assert.equal(checkFrameIntervalP95(50), true);
+});
+
+test("checkTotalBlockingTime rejects 300.01ms, just over the 300ms budget", () => {
+  assert.equal(checkTotalBlockingTime(300.01), false);
+});
+
+test("checkTotalBlockingTime accepts exactly 300ms", () => {
+  assert.equal(checkTotalBlockingTime(300), true);
+});
+
+test("checkHeapGrowthBytes rejects 8 MiB plus one byte", () => {
+  assert.equal(checkHeapGrowthBytes(8 * 1024 * 1024 + 1), false);
+});
+
+test("checkHeapGrowthBytes accepts exactly 8 MiB", () => {
+  assert.equal(checkHeapGrowthBytes(8 * 1024 * 1024), true);
+});
+
+test("checkCumulativeLayoutShift rejects 0.051, just over the 0.05 budget", () => {
+  assert.equal(checkCumulativeLayoutShift(0.051), false);
+});
+
+test("checkCumulativeLayoutShift accepts exactly 0.05", () => {
+  assert.equal(checkCumulativeLayoutShift(0.05), true);
+});
+
+test("checkAnimatedCanvasCount rejects both session canvases marked animated", () => {
+  assert.equal(checkAnimatedCanvasCount(2), false);
+});
+
+test("checkAnimatedCanvasCount accepts exactly one animated canvas", () => {
+  assert.equal(checkAnimatedCanvasCount(1), true);
+});
+
+test("checkAnimatedCanvasCount accepts zero animated canvases", () => {
+  assert.equal(checkAnimatedCanvasCount(0), true);
 });

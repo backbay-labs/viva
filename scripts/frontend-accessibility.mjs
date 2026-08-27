@@ -1,9 +1,13 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   launchChromium,
   repoRoot,
+  routeSyntheticSessionProjection,
   startLibrarySnapshotStub,
+  startSyntheticAgent,
+  syntheticSessionUrl,
   withFrontendDevServer,
 } from "./frontend-harness.mjs";
 
@@ -123,7 +127,66 @@ import {
  * Task 8 (`FRONTEND-010`, D-06 Branch B — `DELETE`, the only recorded D-06
  * branch in this program) adds no mode here: Branch A's `--static-export`
  * proof is not implemented, since that branch was not selected.
+ *
+ * Task 11 (`FRONTEND-009`) completes this script (A-27.3):
+ *
+ * - fixes the `--owned-surfaces` `page.addStyleTag` throw (`checkZoomSafety`,
+ *   `checkKeyboardTraversal`) — Plan 11's nonce `style-src` CSP blocks an
+ *   injected `<style>` element, so both now use CSP-unaffected techniques
+ *   (`style-src-attr` is separately `'unsafe-inline'`) instead of a global
+ *   stylesheet;
+ * - fixes `--session-handoff`'s stale `"Transcript"` text match to Plan 10's
+ *   real `"Show transcript"` label, and mounts a real, connected
+ *   `LiveSessionShell` (via `startSyntheticAgent` and
+ *   `routeSyntheticSessionProjection`) instead of a bare, disconnected
+ *   `/session` that never rendered `<main>` at all;
+ * - re-derives the D-08 gating proof from what a real mounted session
+ *   actually does (no live-provider WebSocket opens, and no enabled
+ *   typed-answer/microphone control is reachable, before acknowledgment)
+ *   rather than an unverified assumption that the whole stage container is
+ *   marked `inert`;
+ * - adds the bare, no-flag mode (`runFullAccessibilityCheck`): `--owned-
+ *   surfaces` and `--session-handoff --disclosure-scope all-live-content`
+ *   together, the full item 1-5 contract this plan's acceptance criteria
+ *   and `bun run validate` require.
  */
+
+/**
+ * Task 11 (`FRONTEND-009`) pure assertion functions, exported so
+ * `scripts/frontend-quality.test.mjs` can prove their threshold direction
+ * against hostile fixtures without launching a browser — the real mounted
+ * checks below call these same functions rather than re-deriving the
+ * comparison inline, so a script-level and a quality-test-level pass can
+ * never silently disagree about where the line is.
+ */
+
+/** `FRONTEND-002` item 1: a route's real `<main>` count. Exactly one passes. */
+export function checkMainLandmarkCount(mainCount) {
+  return mainCount === 1;
+}
+
+/**
+ * `FRONTEND-006`: Transcript must be a real `<button>` (never a bare
+ * `<details>`/`<summary>` pair) carrying both `aria-expanded` and
+ * `aria-controls`.
+ */
+export function checkTranscriptButtonSemantics(transcript) {
+  return (
+    transcript.kind === "button" &&
+    transcript.hasAriaExpanded === true &&
+    transcript.hasAriaControls === true
+  );
+}
+
+/**
+ * `FRONTEND-007`: a healthy, WebP-capable load must never also transfer the
+ * PNG fallback — `pngTransferCount` is the number of `/viva-muse.png`
+ * requests observed, never a boolean, so a caller with more than one such
+ * request is named exactly, not merely flagged.
+ */
+export function checkNoPngDuringHealthyLoad(pngTransferCount) {
+  return pngTransferCount === 0;
+}
 
 const ALLOWLISTED_COMPUTED_PROPERTIES = [
   "display",
@@ -419,12 +482,50 @@ async function main() {
     return;
   }
 
+  if (args.length === 0) {
+    const failures = await runFullAccessibilityCheck();
+    if (failures.length > 0) {
+      console.error(`frontend-accessibility FAILED: ${failures.length} issue(s)`);
+      for (const line of failures) console.error(`  - ${line}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("frontend-accessibility OK: 0 issues (owned surfaces + session handoff)");
+    return;
+  }
+
   fail(
     "no recognized mode flag. Supported: --write-computed-style-baseline <path>, " +
       "--compare-computed-style-baseline <path>, --owned-surfaces, --session-handoff " +
       "--disclosure-scope all-live-content, --assets, --landing-affordance, " +
-      "--session-bootstrap, --deletion; later tasks add more modes.",
+      "--session-bootstrap, --deletion, or no flag at all for the full combined gate.",
   );
+}
+
+/**
+ * Task 11 (`FRONTEND-009`): the full mode — every item Task 3 named,
+ * across both owned and Plan-10-owned surfaces, now that Plan 10 has
+ * landed. This is the superset of `--owned-surfaces` (items 2-5 plus the
+ * landing half of item 1, needing no Plan-10 file) and
+ * `--session-handoff --disclosure-scope all-live-content` (the session
+ * half of item 1, Transcript semantics, and D-08 Branch A gating, which
+ * genuinely need Plan 10's `LiveSessionShell`/`QuestionStage` mounted) run
+ * together and reported as one combined failure list. Task 12 separately
+ * re-runs `--session-handoff` on its own for a distinctly-labelled
+ * FRONTEND-005/006 RED-to-GREEN record; this bare invocation is this
+ * plan's own final acceptance gate (`bun run validate` and the hosted CI
+ * step both invoke it with no flag).
+ */
+async function runFullAccessibilityCheck() {
+  // Sequential, not `Promise.all`: each half spawns its own dev server (and
+  // the session half also spawns a real agent-service), and running both
+  // pairs of processes at once is needless resource contention for a check
+  // with no time budget of its own (unlike `frontend-performance.mjs`).
+  const ownedSurfaceFailures = await runOwnedSurfacesCheck();
+  const sessionHandoffFailures = await runSessionHandoffCheck({
+    disclosureScope: "all-live-content",
+  });
+  return [...ownedSurfaceFailures, ...sessionHandoffFailures];
 }
 
 /** Mounts `/` at every baseline viewport and captures allowlisted computed styles. */
@@ -718,7 +819,7 @@ async function checkOwnedSurfacePage(page, { route, viewportLabel }) {
         "decorative --viva-ochre color; text must resolve through --viva-ochre-text instead",
     );
   }
-  if (route === "/" && result.mainCount !== 1) {
+  if (route === "/" && !checkMainLandmarkCount(result.mainCount)) {
     failures.push(
       `[${route} @ ${viewportLabel}] expected exactly one <main>, found ${result.mainCount}`,
     );
@@ -745,8 +846,18 @@ async function checkZoomSafety(browser, baseUrl) {
   const page = await context.newPage();
   try {
     await gotoRouteReady(page, baseUrl, "/");
-    await page.addStyleTag({ content: "html { font-size: 200% !important; }" });
-    // Let layout settle after the injected stylesheet before measuring.
+    // A-27.3: `page.addStyleTag` injects a real `<style>` element, which
+    // Plan 11's nonce-based `style-src` CSP (no `unsafe-inline`, no static
+    // hash for content this script only generates at runtime) blocks
+    // outright — Playwright then throws rather than returning a diff. CSP's
+    // `style-src-attr` is separately configured `'unsafe-inline'` (see
+    // `apps/web/proxy.ts`), so setting the `style` ATTRIBUTE directly is
+    // unaffected; this sets a single inline style declaration on the root
+    // element via the DOM instead of injecting a stylesheet.
+    await page.evaluate(() => {
+      document.documentElement.style.setProperty("font-size", "200%", "important");
+    });
+    // Let layout settle after the style change before measuring.
     await page.waitForTimeout(100);
     const report = await page.evaluate(() => {
       const doc = document.documentElement;
@@ -805,18 +916,22 @@ async function checkKeyboardTraversal(browser, baseUrl) {
     // Several focus rings (e.g. .viva-chip:focus-visible) are declared with
     // a CSS transition, so getComputedStyle read synchronously after a Tab
     // press can observe a mid-transition (or even pre-transition) value
-    // rather than the settled focus style. Disabling transitions/animations
-    // makes every focus-driven style change apply instantly, so the
-    // blur/focus comparison below measures the real end state.
-    await page.addStyleTag({
-      content:
-        "*, *::before, *::after { transition: none !important; animation: none !important; }",
-    });
+    // rather than the settled focus style. This used to disable every
+    // transition/animation with a global `page.addStyleTag` `<style>` rule;
+    // A-27.3: Plan 11's nonce-based `style-src` CSP now blocks that inline
+    // stylesheet outright (Playwright throws rather than returning a diff),
+    // and unlike `checkZoomSafety`'s single root `font-size`, this rule
+    // targeted `*::before`/`*::after` too, which have no DOM node a script
+    // could set an inline style property on even under `style-src-attr`'s
+    // separate `'unsafe-inline'` allowance. Polling each snapshot until two
+    // consecutive reads agree (bounded, so a genuinely absent focus
+    // indicator still fails promptly rather than hanging) observes the real
+    // settled end state instead, without touching any stylesheet.
 
     const tabbed = [];
     for (let i = 0; i < 60; i++) {
       await page.keyboard.press("Tab");
-      const info = await page.evaluate(() => {
+      const info = await page.evaluate(async () => {
         const el = document.activeElement;
         if (!el || el === document.body) return null;
 
@@ -849,10 +964,25 @@ async function checkKeyboardTraversal(browser, baseUrl) {
             };
           });
         }
+        // Waits for `snapshot(nodes)` to stop changing between consecutive
+        // ~16ms polls (one frame), up to ~512ms — comfortably above the
+        // longest authored focus-ring transition in this codebase (450ms) —
+        // so a mid-transition read never gets compared against another
+        // mid-transition read.
+        async function settledSnapshot(nodes) {
+          let previous = snapshot(nodes);
+          for (let attempt = 0; attempt < 32; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 16));
+            const next = snapshot(nodes);
+            if (JSON.stringify(next) === JSON.stringify(previous)) return next;
+            previous = next;
+          }
+          return previous;
+        }
         const nodes = chain(el);
-        const focusedSnapshot = snapshot(nodes);
+        const focusedSnapshot = await settledSnapshot(nodes);
         el.blur();
-        const blurredSnapshot = snapshot(nodes);
+        const blurredSnapshot = await settledSnapshot(nodes);
         el.focus();
         const hasVisibleFocus = focusedSnapshot.some(
           (focused, i) =>
@@ -920,12 +1050,16 @@ async function checkKeyboardTraversal(browser, baseUrl) {
 }
 
 /**
- * `--session-handoff --disclosure-scope all-live-content`: the Plan-10
- * handoff RED. Mounts `/session` alone (it never needs the library-snapshot
- * stub) and asserts the session landmark/skip target, Transcript button
- * semantics, and D-08 Branch A's joint typed+voice gating. This mode is
- * EXPECTED to fail until Plan 10 lands; Task 12 reruns this exact command
- * on the combined tree and requires it to pass there.
+ * `--session-handoff --disclosure-scope all-live-content`: mounts a real
+ * `/session` and asserts the session landmark/skip target, Transcript
+ * button semantics, and D-08 Branch A's joint typed+voice gating.
+ *
+ * Reaching a real `LiveSessionShell` render needs a real synthetic
+ * agent-service (`startSyntheticAgent`) plus
+ * `routeSyntheticSessionProjection`'s same-origin projection interception
+ * — see `frontend-harness.mjs`'s doc comments for the confirmed reason no
+ * signed capability (a real click-through start, or the agent's own
+ * projection route) is reachable from a database-free harness at all.
  *
  * @param {{ disclosureScope: "all-live-content" }} options
  */
@@ -933,97 +1067,138 @@ async function runSessionHandoffCheck({ disclosureScope }) {
   const artifactDir = path.join(repoRoot, "artifacts/frontend-accessibility");
   mkdirSync(artifactDir, { recursive: true });
   const failures = [];
-  await withFrontendDevServer({ artifactDir }, async ({ baseUrl }) => {
-    const browser = await launchChromium();
-    try {
-      const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-      const page = await context.newPage();
-      try {
-        await gotoRouteReady(page, baseUrl, "/session");
+  const agent = await startSyntheticAgent({ artifactDir });
+  try {
+    await withFrontendDevServer(
+      {
+        artifactDir,
+        extraEnv: {
+          NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: agent.url,
+          NEXT_PUBLIC_VIVA_AGENT_WS_URL: agent.wsUrl,
+        },
+      },
+      async ({ baseUrl }) => {
+        const browser = await launchChromium();
+        try {
+          const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+          const page = await context.newPage();
+          try {
+            const openedWebSocketUrls = [];
+            page.on("websocket", (socket) => openedWebSocketUrls.push(socket.url()));
+            await routeSyntheticSessionProjection(page);
+            await page.goto(toHydratableUrl(syntheticSessionUrl(baseUrl)), {
+              timeout: 120_000,
+              waitUntil: "load",
+            });
+            await page.waitForSelector(".live-session", { state: "attached", timeout: 30_000 });
+            await page.waitForSelector(".voice-trace[data-render-mode]", { timeout: 15_000 });
+            await page.evaluate(() => document.fonts.ready);
 
-        // Item 1 (session half): exactly one <main>, plus a visible-on-focus
-        // skip link targeting the active question/answer region.
-        const mainCount = await page.evaluate(() => document.querySelectorAll("main").length);
-        if (mainCount !== 1) {
-          failures.push(
-            `/session must expose exactly one <main>, found ${mainCount} (Plan 10 handoff, FRONTEND-002 item 1)`,
-          );
-        }
-        const hasSkipLink = await page.evaluate(() =>
-          [...document.querySelectorAll('a[href^="#"]')].some((a) =>
-            /skip/i.test(a.textContent ?? ""),
-          ),
-        );
-        if (!hasSkipLink) {
-          failures.push(
-            "/session has no visible-on-focus skip link targeting the active question/answer region (Plan 10 handoff, FRONTEND-002 item 1)",
-          );
-        }
-
-        // FRONTEND-006: Transcript is a real button with aria-expanded and
-        // stable aria-controls, not a bare <details>/<summary> pair.
-        const transcript = await page.evaluate(() => {
-          const button = [...document.querySelectorAll("button")].find(
-            (el) => (el.textContent ?? "").trim() === "Transcript",
-          );
-          if (button) {
-            return {
-              kind: "button",
-              hasAriaExpanded: button.hasAttribute("aria-expanded"),
-              hasAriaControls: button.hasAttribute("aria-controls"),
-            };
-          }
-          const summary = [...document.querySelectorAll("summary")].find(
-            (el) => (el.textContent ?? "").trim() === "Transcript",
-          );
-          if (summary) return { kind: "details-summary" };
-          return { kind: "missing" };
-        });
-        if (
-          transcript.kind !== "button" ||
-          !transcript.hasAriaExpanded ||
-          !transcript.hasAriaControls
-        ) {
-          failures.push(
-            `Transcript is not a real button with aria-expanded/aria-controls semantics (found: ${JSON.stringify(
-              transcript,
-            )}) (Plan 10 handoff, FRONTEND-006)`,
-          );
-        }
-
-        // D-08 Branch A: acknowledgment must jointly gate typed and voice
-        // live content, not only the microphone. Proven here by observing
-        // that the question/answer stage stays fully reachable while the
-        // disclosure banner is still shown unacknowledged.
-        if (disclosureScope === "all-live-content") {
-          const gating = await page.evaluate(() => {
-            const consentShown = Boolean(document.querySelector(".session-consent"));
-            const stage = document.querySelector(".live-session__stage");
-            if (!stage) return { consentShown, stageBlocked: null };
-            const style = getComputedStyle(stage);
-            const stageBlocked =
-              style.display === "none" ||
-              style.visibility === "hidden" ||
-              stage.hasAttribute("inert") ||
-              stage.getAttribute("aria-hidden") === "true";
-            return { consentShown, stageBlocked };
-          });
-          if (gating.consentShown && gating.stageBlocked !== true) {
-            failures.push(
-              "D-08 Branch A requires both typed and voice live content to be blocked until the " +
-                "disclosure is acknowledged, but the question/answer stage remains reachable while " +
-                "the disclosure banner is still shown unacknowledged (Plan 10 handoff, " +
-                "FRONTEND-005/WEBSESSION-DISCLOSURE-01)",
+            // Item 1 (session half): exactly one <main>, plus a visible-on-focus
+            // skip link targeting the active question/answer region.
+            const mainCount = await page.evaluate(() => document.querySelectorAll("main").length);
+            if (!checkMainLandmarkCount(mainCount)) {
+              failures.push(
+                `/session must expose exactly one <main>, found ${mainCount} (Plan 10 handoff, FRONTEND-002 item 1)`,
+              );
+            }
+            const hasSkipLink = await page.evaluate(() =>
+              [...document.querySelectorAll('a[href^="#"]')].some((a) =>
+                /skip/i.test(a.textContent ?? ""),
+              ),
             );
+            if (!hasSkipLink) {
+              failures.push(
+                "/session has no visible-on-focus skip link targeting the active question/answer region (Plan 10 handoff, FRONTEND-002 item 1)",
+              );
+            }
+
+            // FRONTEND-006: Transcript is a real button with aria-expanded and
+            // stable aria-controls, not a bare <details>/<summary> pair.
+            // A-27.3: Plan 10's real label is "Show transcript" — this
+            // originally matched the bare word "Transcript", which never
+            // matched anything real once Plan 10 landed.
+            const transcript = await page.evaluate(() => {
+              const button = [...document.querySelectorAll("button")].find(
+                (el) => (el.textContent ?? "").trim() === "Show transcript",
+              );
+              if (button) {
+                return {
+                  kind: "button",
+                  hasAriaExpanded: button.hasAttribute("aria-expanded"),
+                  hasAriaControls: button.hasAttribute("aria-controls"),
+                };
+              }
+              const summary = [...document.querySelectorAll("summary")].find(
+                (el) => (el.textContent ?? "").trim() === "Show transcript",
+              );
+              if (summary) return { kind: "details-summary" };
+              return { kind: "missing" };
+            });
+            if (!checkTranscriptButtonSemantics(transcript)) {
+              failures.push(
+                `Transcript is not a real button with aria-expanded/aria-controls semantics (found: ${JSON.stringify(
+                  transcript,
+                )}) (Plan 10 handoff, FRONTEND-006)`,
+              );
+            }
+
+            // D-08 Branch A: acknowledgment must jointly gate typed and voice
+            // live content, not only the microphone, until the disclosure is
+            // acknowledged. Proven two ways while the banner is still shown
+            // unacknowledged: (1) no live-provider connection is even attempted
+            // — the real synthetic agent's own `/ws` URL never opens as a
+            // WebSocket, which is the mounted, black-box observation behind
+            // "before Viva sends anything to the live provider" — and (2) no
+            // *enabled* typed-answer or microphone-start control is reachable
+            // in the stage. Neither is a container-inertness assumption: Plan
+            // 10's `consentDisclosure` prop only ever decides whether to render
+            // the banner itself (confirmed by reading `QuestionStage.tsx`,
+            // which never reads `consentDisclosure`/`acknowledged` at all), so
+            // asserting the stage container is marked `inert`/`aria-hidden`
+            // would fail against a real, correctly-gated implementation that
+            // (as here) withholds the connection and the answer surface instead
+            // of hiding a stage that still legitimately shows the question.
+            if (disclosureScope === "all-live-content") {
+              const consentShown = await page.evaluate(() =>
+                Boolean(document.querySelector(".session-consent")),
+              );
+              const liveConnectionAttempted = openedWebSocketUrls.includes(agent.wsUrl);
+              const answerSurfaceReachable = await page.evaluate(() => {
+                const stage = document.querySelector(".live-session__stage");
+                if (!stage) return false;
+                const isEnabled = (el) =>
+                  !("disabled" in el && el.disabled) && el.getAttribute("aria-disabled") !== "true";
+                return [...stage.querySelectorAll("textarea, button, [role=button]")].some((el) => {
+                  if (!isEnabled(el)) return false;
+                  if (el.tagName === "TEXTAREA") return true;
+                  const name = (el.getAttribute("aria-label") ?? el.textContent ?? "")
+                    .trim()
+                    .toLowerCase();
+                  return /answer|speak|record|microphone/.test(name);
+                });
+              });
+              if (consentShown && (liveConnectionAttempted || answerSurfaceReachable)) {
+                failures.push(
+                  "D-08 Branch A requires both typed and voice live content to be blocked until the " +
+                    "disclosure is acknowledged, but while the disclosure banner is still shown " +
+                    `unacknowledged: live-provider connection attempted=${liveConnectionAttempted}, ` +
+                    `an enabled answer/microphone control was reachable=${answerSurfaceReachable} ` +
+                    "(Plan 10 handoff, FRONTEND-005/WEBSESSION-DISCLOSURE-01)",
+                );
+              }
+            }
+          } finally {
+            await context.close();
           }
+        } finally {
+          await browser.close();
         }
-      } finally {
-        await context.close();
-      }
-    } finally {
-      await browser.close();
-    }
-  });
+      },
+    );
+  } finally {
+    await agent.close();
+  }
   return failures;
 }
 
@@ -1597,7 +1772,9 @@ async function runDeletionCheck() {
         const browser = await launchChromium();
         try {
           for (const target of DELETION_CHECK_TARGETS) {
-            failures.push(...(await checkDeliberateDeletionFlow(browser, hydratableBaseUrl, target)));
+            failures.push(
+              ...(await checkDeliberateDeletionFlow(browser, hydratableBaseUrl, target)),
+            );
           }
         } finally {
           await browser.close();
@@ -1864,13 +2041,14 @@ async function checkNormalAssetLoad(browser, baseUrl) {
     }
 
     const requestedWebp = requestedUrls.some((url) => url.endsWith("/viva-muse.webp"));
-    const requestedPng = requestedUrls.some((url) => url.endsWith("/viva-muse.png"));
+    const pngTransferCount = requestedUrls.filter((url) => url.endsWith("/viva-muse.png")).length;
     if (!requestedWebp) {
       failures.push("[assets] a normal load never requested /viva-muse.webp");
     }
-    if (requestedPng) {
+    if (!checkNoPngDuringHealthyLoad(pngTransferCount)) {
       failures.push(
-        "[assets] a normal WebP-capable load unexpectedly requested /viva-muse.png too",
+        `[assets] a normal WebP-capable load unexpectedly transferred /viva-muse.png ` +
+          `${pngTransferCount} time(s) too`,
       );
     }
 
@@ -2063,7 +2241,18 @@ function fail(message) {
   process.exitCode = 1;
 }
 
-main().catch((error) => {
-  console.error(error?.stack ?? String(error));
-  process.exitCode = 1;
-});
+// A-27.3/Task 11: only run the CLI when this file is executed directly
+// (`node scripts/frontend-accessibility.mjs ...`), never when imported —
+// `scripts/frontend-quality.test.mjs` imports this module's pure
+// `checkMainLandmarkCount`/etc. exports specifically so it can test them
+// "without running browsers" (its own owning requirement); an unguarded
+// top-level `main()` call would launch a real mounted check, and any
+// eventual failure there would silently corrupt `process.exitCode` for
+// that entire, unrelated `node --test` run. Mirrors `scripts/dev-agent.mjs`'s
+// own identical guard.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((error) => {
+    console.error(error?.stack ?? String(error));
+    process.exitCode = 1;
+  });
+}
