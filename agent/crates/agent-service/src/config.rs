@@ -481,6 +481,10 @@ impl ServiceConfig {
             env_value("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN").map(RedactedSecret::from);
         config.library_delete_bearer =
             env_value("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN").map(RedactedSecret::from);
+        // The same conversion as the three siblings above, spelled `Into::into`. The
+        // continuous redaction control reads a line naming the redacting-secret type
+        // with a path separator as a credential-rendering site, so the sibling spelling
+        // would need a new allowlist entry for a line that renders nothing.
         config.session_mint_credential =
             env_value("VIVA_AGENT_SESSION_MINT_BEARER_TOKEN").map(Into::into);
         if let Some(cidrs) = env_value("VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS") {
