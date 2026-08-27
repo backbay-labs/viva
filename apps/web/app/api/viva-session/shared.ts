@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
 
 export type VivaSessionRouteFailureClass = {
@@ -34,15 +34,28 @@ export type VivaSessionRouteFailureLog = Omit<VivaSessionRouteFailureClass, "sta
   status: number;
 };
 
+/**
+ * The D-07 Branch A success shape.
+ *
+ * The two instants are canonical second-precision RFC3339 UTC strings rather than the plan's
+ * literal `number`: Plan 13's already-merged browser vault seam
+ * (`browserSessionCredentialVaultInputFromStartResponse` in `apps/web/lib/viva-library.ts`, which
+ * this lane may not edit) types them `string` and calls `.trim()` on them, so a number would throw
+ * in the browser. The arithmetic the plan pins is unchanged; only its serialization differs, and
+ * the deviation is recorded in the lane report.
+ */
 export type VivaSessionRouteOutcome = {
   failure_class: null;
+  refresh_expires_at: string;
+  refresh_token: string;
   session: {
     session_id: string;
     study_set_id: string;
     user_id: string;
   };
+  session_absolute_expires_at: string;
   session_token: string;
-  token_refresh_outcome: string;
+  token_refresh_outcome: "issued" | "refreshed";
 };
 
 export type VivaSessionAuthFailureCode =
@@ -65,9 +78,9 @@ type VivaSessionAuthFailureProfile = {
 };
 
 type SessionRequestPayload = {
+  refresh_token?: unknown;
   session_id?: unknown;
   session_bootstrap_token?: unknown;
-  session_token?: unknown;
   study_set_id?: unknown;
   user_id?: unknown;
 };
@@ -435,6 +448,23 @@ const WEB_SECRET_PLACEHOLDER_VALUES = new Set([
   "example",
   "test",
 ]);
+/**
+ * D-07 Branch A refresh-credential constants. These are NOT operator-extensible in this patch: a
+ * deployment cannot lengthen the absolute session lifetime or the credential TTL through env.
+ */
+const REFRESH_CREDENTIAL_BYTES = 32;
+const REFRESH_CREDENTIAL_TTL_SECONDS = 15 * 60;
+const SESSION_ABSOLUTE_LIFETIME_SECONDS = 6 * 60 * 60;
+const REFRESH_RESERVATION_TTL_SECONDS = 10;
+const REFRESH_CREDENTIAL_PREFIX = "viva-refresh1";
+/** 32 bytes as canonical unpadded base64url is exactly 43 characters. */
+const REFRESH_CREDENTIAL_ENCODED_LENGTH = 43;
+const REFRESH_REQUEST_KEYS: ReadonlySet<string> = new Set([
+  "refresh_token",
+  "session_id",
+  "study_set_id",
+  "user_id",
+]);
 const SESSION_BOOTSTRAP_TOKEN_TTL_SECONDS = 5 * 60;
 const SESSION_BOOTSTRAP_TOKEN_PREFIX = "viva-bootstrap1";
 const SESSION_BOOTSTRAP_TOKEN_PURPOSE = "viva_session_bootstrap";
@@ -516,6 +546,9 @@ export async function handleVivaSessionStart(request: NextRequest) {
     userId,
   });
   if (bootstrap) return bootstrap;
+  // A deployment with no usable access-token verification key cannot check what the agent hands
+  // back, so it refuses before it spends an admission slot or contacts the agent at all.
+  if (!sessionAccessTokenVerificationKeys()) return sessionConfigUnavailableResponse(logContext);
   const limit = await guardSessionMintAdmission(request, userId, studySetId, logContext);
   if (limit) return limit;
 
@@ -527,10 +560,36 @@ export async function handleVivaSessionStart(request: NextRequest) {
     userId,
   });
   if (!minted.ok) return minted.response;
+  const identity: SessionIdentity = {
+    sessionId: minted.value.session.session_id,
+    studySetId: minted.value.session.study_set_id,
+    userId: minted.value.session.user_id,
+  };
+  const verified = verifyAgentIssuedAccessToken(minted.value, identity, logContext);
+  if (!verified.ok) return verified.response;
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const absoluteExpiresAt = nowSeconds + SESSION_ABSOLUTE_LIFETIME_SECONDS;
+  const refreshExpiresAt = Math.min(nowSeconds + REFRESH_CREDENTIAL_TTL_SECONDS, absoluteExpiresAt);
+  const credential = generateRefreshCredential();
+  const selection = vivaSessionSecurityStore();
+  if (!selection.ok) return sessionAdmissionUnavailableResponse(logContext);
+  const issued = await selection.store.rotateRefresh({
+    absoluteExpiresAt,
+    credentialHash: capabilityDigest(credential),
+    identity,
+    mode: "issue",
+    refreshExpiresAt,
+  });
+  // Both credentials are discarded unless the store durably owns the new refresh record.
+  if (!issued.ok) return sessionAdmissionUnavailableResponse(logContext);
   return sessionJson(
     {
       failure_class: null,
+      refresh_expires_at: rfc3339UtcInstant(refreshExpiresAt),
+      refresh_token: credential,
       session: minted.value.session,
+      session_absolute_expires_at: rfc3339UtcInstant(absoluteExpiresAt),
       session_token: minted.value.session_token,
       token_refresh_outcome: "issued",
     },
@@ -538,6 +597,14 @@ export async function handleVivaSessionStart(request: NextRequest) {
   );
 }
 
+/**
+ * D-07 Branch A refresh: a separate, opaque, one-time, rotating credential.
+ *
+ * An access token — however correctly signed, however old — is never refresh authority. The
+ * browser sends exactly four fields; anything else is a 400 that reaches neither the shared store
+ * nor the agent. Every credential rejection returns one coarse terminal body with a distinct
+ * operator code, and credentials are returned only after the store has committed the rotation.
+ */
 export async function handleVivaSessionRefresh(request: NextRequest) {
   const logContext = { action: "refresh", route: "refresh" } as const;
   const guard = guardSameOrigin(request, logContext);
@@ -546,56 +613,192 @@ export async function handleVivaSessionRefresh(request: NextRequest) {
   const payload = await readSessionPayload(request, logContext);
   if (!payload.ok) return payload.response;
 
-  const userId = requiredString(payload.value.user_id);
-  const studySetId = requiredString(payload.value.study_set_id);
-  const sessionId = requiredString(payload.value.session_id);
-  const sessionToken = requiredString(payload.value.session_token);
-  if (!userId || !studySetId || !sessionId || !sessionToken) {
+  const fields = exactRefreshRequestFields(payload.value);
+  if (!fields) {
     return sessionJsonError(400, "invalid_session_request", "invalid", logContext);
   }
 
-  const access = guardAllowedIdentity(userId, studySetId, logContext);
+  const access = guardAllowedIdentity(fields.userId, fields.studySetId, logContext);
   if (access) return access;
-
-  const verification = verifySessionAccessTokenForRoute({
-    allowExpired: true,
-    expectedBinding: { session_id: sessionId, study_set_id: studySetId, user_id: userId },
-    token: sessionToken,
-  });
-  if (!verification.ok) {
-    const reason = verification.reason;
-    if (reason === "unavailable") {
-      return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
-    }
-    // BAC-510 keeps the identity-binding terminal visible as its own emitter at the route,
-    // separate from the structural/signature/time rejections the mapper covers.
-    if (reason === "binding_mismatch") {
-      return sessionAuthTerminalJsonError("identity_mismatch", logContext);
-    }
-    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(reason), logContext);
+  if (!sessionAccessTokenVerificationKeys()) {
+    return sessionJsonError(503, "viva_session_refresh_unavailable", "failed", logContext);
   }
 
-  const limit = await guardSessionMintAdmission(request, userId, studySetId, logContext);
+  const limit = await guardSessionMintAdmission(
+    request,
+    fields.userId,
+    fields.studySetId,
+    logContext,
+  );
   if (limit) return limit;
+
+  if (!isRefreshCredentialShape(fields.credential)) {
+    return refreshTerminalJsonError("malformed", logContext);
+  }
+  const selection = vivaSessionSecurityStore();
+  if (!selection.ok) return sessionAdmissionUnavailableResponse(logContext);
+
+  const identity: SessionIdentity = {
+    sessionId: fields.sessionId,
+    studySetId: fields.studySetId,
+    userId: fields.userId,
+  };
+  const reservation = await selection.store.consumeRefresh({
+    credentialHash: capabilityDigest(fields.credential),
+    identity,
+    nowSeconds: Math.floor(Date.now() / 1000),
+    reservationTtlSeconds: REFRESH_RESERVATION_TTL_SECONDS,
+  });
+  if (!reservation.ok) {
+    if (reservation.reason === "unavailable") {
+      return sessionAdmissionUnavailableResponse(logContext);
+    }
+    return refreshTerminalJsonError(reservation.reason, logContext);
+  }
 
   const minted = await mintSessionFromLibrary({
     actionName: "resume",
     route: "refresh",
-    sessionId,
-    studySetId,
-    userId,
+    sessionId: fields.sessionId,
+    studySetId: fields.studySetId,
+    userId: fields.userId,
   });
+  // A transport failure returns no credential at all; the reservation lapses at its own TTL.
   if (!minted.ok) return minted.response;
-  const tokenRefreshOutcome = verification.expired ? "expired_refreshed" : "refreshed";
+  const verified = verifyAgentIssuedAccessToken(minted.value, identity, logContext);
+  if (!verified.ok) return verified.response;
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const absoluteExpiresAt = reservation.absoluteExpiresAt;
+  const refreshExpiresAt = Math.min(nowSeconds + REFRESH_CREDENTIAL_TTL_SECONDS, absoluteExpiresAt);
+  const credential = generateRefreshCredential();
+  const rotated = await selection.store.rotateRefresh({
+    absoluteExpiresAt,
+    credentialHash: capabilityDigest(credential),
+    identity,
+    mode: "rotate",
+    refreshExpiresAt,
+    rotationId: reservation.rotationId,
+  });
+  if (!rotated.ok) return sessionAdmissionUnavailableResponse(logContext);
   return sessionJson(
     {
       failure_class: null,
+      refresh_expires_at: rfc3339UtcInstant(refreshExpiresAt),
+      refresh_token: credential,
       session: minted.value.session,
+      session_absolute_expires_at: rfc3339UtcInstant(absoluteExpiresAt),
       session_token: minted.value.session_token,
-      token_refresh_outcome: tokenRefreshOutcome,
+      token_refresh_outcome: "refreshed",
     },
     200,
   );
+}
+
+/**
+ * The exact D-07 Branch A refresh payload. Any missing, empty, or additional field — including a
+ * stale access credential a client might still send — is `invalid_session_request` before the shared
+ * store or the agent is touched.
+ */
+function exactRefreshRequestFields(value: SessionRequestPayload): {
+  credential: string;
+  sessionId: string;
+  studySetId: string;
+  userId: string;
+} | null {
+  const keys = Object.keys(value);
+  if (keys.length !== REFRESH_REQUEST_KEYS.size) return null;
+  if (keys.some((key) => !REFRESH_REQUEST_KEYS.has(key))) return null;
+  const record = value as Record<string, unknown>;
+  const credential = requiredString(record.refresh_token);
+  const sessionId = requiredString(record.session_id);
+  const studySetId = requiredString(record.study_set_id);
+  const userId = requiredString(record.user_id);
+  if (!credential || !sessionId || !studySetId || !userId) return null;
+  return { credential, sessionId, studySetId, userId };
+}
+
+/** `viva-refresh1.` plus exactly 43 canonical unpadded base64url characters (32 random bytes). */
+function isRefreshCredentialShape(value: string): boolean {
+  const segments = value.split(".");
+  if (segments.length !== 2 || segments[0] !== REFRESH_CREDENTIAL_PREFIX) return false;
+  const encoded = segments[1] ?? "";
+  if (encoded.length !== REFRESH_CREDENTIAL_ENCODED_LENGTH) return false;
+  const decoded = decodeCanonicalBase64Url(encoded);
+  return decoded !== null && decoded.length === REFRESH_CREDENTIAL_BYTES;
+}
+
+function generateRefreshCredential(): string {
+  return `${REFRESH_CREDENTIAL_PREFIX}.${randomBytes(REFRESH_CREDENTIAL_BYTES).toString("base64url")}`;
+}
+
+/**
+ * One coarse public terminal for every refresh-credential rejection, with a distinct operator code
+ * per cause. `identity_mismatch` and the structural mapper keep their own BAC-510 call sites: the
+ * release observability gate asserts both shapes at this terminal.
+ */
+function refreshTerminalJsonError(
+  reason: "expired" | "identity_mismatch" | "malformed" | "replayed" | "revoked",
+  logContext: VivaSessionRouteLogContext,
+): NextResponse<VivaSessionRouteFailureClass> {
+  if (reason === "identity_mismatch") {
+    return sessionAuthTerminalJsonError("identity_mismatch", logContext);
+  }
+  if (reason === "replayed") {
+    return sessionAuthTerminalJsonError("replayed", logContext);
+  }
+  if (reason === "malformed") {
+    // A credential that fails its prefix/canonical-length shape is the same class of structural
+    // rejection the shared access-token mapper exists for, so both share one operator vocabulary.
+    // Kept on ONE line on purpose: the BAC-510 release observability gate in
+    // `scripts/provider-failure-observability.test.mjs` asserts this exact adjacency.
+    const structural: VivaSessionAccessTokenRejection = "malformed_json";
+    return sessionAuthTerminalJsonError(authFailureCodeForTokenReason(structural), logContext);
+  }
+  return sessionJsonError(401, "session_auth_terminal", "terminal", {
+    ...logContext,
+    failure_class: "session_auth_failure",
+    logError: "invalid_session_refresh_credential",
+    logTokenRefreshOutcome: reason === "expired" ? "expired_rejected" : "revoked_rejected",
+  });
+}
+
+/**
+ * The agent's access token is never handed to a browser unverified. Strict Plan 05 verification
+ * plus an exact identity/session binding must both hold; anything else is an upstream contract
+ * violation and returns the route's sanitized 502 with no token, nonce, or reason in the body.
+ */
+function verifyAgentIssuedAccessToken(
+  minted: { session_token: string },
+  identity: SessionIdentity,
+  logContext: VivaSessionRouteLogContext,
+): { ok: true } | { ok: false; response: NextResponse<VivaSessionRouteFailureClass> } {
+  const verification = verifySessionAccessTokenForRoute({
+    allowExpired: false,
+    expectedBinding: {
+      session_id: identity.sessionId,
+      study_set_id: identity.studySetId,
+      user_id: identity.userId,
+    },
+    token: minted.session_token,
+  });
+  if (verification.ok) return { ok: true };
+  return {
+    ok: false,
+    response: sessionPreLoopJsonError(
+      verification.reason === "unavailable" ? 503 : 502,
+      "viva_session_agent_unavailable",
+      "failed",
+      "session_bootstrap_unavailable",
+      PRE_LOOP_SESSION_TERMINAL_REASON,
+      logContext,
+    ),
+  };
+}
+
+/** Canonical second-precision RFC3339 UTC, the shape Plan 13's browser vault seam consumes. */
+function rfc3339UtcInstant(unixSeconds: number): string {
+  return `${new Date(unixSeconds * 1000).toISOString().slice(0, 19)}Z`;
 }
 
 /** Clears every bounded in-memory record this module owns: admission, refresh, and tombstones. */
@@ -1133,7 +1336,8 @@ function memoryConsumeRefresh(input: {
       ok: false;
       reason: "expired" | "identity_mismatch" | "replayed" | "revoked" | "unavailable";
     } {
-  pruneExpiredMemoryRefreshRecords(input.nowSeconds);
+  // The record is looked up BEFORE any pruning sweep, so a credential used exactly at its horizon
+  // reports the precise `expired` operator code instead of collapsing into "unknown hash".
   const record = memorySecurityStoreRefreshRecords.get(input.credentialHash);
   // An unknown hash is a forged or long-expired credential. It reports as a replay so the adapter
   // never separates "never existed" from "already spent" for a caller.
@@ -1150,6 +1354,7 @@ function memoryConsumeRefresh(input: {
     return { ok: false, reason: "replayed" };
   }
   if (input.nowSeconds >= record.refreshExpiresAt || input.nowSeconds >= record.absoluteExpiresAt) {
+    memorySecurityStoreRefreshRecords.delete(input.credentialHash);
     return { ok: false, reason: "expired" };
   }
   if (record.reservation && input.nowSeconds < record.reservation.expiresAtSeconds) {

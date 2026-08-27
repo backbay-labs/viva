@@ -1,11 +1,12 @@
 import * as bunTest from "bun:test";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { NextRequest } from "next/server";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   guardVivaSessionProjectionAdmission,
   resetVivaSessionSecurityStoreForTests,
+  type SessionSecurityStore,
   type SessionTokenClaims,
   signVivaLibraryControlToken,
   signVivaSessionBootstrapToken,
@@ -126,9 +127,10 @@ describe("Viva same-origin session API", () => {
 
   test("start mints through the server REST bearer without reflecting secrets", async () => {
     const calls: Array<{ input: string; init?: RequestInit }> = [];
+    const agentAccessToken = signedAgentAccessToken();
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ input: String(input), init });
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: agentAccessToken }));
     }) as typeof fetch;
 
     const response = await startSession(
@@ -142,16 +144,26 @@ describe("Viva same-origin session API", () => {
     const headers = new Headers(calls[0]?.init?.headers);
     expect(headers.get("authorization")).toBe(`Bearer ${SCOPED_SESSION_MINT_BEARER}`);
     expect(headers.get("origin")).toBe(CANONICAL_WEB_ORIGIN);
-    expect(body).toEqual({
-      failure_class: null,
-      session: {
-        session_id: "server-session",
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      },
-      session_token: "viva1.redacted-start-token",
-      token_refresh_outcome: "issued",
+    expect(Object.keys(body).sort()).toEqual([
+      "failure_class",
+      "refresh_expires_at",
+      "refresh_token",
+      "session",
+      "session_absolute_expires_at",
+      "session_token",
+      "token_refresh_outcome",
+    ]);
+    expect(body.failure_class).toBe(null);
+    expect(body.session).toEqual({
+      session_id: "server-session",
+      study_set_id: "biology-midterm",
+      user_id: "synthetic-user",
     });
+    expect(body.session_token).toBe(agentAccessToken);
+    expect(body.token_refresh_outcome).toBe("issued");
+    expect(typeof body.refresh_token).toBe("string");
+    expect(typeof body.refresh_expires_at).toBe("string");
+    expect(typeof body.session_absolute_expires_at).toBe("string");
     const serialized = JSON.stringify(body);
     // The credential this path actually sends upstream is the scoped mint bearer asserted above,
     // so that is the string whose absence proves nothing leaked back to the browser.
@@ -216,7 +228,7 @@ describe("Viva same-origin session API", () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       observedSignal = init?.signal ?? undefined;
       if (!observedSignal) {
-        return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+        return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
       }
       return new Promise<Response>((_resolve, reject) => {
         observedSignal?.addEventListener("abort", () => {
@@ -414,7 +426,7 @@ describe("Viva same-origin session API", () => {
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "http://127.0.0.1:4318";
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const response = await startSession(
@@ -463,10 +475,7 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
     const requestBody = sessionStartPayload();
 
     const first = await startSession(sessionRequest("/api/viva-session/start", requestBody));
@@ -504,10 +513,7 @@ describe("Viva same-origin session API", () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
 
     const first = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload(), {
@@ -580,75 +586,6 @@ describe("Viva same-origin session API", () => {
     }
   });
 
-  test("refresh replaces an expired same-identity token and records the refresh outcome", async () => {
-    const calls: Array<{ input: string; init?: RequestInit }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ input: String(input), init });
-      return jsonResponse(200, librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }));
-    }) as typeof fetch;
-
-    const response = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
-          sessionTokenClaims({
-            expires_at: 1_000_000,
-            issued_at: 900_000,
-            nonce: "expired-nonce",
-            not_before: 900_000,
-          }),
-        ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
-    );
-    const body = (await response.json()) as VivaSessionRouteOutcome;
-
-    expect(response.status).toBe(200);
-    expect(calls).toHaveLength(1);
-    expect(body).toEqual({
-      failure_class: null,
-      session: {
-        session_id: "server-session",
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      },
-      session_token: "viva1.redacted-refresh-token",
-      token_refresh_outcome: "expired_refreshed",
-    });
-  });
-
-  test("refresh records a normal same-identity token refresh separately from expiry recovery", async () => {
-    const calls: Array<{ input: string; init?: RequestInit }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ input: String(input), init });
-      return jsonResponse(200, librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }));
-    }) as typeof fetch;
-
-    const response = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(sessionTokenClaims({ nonce: "valid-refresh-nonce" })),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
-    );
-    const body = (await response.json()) as VivaSessionRouteOutcome;
-
-    expect(response.status).toBe(200);
-    expect(calls).toHaveLength(1);
-    expect(body).toEqual({
-      failure_class: null,
-      session: {
-        session_id: "server-session",
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      },
-      session_token: "viva1.redacted-refresh-token",
-      token_refresh_outcome: "refreshed",
-    });
-  });
-
   test("refresh requires the server-only session signing secret before contacting the agent", async () => {
     const calls: string[] = [];
     delete process.env.VIVA_VOICE_SESSION_TOKEN_SECRET;
@@ -658,12 +595,10 @@ describe("Viva same-origin session API", () => {
     }) as typeof fetch;
 
     const response = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(sessionTokenClaims({ nonce: "valid-nonce" })),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest(
+        "/api/viva-session/refresh",
+        refreshPayload("viva-refresh1.unused-credential"),
+      ),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -673,102 +608,6 @@ describe("Viva same-origin session API", () => {
       failure_class: "session_bootstrap_failed",
       token_refresh_outcome: "failed",
     });
-    expect(calls).toEqual([]);
-  });
-
-  test("refresh exposes only coarse terminal auth class for invalid token categories", async () => {
-    const calls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      calls.push(String(input));
-      return jsonResponse(500, { error: "should_not_call_agent" });
-    }) as typeof fetch;
-
-    const cases = [
-      {
-        forbiddenFragments: ["mismatch-nonce", "identity_mismatch", "other-user"],
-        token: signedSessionToken(
-          sessionTokenClaims({ nonce: "mismatch-nonce", user_id: "other-user" }),
-        ),
-      },
-      {
-        forbiddenFragments: ["invalid-signature-nonce", "invalid_signature", "invalid_rejected"],
-        token: signedSessionToken(
-          sessionTokenClaims({ nonce: "invalid-signature-nonce" }),
-          "viva-fixture-unrelated-signing-secret-000",
-        ),
-      },
-      {
-        forbiddenFragments: ["not-a-viva-token", "malformed", "malformed_rejected"],
-        token: "not-a-viva-token",
-      },
-    ];
-    const observed = [];
-    const warnings: string[] = [];
-    const originalWarn = console.warn;
-    console.warn = (message?: unknown) => {
-      warnings.push(String(message));
-    };
-    try {
-      for (const input of cases) {
-        const response = await refreshSession(
-          sessionRequest("/api/viva-session/refresh", {
-            session_id: "server-session",
-            session_token: input.token,
-            study_set_id: "biology-midterm",
-            user_id: "synthetic-user",
-          }),
-        );
-        const body = (await response.json()) as VivaSessionRouteFailureClass;
-        observed.push({ body, status: response.status });
-        const serialized = JSON.stringify(body);
-        for (const fragment of input.forbiddenFragments) {
-          expect(serialized).not.toContain(fragment);
-        }
-      }
-    } finally {
-      console.warn = originalWarn;
-    }
-
-    expect(observed).toEqual([
-      {
-        status: 401,
-        body: {
-          error: "session_auth_terminal",
-          failure_class: "session_auth_failure",
-          token_refresh_outcome: "terminal",
-        },
-      },
-      {
-        status: 401,
-        body: {
-          error: "session_auth_terminal",
-          failure_class: "session_auth_failure",
-          token_refresh_outcome: "terminal",
-        },
-      },
-      {
-        status: 401,
-        body: {
-          error: "session_auth_terminal",
-          failure_class: "session_auth_failure",
-          token_refresh_outcome: "terminal",
-        },
-      },
-    ]);
-    const logPayloads = warnings.map((entry) => JSON.parse(entry));
-    expect(logPayloads.map((entry) => entry.error)).toEqual([
-      "invalid_session_identity",
-      "invalid_session_token",
-      "invalid_session_token",
-    ]);
-    expect(logPayloads.map((entry) => entry.token_refresh_outcome)).toEqual([
-      "identity_mismatch",
-      "invalid_rejected",
-      "malformed_rejected",
-    ]);
-    expect(JSON.stringify(logPayloads)).not.toContain("mismatch-nonce");
-    expect(JSON.stringify(logPayloads)).not.toContain("invalid-signature-nonce");
-    expect(JSON.stringify(logPayloads)).not.toContain("not-a-viva-token");
     expect(calls).toEqual([]);
   });
 
@@ -1065,15 +904,10 @@ describe("Viva web credential configuration", () => {
     };
 
     const response = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
-          sessionTokenClaims({ nonce: "weak-secret-nonce" }),
-          STRONG_SESSION_SECRET,
-        ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest(
+        "/api/viva-session/refresh",
+        refreshPayload("viva-refresh1.unused-credential"),
+      ),
     );
     const body = (await response.json()) as VivaSessionRouteFailureClass;
 
@@ -1090,64 +924,55 @@ describe("Viva web credential configuration", () => {
   });
 
   test("accepts previous verification key during rotation without signing with it", async () => {
+    // D-07 Branch A moved access-token verification off the browser payload and onto the token the
+    // agent returns, so the active/previous rotation rule is proved through the surviving path.
     process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_SESSION_SECRET;
     process.env.VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET = STRONG_PREVIOUS_SESSION_SECRET;
+    let agentToken = signedSessionToken(
+      sessionTokenClaims({ nonce: "previous-key-nonce" }),
+      STRONG_PREVIOUS_SESSION_SECRET,
+    );
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ resumeToken: "viva1.redacted-refresh-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: agentToken }))) as typeof fetch;
 
-    const rotated = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
-          sessionTokenClaims({ nonce: "previous-key-nonce" }),
-          STRONG_PREVIOUS_SESSION_SECRET,
-        ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+    const rotated = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const rotatedBody = (await rotated.json()) as VivaSessionRouteOutcome;
 
-    const active = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
-          sessionTokenClaims({ nonce: "active-key-nonce" }),
-          STRONG_SESSION_SECRET,
-        ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+    agentToken = signedSessionToken(
+      sessionTokenClaims({ nonce: "active-key-nonce" }),
+      STRONG_SESSION_SECRET,
+    );
+    const active = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
 
     expect(rotated.status).toBe(200);
-    expect(rotatedBody.token_refresh_outcome).toBe("refreshed");
+    expect(rotatedBody.token_refresh_outcome).toBe("issued");
     expect(active.status).toBe(200);
 
-    // The previous key is verify-only: it must never become the active signer.
+    // The previous key is verify-only: it must never become the active signer, and a token signed
+    // with neither the active nor the previous key is never handed to the browser.
     process.env.VIVA_VOICE_SESSION_TOKEN_SECRET = STRONG_ROTATED_SESSION_SECRET;
-    const staleActive = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(
-          sessionTokenClaims({ nonce: "stale-active-nonce" }),
-          "viva-fixture-unrelated-signing-secret-000",
-        ),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+    agentToken = signedSessionToken(
+      sessionTokenClaims({ nonce: "stale-active-nonce" }),
+      "viva-fixture-unrelated-signing-secret-000",
+    );
+    const staleActive = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
     );
     const staleBody = (await staleActive.json()) as VivaSessionRouteFailureClass;
 
-    expect(staleActive.status).toBe(401);
+    expect(staleActive.status).toBe(502);
     expect(staleBody).toEqual({
-      error: "session_auth_terminal",
-      failure_class: "session_auth_failure",
-      token_refresh_outcome: "terminal",
+      error: "viva_session_agent_unavailable",
+      failure_class: "session_bootstrap_unavailable",
+      stage: "pre_loop",
+      terminal_reason: "pre_loop_session_unavailable",
+      token_refresh_outcome: "failed",
     });
+    expect(JSON.stringify(staleBody)).not.toContain("stale-active-nonce");
   });
 });
 
@@ -1178,12 +1003,10 @@ describe("Viva canonical origin authority", () => {
     );
     const startBody = (await start.json()) as VivaSessionRouteFailureClass;
     const refresh = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(sessionTokenClaims({ nonce: "no-canonical-nonce" })),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest(
+        "/api/viva-session/refresh",
+        refreshPayload("viva-refresh1.unused-credential"),
+      ),
     );
     const refreshBody = (await refresh.json()) as VivaSessionRouteFailureClass;
 
@@ -1303,7 +1126,7 @@ describe("Viva canonical origin authority", () => {
     const calls: Array<{ init?: RequestInit }> = [];
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ init });
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const spoofHeaders = {
@@ -1338,10 +1161,7 @@ describe("Viva canonical origin authority", () => {
   test("canonical origin accepts a bootstrap capability minted under the previous signing key", async () => {
     process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_PREVIOUS_SECRET = STRONG_PREVIOUS_BOOTSTRAP_SECRET;
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
 
     const rotated = await startSession(
       sessionRequest("/api/viva-session/start", {
@@ -1500,7 +1320,7 @@ describe("Viva scoped service credential selection", () => {
     const calls: Array<{ init?: RequestInit }> = [];
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ init });
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const response = await startSession(
@@ -1548,7 +1368,7 @@ describe("Viva scoped service credential selection", () => {
     process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL_WEB_ORIGIN;
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ init });
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const withoutEscapeHatch = await startSession(
@@ -1590,7 +1410,7 @@ describe("Viva scoped service credential selection", () => {
     process.env.VIVA_AGENT_REST_BEARER_TOKEN = "viva-fixture-legacy-rest-bearer";
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const weakValues = ["short-mint-bearer", "changeme", `viva-${"m".repeat(600)}`];
@@ -1632,10 +1452,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
 
     // Same trusted hop, attacker-rotated left prefixes AND attacker-supplied platform headers.
     // None of them may mint a fresh admission bucket.
@@ -1673,14 +1490,15 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "2";
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "1";
     process.env.VIVA_SESSION_ALLOWED_USER_IDS = "synthetic-user,alternate-user";
-    globalThis.fetch = (async (input: RequestInfo | URL) =>
-      jsonResponse(
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const userId = new URL(String(input)).searchParams.get("user_id") ?? "synthetic-user";
+      // The agent's token is now strictly verified against the minted identity, so the fixture
+      // must sign one that actually binds the user it is answering for.
+      return jsonResponse(
         200,
-        librarySnapshot({
-          startToken: "viva1.redacted-start-token",
-          userId: new URL(String(input)).searchParams.get("user_id") ?? "synthetic-user",
-        }),
-      )) as typeof fetch;
+        librarySnapshot({ startToken: signedAgentAccessToken({ user_id: userId }), userId }),
+      );
+    }) as typeof fetch;
 
     const first = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload(), {
@@ -1714,15 +1532,18 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
       const target = String(input);
       calls.push(target);
       if (target.startsWith(SESSION_SECURITY_STORE_ORIGIN)) {
-        const sent = JSON.parse(String(init?.body)) as { request_id: string };
+        const sent = JSON.parse(String(init?.body)) as { operation: string; request_id: string };
         return jsonResponse(200, {
-          operation: "increment_rate_limit",
+          operation: sent.operation,
           request_id: sent.request_id,
-          result: { ok: true, remaining: 11, resetAtMs: Date.now() + 60_000 },
+          result:
+            sent.operation === "increment_rate_limit"
+              ? { ok: true, remaining: 11, resetAtMs: Date.now() + 60_000 }
+              : { ok: true },
           schema_version: 1,
         });
       }
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const cases: Array<{
@@ -1772,6 +1593,8 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     expect(calls).toEqual([
       "https://session-store.example/v1/session-security",
       "https://agent.example/study-sets/library?user_id=synthetic-user",
+      // D-07 Branch A: the issued refresh record is committed to the same shared store.
+      "https://session-store.example/v1/session-security",
     ]);
   });
 
@@ -1779,7 +1602,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const rejected = ["0", "121", "-1", "12.5", "twelve", "1e2", "+12", "0x0c"];
@@ -1827,7 +1650,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const start = await startSession(
@@ -1835,12 +1658,10 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     );
     const startBody = (await start.json()) as VivaSessionRouteFailureClass;
     const refresh = await refreshSession(
-      sessionRequest("/api/viva-session/refresh", {
-        session_id: "server-session",
-        session_token: signedSessionToken(sessionTokenClaims()),
-        study_set_id: "biology-midterm",
-        user_id: "synthetic-user",
-      }),
+      sessionRequest(
+        "/api/viva-session/refresh",
+        refreshPayload("viva-refresh1.unused-credential"),
+      ),
     );
     const refreshBody = (await refresh.json()) as VivaSessionRouteFailureClass;
 
@@ -1865,7 +1686,7 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const response = await startSession(
@@ -2188,10 +2009,7 @@ describe("Viva shared security store adapters", () => {
   test("atomic shared rate admission shares one mint bucket with the start route", async () => {
     process.env.VIVA_SESSION_MINT_MAX_PER_MINUTE = "2";
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
     const selection = vivaSessionSecurityStore();
     if (!selection.ok) throw new Error("memory adapter must be selected in test mode");
 
@@ -2458,7 +2276,7 @@ describe("Viva session body byte cap", () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     const atLimit = await startSession(
@@ -2486,7 +2304,7 @@ describe("Viva session body byte cap", () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
 
     // Four bytes per astral character: well under 16 KiB by string length, over it by bytes.
@@ -2505,7 +2323,7 @@ describe("Viva session body byte cap", () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return jsonResponse(200, librarySnapshot({ startToken: "viva1.redacted-start-token" }));
+      return jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }));
     }) as typeof fetch;
     const oversized = paddedSessionPayload(16 * 1024 + 1);
 
@@ -2554,10 +2372,7 @@ describe("Viva session body byte cap", () => {
 
   test("body byte cap responses carry route-owned no-store, pragma, and nosniff headers", async () => {
     globalThis.fetch = (async () =>
-      jsonResponse(
-        200,
-        librarySnapshot({ startToken: "viva1.redacted-start-token" }),
-      )) as typeof fetch;
+      jsonResponse(200, librarySnapshot({ startToken: signedAgentAccessToken() }))) as typeof fetch;
 
     const success = await startSession(
       sessionRequest("/api/viva-session/start", sessionStartPayload()),
@@ -2580,6 +2395,423 @@ describe("Viva session body byte cap", () => {
  * suite pins the shared-store transaction primitive the route depends on, so a store that checks
  * and then inserts in two operations is caught here rather than only at the route.
  */
+/**
+ * Task 8A (`WEBAPI-011`), D-07 Branch A `retain-token-only`.
+ *
+ * The browser now holds a SEPARATE opaque refresh credential. An access token — however correctly
+ * signed, however old — is never refresh authority again.
+ *
+ * WIRE-SHAPE NOTE: the plan's Task 8A literal types `refresh_expires_at` and
+ * `session_absolute_expires_at` as `number`, but Plan 13's already-merged browser vault seam
+ * (`browserSessionCredentialVaultInputFromStartResponse` in `apps/web/lib/viva-library.ts`, which
+ * this lane may not edit) declares them `string` and calls `.trim()` on them — a number would throw
+ * in the browser. These assertions therefore pin canonical RFC3339 UTC strings whose parsed instant
+ * equals the plan's arithmetic exactly. See the lane ledger's recorded deviation.
+ */
+describe("Viva D-07 Branch A rotating refresh credentials", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionSecurityStoreForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionSecurityStoreForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("rotating refresh credential is a 256-bit opaque value stored only as its SHA-256", async () => {
+    const agentAccessToken = signedAgentAccessToken();
+    globalThis.fetch = agentSnapshotFetch(() => agentAccessToken);
+
+    const issued = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await issued.json()) as VivaSessionRouteOutcome;
+
+    expect(issued.status).toBe(200);
+    expect(body.token_refresh_outcome).toBe("issued");
+    expect(body.session_token).toBe(agentAccessToken);
+    const [prefix, encoded, ...rest] = body.refresh_token.split(".");
+    expect(prefix).toBe("viva-refresh1");
+    expect(rest).toEqual([]);
+    // 32 random bytes as canonical unpadded base64url is exactly 43 characters.
+    expect(/^[A-Za-z0-9_-]{43}$/.test(encoded ?? "")).toBe(true);
+    expect(Buffer.from(encoded ?? "", "base64url")).toHaveLength(32);
+    // Two starts never produce the same credential.
+    const second = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const secondBody = (await second.json()) as VivaSessionRouteOutcome;
+    expect(secondBody.refresh_token).not.toBe(body.refresh_token);
+
+    // Only the digest is stored: the raw credential never matches a store record, its digest does.
+    const store = selectedSecurityStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const rawLookup = await store.consumeRefresh({
+      credentialHash: body.refresh_token,
+      identity: refreshIdentity(),
+      nowSeconds,
+      reservationTtlSeconds: 10,
+    });
+    const digestLookup = await store.consumeRefresh({
+      credentialHash: sha256Hex(body.refresh_token),
+      identity: refreshIdentity(),
+      nowSeconds,
+      reservationTtlSeconds: 10,
+    });
+    expect(rawLookup).toEqual({ ok: false, reason: "replayed" });
+    expect(digestLookup).toMatchObject({ ok: true });
+  });
+
+  test("years-old access token cannot stand in for a rotating refresh credential", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(500, { error: "should_not_call_agent" });
+    }) as typeof fetch;
+    const yearsOldButCorrectlySigned = signedSessionToken(
+      sessionTokenClaims({
+        expires_at: 1_600_000_900,
+        issued_at: 1_600_000_000,
+        nonce: "years-old-nonce",
+        not_before: 1_600_000_000,
+      }),
+    );
+
+    const rejected = await Promise.all([
+      refreshSession(
+        sessionRequest("/api/viva-session/refresh", {
+          session_id: "server-session",
+          session_token: yearsOldButCorrectlySigned,
+          study_set_id: "biology-midterm",
+          user_id: "synthetic-user",
+        }),
+      ),
+      refreshSession(
+        sessionRequest("/api/viva-session/refresh", {
+          ...refreshPayload("viva-refresh1.unused-credential"),
+          session_token: yearsOldButCorrectlySigned,
+        }),
+      ),
+      refreshSession(sessionRequest("/api/viva-session/refresh", { session_id: "server-session" })),
+    ]);
+    const bodies = await Promise.all(rejected.map((response) => response.json()));
+
+    expect(rejected.map((response) => response.status)).toEqual([400, 400, 400]);
+    for (const body of bodies) {
+      expect(body).toEqual({
+        error: "invalid_session_request",
+        failure_class: "session_bootstrap_failed",
+        token_refresh_outcome: "invalid",
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  test("rotating refresh credential replay revokes the replacement and returns the coarse terminal", async () => {
+    let agentAccessToken = signedAgentAccessToken({ nonce: "issued-nonce" });
+    globalThis.fetch = agentSnapshotFetch(() => agentAccessToken);
+    const issued = await issuedCredentials();
+
+    agentAccessToken = signedAgentAccessToken({ nonce: "rotated-nonce" });
+    const rotated = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+    const rotatedBody = (await rotated.json()) as VivaSessionRouteOutcome;
+
+    expect(rotated.status).toBe(200);
+    expect(rotatedBody.token_refresh_outcome).toBe("refreshed");
+    expect(rotatedBody.refresh_token).not.toBe(issued.refresh_token);
+    expect(rotatedBody.session_token).not.toBe(issued.session_token);
+    expect(rotatedBody.session_absolute_expires_at).toBe(issued.session_absolute_expires_at);
+
+    const replay = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+    const afterReplay = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(rotatedBody.refresh_token)),
+    );
+
+    expect(replay.status).toBe(401);
+    expect(await replay.json()).toEqual(COARSE_SESSION_AUTH_TERMINAL);
+    // The replacement the winning rotation issued is revoked by the replay, not merely unused.
+    expect(afterReplay.status).toBe(401);
+    expect(await afterReplay.json()).toEqual(COARSE_SESSION_AUTH_TERMINAL);
+  });
+
+  test("refresh race admits exactly one concurrent use of a rotating refresh credential", async () => {
+    let nonce = 0;
+    globalThis.fetch = agentSnapshotFetch(() => {
+      nonce += 1;
+      return signedAgentAccessToken({ nonce: `race-nonce-${nonce}` });
+    });
+    const issued = await issuedCredentials();
+
+    const raced = await Promise.all([
+      refreshSession(
+        sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+      ),
+      refreshSession(
+        sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+      ),
+    ]);
+    const statuses = raced.map((response) => response.status).sort();
+    const loser = raced.find((response) => response.status === 401);
+
+    expect(statuses).toEqual([200, 401]);
+    expect(await loser?.json()).toEqual(COARSE_SESSION_AUTH_TERMINAL);
+  });
+
+  test("rotating refresh credential expiry is the minimum of its TTL and the absolute lifetime", async () => {
+    globalThis.fetch = agentSnapshotFetch(() => signedAgentAccessToken());
+    const before = Math.floor(Date.now() / 1000);
+    const issued = await issuedCredentials();
+    const after = Math.floor(Date.now() / 1000);
+
+    const refreshExpiresAt = unixSecondsFromRfc3339(issued.refresh_expires_at);
+    const absoluteExpiresAt = unixSecondsFromRfc3339(issued.session_absolute_expires_at);
+    expect(refreshExpiresAt).toBeGreaterThanOrEqual(before + 900);
+    expect(refreshExpiresAt).toBeLessThanOrEqual(after + 900);
+    expect(absoluteExpiresAt).toBeGreaterThanOrEqual(before + 21_600);
+    expect(absoluteExpiresAt).toBeLessThanOrEqual(after + 21_600);
+    // min(now + 900, absolute) — the 15-minute TTL is the binding one this far from the horizon.
+    expect(refreshExpiresAt).toBe(Math.min(refreshExpiresAt, absoluteExpiresAt));
+    expect(refreshExpiresAt).toBeLessThan(absoluteExpiresAt);
+  });
+
+  test("absolute session lifetime is fixed at issue and never extended by rotation", async () => {
+    let nonce = 0;
+    globalThis.fetch = agentSnapshotFetch(() => {
+      nonce += 1;
+      return signedAgentAccessToken({ nonce: `absolute-nonce-${nonce}` });
+    });
+    // A controlled clock, advanced a minute between rotations. Without it every rotation lands in
+    // the same wall-clock second and a horizon that IS being extended would serialize identically.
+    const realNow = Date.now;
+    let clockMs = realNow();
+    Date.now = () => clockMs;
+    let current: VivaSessionRouteOutcome;
+    let issued: VivaSessionRouteOutcome;
+    let atHorizon: unknown;
+    try {
+      issued = await issuedCredentials();
+      current = issued;
+      for (let rotation = 0; rotation < 3; rotation += 1) {
+        clockMs += 60_000;
+        const response = await refreshSession(
+          sessionRequest("/api/viva-session/refresh", refreshPayload(current.refresh_token)),
+        );
+        const body = (await response.json()) as VivaSessionRouteOutcome;
+        expect(response.status).toBe(200);
+        expect(body.session_absolute_expires_at).toBe(issued.session_absolute_expires_at);
+        current = body;
+      }
+
+      // At the absolute horizon the credential is terminal, whatever its own TTL says.
+      atHorizon = await selectedSecurityStore().consumeRefresh({
+        credentialHash: sha256Hex(current.refresh_token),
+        identity: refreshIdentity(),
+        nowSeconds: unixSecondsFromRfc3339(issued.session_absolute_expires_at),
+        reservationTtlSeconds: 10,
+      });
+    } finally {
+      Date.now = realNow;
+    }
+
+    expect(unixSecondsFromRfc3339(current.refresh_expires_at)).toBeGreaterThan(
+      unixSecondsFromRfc3339(issued.refresh_expires_at),
+    );
+    expect(atHorizon).toEqual({ ok: false, reason: "expired" });
+  });
+
+  test("rotating refresh credential rejections share one public body and distinct operator codes", async () => {
+    globalThis.fetch = agentSnapshotFetch(() => signedAgentAccessToken());
+    const issued = await issuedCredentials();
+    const store = selectedSecurityStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    // A second identity's credential, so the identity-mismatch case is a real credential used by
+    // the wrong session rather than a forged string.
+    const foreign = fixtureRefreshCredential();
+    await store.rotateRefresh({
+      absoluteExpiresAt: nowSeconds + 21_600,
+      credentialHash: sha256Hex(foreign),
+      identity: {
+        sessionId: "other-session",
+        studySetId: "biology-midterm",
+        userId: "synthetic-user",
+      },
+      mode: "issue",
+      refreshExpiresAt: nowSeconds + 900,
+    });
+
+    const warnings: string[] = [];
+    console.warn = (message?: unknown) => {
+      warnings.push(String(message));
+    };
+    const cases = [
+      { credential: "viva-refresh1.not-canonical", label: "malformed" },
+      { credential: foreign, label: "identity_mismatch" },
+      { credential: fixtureRefreshCredential(), label: "replayed" },
+    ];
+    const observed = [];
+    for (const input of cases) {
+      const response = await refreshSession(
+        sessionRequest("/api/viva-session/refresh", refreshPayload(input.credential)),
+      );
+      observed.push({ body: await response.json(), status: response.status });
+    }
+    // The genuinely-consumed credential: spend it, then reuse it.
+    await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+    const replayed = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+    observed.push({ body: await replayed.json(), status: replayed.status });
+    console.warn = originalConsoleWarn;
+
+    for (const entry of observed) {
+      expect(entry.status).toBe(401);
+      expect(entry.body).toEqual(COARSE_SESSION_AUTH_TERMINAL);
+    }
+    const operatorCodes = warnings
+      .map((entry) => JSON.parse(entry) as { token_refresh_outcome?: string })
+      .map((entry) => entry.token_refresh_outcome)
+      .filter((code) => code !== undefined);
+    expect(new Set(operatorCodes).size).toBeGreaterThanOrEqual(3);
+    expect(operatorCodes).toContain("identity_mismatch");
+    expect(operatorCodes).toContain("malformed_rejected");
+    expect(operatorCodes).toContain("replayed_rejected");
+    const serializedWarnings = JSON.stringify(warnings);
+    expect(serializedWarnings).not.toContain(issued.refresh_token);
+    expect(serializedWarnings).not.toContain(foreign);
+  });
+
+  test("rotating refresh credential is withheld when the agent mint fails", async () => {
+    let agentAccessToken = signedAgentAccessToken();
+    globalThis.fetch = agentSnapshotFetch(() => agentAccessToken);
+    const issued = await issuedCredentials();
+
+    globalThis.fetch = (async () => jsonResponse(502, { error: "agent_down" })) as typeof fetch;
+    const failed = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+
+    expect(failed.status).toBe(502);
+    expect(failedBody.refresh_token).toBeUndefined();
+    expect(failedBody.session_token).toBeUndefined();
+
+    // The reservation holds until its TTL: an immediate retry loses, a retry past the TTL wins.
+    const store = selectedSecurityStore();
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const duringReservation = await store.consumeRefresh({
+      credentialHash: sha256Hex(issued.refresh_token),
+      identity: refreshIdentity(),
+      nowSeconds,
+      reservationTtlSeconds: 10,
+    });
+    const afterReservation = await store.consumeRefresh({
+      credentialHash: sha256Hex(issued.refresh_token),
+      identity: refreshIdentity(),
+      nowSeconds: nowSeconds + 10,
+      reservationTtlSeconds: 10,
+    });
+
+    expect(duringReservation).toEqual({ ok: false, reason: "replayed" });
+    expect(afterReservation).toMatchObject({ ok: true });
+    agentAccessToken = signedAgentAccessToken();
+  });
+
+  test("rotating refresh credential flow exposes an agent access token only after strict verification", async () => {
+    const calls: string[] = [];
+    const hostile = [
+      { label: "unsigned", token: "viva1.not-a-real-token" },
+      {
+        label: "foreign-key",
+        token: signedSessionToken(
+          sessionTokenClaims({ nonce: "foreign-key-nonce" }),
+          "viva-fixture-unrelated-signing-secret-000",
+        ),
+      },
+      {
+        label: "wrong-identity",
+        token: signedSessionToken(
+          sessionTokenClaims({ nonce: "wrong-identity-nonce", user_id: "other-user" }),
+        ),
+      },
+      {
+        label: "wrong-session",
+        token: signedSessionToken(
+          sessionTokenClaims({ nonce: "wrong-session-nonce", session_id: "other-session" }),
+        ),
+      },
+    ];
+    const observed = [];
+    for (const input of hostile) {
+      globalThis.fetch = (async (url: RequestInfo | URL) => {
+        calls.push(String(url));
+        return jsonResponse(200, librarySnapshot({ startToken: input.token }));
+      }) as typeof fetch;
+      const response = await startSession(
+        sessionRequest("/api/viva-session/start", sessionStartPayload()),
+      );
+      const serialized = await response.text();
+      observed.push({ serialized, status: response.status });
+      expect(serialized).not.toContain(input.token);
+    }
+
+    expect(observed.map((entry) => entry.status)).toEqual([502, 502, 502, 502]);
+    for (const entry of observed) {
+      expect(JSON.parse(entry.serialized)).toEqual({
+        error: "viva_session_agent_unavailable",
+        failure_class: "session_bootstrap_unavailable",
+        stage: "pre_loop",
+        terminal_reason: "pre_loop_session_unavailable",
+        token_refresh_outcome: "failed",
+      });
+    }
+    expect(calls).toHaveLength(4);
+  });
+
+  function selectedSecurityStore(): SessionSecurityStore {
+    const selection = vivaSessionSecurityStore();
+    if (!selection.ok) throw new Error("fixture requires a selectable bounded security store");
+    return selection.store;
+  }
+
+  function refreshIdentity() {
+    return {
+      sessionId: "server-session",
+      studySetId: "biology-midterm",
+      userId: "synthetic-user",
+    };
+  }
+
+  async function issuedCredentials(): Promise<VivaSessionRouteOutcome> {
+    const response = await startSession(
+      sessionRequest("/api/viva-session/start", sessionStartPayload()),
+    );
+    const body = (await response.json()) as VivaSessionRouteOutcome;
+    if (response.status !== 200) {
+      throw new Error(`fixture start must succeed, got ${response.status}`);
+    }
+    return body;
+  }
+
+  function agentSnapshotFetch(nextToken: () => string): typeof fetch {
+    return (async () =>
+      jsonResponse(
+        200,
+        librarySnapshot({ resumeToken: nextToken(), startToken: nextToken() }),
+      )) as typeof fetch;
+  }
+});
+
 describe("Viva destructive capability store contract", () => {
   beforeEach(() => {
     console.warn = () => {};
@@ -2666,6 +2898,52 @@ describe("Viva destructive capability store contract", () => {
     expect(raced.filter((outcome) => !outcome.ok)).toEqual([{ ok: false, reason: "replayed" }]);
   });
 });
+
+/** The one coarse public body every D-07 Branch A refresh terminal returns. */
+const COARSE_SESSION_AUTH_TERMINAL = {
+  error: "session_auth_terminal",
+  failure_class: "session_auth_failure",
+  token_refresh_outcome: "terminal",
+} as const;
+
+/**
+ * A currently-valid access token of the shape the AGENT returns. Start and refresh now verify this
+ * strictly before handing it to the browser, so fixtures must sign a real one.
+ */
+function signedAgentAccessToken(
+  overrides: Partial<Record<keyof SessionTokenClaims, unknown>> = {},
+): string {
+  return signedSessionToken(sessionTokenClaims(overrides));
+}
+
+/** A syntactically valid opaque refresh credential, minted locally rather than by the route. */
+function fixtureRefreshCredential(): string {
+  return `viva-refresh1.${randomBytes(32).toString("base64url")}`;
+}
+
+/** The exact D-07 Branch A refresh payload: four fields, no access token. */
+function refreshPayload(refreshToken: string): Record<string, unknown> {
+  return {
+    refresh_token: refreshToken,
+    session_id: "server-session",
+    study_set_id: "biology-midterm",
+    user_id: "synthetic-user",
+  };
+}
+
+/**
+ * Independent restatement of the credential-hash rule the store contract pins: the adapter only
+ * ever sees SHA-256. Computed here rather than imported, so a production drift breaks the test.
+ */
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/** Parses a canonical RFC3339 UTC instant back to epoch seconds for the plan's arithmetic. */
+function unixSecondsFromRfc3339(value: string): number {
+  expect(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)).toBe(true);
+  return Math.floor(Date.parse(value) / 1000);
+}
 
 function destructiveCapabilityHash(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
@@ -2997,7 +3275,7 @@ function librarySnapshot({
             ? {
                 available: true,
                 session_id: "server-session",
-                session_token: startToken ?? "viva1.redacted-default-token",
+                session_token: startToken ?? signedAgentAccessToken(),
               }
             : { available: false, unavailable_reason: unavailableReason ?? "unavailable" },
         },
