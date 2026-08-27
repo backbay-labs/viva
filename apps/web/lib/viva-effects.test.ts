@@ -1,15 +1,10 @@
-// The shared mounted-test DOM must exist before anything that reads `window`
-// at import time (`react-dom/client`'s module scope pokes at the global
-// object), so this stays the first import — mirrors
-// `LiveSessionPage.mounted.test.tsx`'s own ordering rule.
-import "../test/setup-dom";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MuseGlyphCanvas } from "../components/landing/MuseGlyphCanvas";
 import { VisualEffectsControl } from "../components/landing/VisualEffectsControl";
-import { resetVivaTestDom } from "../test/setup-dom";
 import type { VivaEffectsPolicy, VivaEffectsPolicyInput } from "./viva-effects";
 import {
   readVivaEffectsPreference,
@@ -453,9 +448,25 @@ function mountMuseGlyphCanvas(
 }
 
 describe("MuseGlyphCanvas effects policy integration", () => {
-  afterEach(() => {
+  // Scoped exactly like `LandingEntry.test.tsx`'s own mounted describes: a
+  // direct `GlobalRegistrator` register/unregister bounded to this describe's
+  // own tests, never the shared `test/setup-dom` module. That module's
+  // beforeAll/afterAll are declared once, at the top level of whichever file
+  // imports it first; in a single-process full-glob run
+  // (`bun test lib/*.test.ts components/**/*.test.tsx`) that ties its
+  // teardown to the first importer's lifecycle, not to every file that
+  // reuses it — so importing it here tore the DOM down the moment this
+  // file's own tests finished, before later mounted suites (Plan 10's
+  // `LiveSessionPage.mounted.test.tsx`) ran. A fresh register/unregister per
+  // test is entirely local to this file and cannot leak across files.
+  beforeEach(() => {
+    GlobalRegistrator.register();
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(async () => {
     restoreGlobals();
-    resetVivaTestDom();
+    await GlobalRegistrator.unregister();
   });
 
   test("default desktop landing_muse: dpr cap 2, 32fps, glyph scale 1, animated", () => {
@@ -731,8 +742,16 @@ describe("MuseGlyphCanvas effects policy integration", () => {
 });
 
 describe("VisualEffectsControl", () => {
-  afterEach(() => {
-    resetVivaTestDom();
+  // See the matching comment on "MuseGlyphCanvas effects policy
+  // integration" above: a fresh per-test `GlobalRegistrator` DOM, scoped to
+  // exactly this describe's tests, never the shared `test/setup-dom` seam.
+  beforeEach(() => {
+    GlobalRegistrator.register();
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(async () => {
+    await GlobalRegistrator.unregister();
   });
 
   function mountControl(): { control: Root; toggle: HTMLButtonElement; unmount: () => void } {
