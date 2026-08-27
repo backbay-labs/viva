@@ -1,4 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import {
+  type AuthenticatedStudyIdentity,
+  type AuthenticatedStudyProjectionV1,
+  validateAuthenticatedStudyProjectionV1ForIdentity,
+} from "@viva/core";
 import { type NextRequest, NextResponse } from "next/server";
 
 export type VivaSessionRouteFailureClass = {
@@ -240,6 +245,33 @@ export type VivaSessionProjectionFailureClass = {
   stage: "pre_loop";
 };
 
+/**
+ * The projection route's auth terminal. It is the same coarse body the session routes return, but
+ * the projection route never refreshes anything, so an *expired* access token is terminal here
+ * too: the browser has to go and refresh before it can read again.
+ */
+type VivaSessionProjectionAuthFailureClass = {
+  error: "session_auth_terminal";
+  failure_class: "session_auth_failure";
+  stage: "session";
+  token_refresh_outcome: "terminal";
+};
+
+/**
+ * Operator-only projection log. Coarse code plus deployment SHA and nothing else — never an env
+ * name, credential, upstream URL, upstream body, user id, study-set id, or voice-session id.
+ */
+export type VivaSessionProjectionFailureLog = {
+  deploy_sha: string | null;
+  error: string;
+  event: "viva_session_projection_failure";
+  failure_class: string;
+  route: "projection";
+  service: "web";
+  stage: "pre_loop" | "session";
+  status: number;
+};
+
 type SessionIdentity = {
   userId: string;
   studySetId: string;
@@ -377,6 +409,31 @@ type SessionAccessTokenRouteVerification =
   | { ok: true; claims: SessionTokenClaims; expired: boolean }
   | { ok: false; reason: VivaSessionAccessTokenRejection | "unavailable" };
 
+/**
+ * The binding a ROUTE asks the verifier to enforce.
+ *
+ * `user_id: null` is legal only for a route that does not receive a user id from the caller at
+ * all — today that is the projection read, whose query names a study set and a voice session and
+ * nothing else. The claim is then bound by the configured identity allowlist immediately after
+ * verification, so the identity is still checked; it is checked against configuration rather than
+ * against a caller-supplied value. The exported {@link SessionTokenBinding} keeps `user_id:
+ * string`, so no caller outside this module can reach the nullable form.
+ */
+type SessionAccessTokenExpectedBinding = {
+  user_id: string | null;
+  study_set_id: string;
+  session_id: string;
+};
+
+type ProjectionAccessTokenVerification =
+  | { ok: true; claims: SessionTokenClaims }
+  | {
+      ok: false;
+      reason: VivaSessionAccessTokenRejection | "access_denied" | "unavailable";
+    };
+
+type ProjectionQuery = { studySetId: string; voiceSessionId: string };
+
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const SESSION_ACCESS_TOKEN_PREFIX = "viva1";
 const SESSION_ACCESS_TOKEN_MAX_BYTES = 4_096;
@@ -513,6 +570,40 @@ const PROJECTION_ADMISSION_LIMIT: AdmissionLimitRange = {
   min: 1,
   name: "VIVA_SESSION_PROJECTION_MAX_PER_MINUTE",
 };
+/** Not operator-extensible: a deployment cannot lengthen the projection read's deadline. */
+const PROJECTION_UPSTREAM_TIMEOUT_MS = 8_000;
+const PROJECTION_QUERY_KEYS: ReadonlySet<string> = new Set(["study_set_id", "voice_session_id"]);
+/** The only `retry-after` window a 429 from the agent may state, in whole delta-seconds. */
+const PROJECTION_UPSTREAM_RETRY_AFTER_MIN_SECONDS = 1;
+const PROJECTION_UPSTREAM_RETRY_AFTER_MAX_SECONDS = 60;
+/**
+ * The projection route's recursive upstream-credential DETECTOR shares its closed key set and its
+ * closed value-marker list with the library proxy's recursive STRIPPER
+ * (`apps/web/app/api/viva-library/[[...path]]/route.ts`). The two differ only in what they do with
+ * a hit: the proxy relays a stripped body, while a projection is a validated read model, so any
+ * credential at all means the upstream contract is broken and nothing is relayed.
+ *
+ * They are two declarations because Task 9's file list does not include the library route, so the
+ * constants cannot be hoisted into one home from this task. `viva-session-api.test.ts` reads both
+ * source files and fails if the two lists ever drift apart; consolidating them into a single
+ * exported set is recorded as a coordinator follow-up.
+ */
+const AGENT_CREDENTIAL_KEYS: ReadonlySet<string> = new Set([
+  "api_key",
+  "authorization",
+  "credential",
+  "password",
+  "private_key",
+  "secret",
+  "token",
+]);
+const AGENT_CREDENTIAL_VALUE_MARKERS = [
+  "bearer ",
+  "viva1.",
+  "viva-bootstrap1.",
+  "viva-control1.",
+  "viva-refresh1.",
+] as const;
 /** One process-wide map, shared by every adapter this module hands out. */
 const memorySecurityStoreRateLimits = new Map<string, MemoryRateLimitRecord>();
 /** Refresh records, keyed by the SHA-256 of the credential; the raw value never reaches here. */
@@ -799,6 +890,379 @@ function verifyAgentIssuedAccessToken(
 /** Canonical second-precision RFC3339 UTC, the shape Plan 13's browser vault seam consumes. */
 function rfc3339UtcInstant(unixSeconds: number): string {
   return `${new Date(unixSeconds * 1000).toISOString().slice(0, 19)}Z`;
+}
+
+/**
+ * `WEBAPI-010` — the authenticated study projection BFF.
+ *
+ * The order below is the whole security property and is fixed: nothing that costs an admission
+ * slot, a credential, or an upstream call happens before the request has proved it is a
+ * same-origin read, states exactly the two allowed query parameters, and carries a strictly
+ * verified Plan 05 access token bound to that query.
+ *
+ * 1. canonical safe-read origin / fetch context
+ * 2. the exact two-parameter query allowlist
+ * 3. the exact `Authorization: Bearer` grammar
+ * 4. strict Plan 05 verification, bound to the query, identity bound to the allowlist
+ * 5. atomic shared IP+session admission
+ * 6. the scoped read credential
+ * 7. the Plan 08 endpoint with the exact two auth headers and an eight-second deadline
+ * 8. bounded read and strict decode/parse
+ * 9. the recursive upstream-credential detector
+ * 10. Plan 04's validator, bound to the verified identity
+ */
+export async function handleVivaSessionProjection(
+  request: NextRequest,
+): Promise<NextResponse<AuthenticatedStudyProjectionV1 | VivaSessionProjectionFailure>> {
+  const canonical = canonicalWebOrigin();
+  if (!canonical.ok) return projectionUnavailableResponse();
+  const crossOrigin = guardProjectionFetchContext(request, canonical.value.origin);
+  if (crossOrigin) return crossOrigin;
+
+  const query = exactProjectionQuery(request.nextUrl);
+  if (!query) {
+    return projectionJson(400, "viva_session_projection_request_invalid", "projection_unavailable");
+  }
+
+  const presented = projectionBearerCredential(request.headers.get("authorization"));
+  if (!presented) return projectionAuthTerminalResponse("malformed");
+
+  const verified = verifyProjectionAccessToken(presented, query);
+  if (!verified.ok) {
+    if (verified.reason === "unavailable") return projectionUnavailableResponse();
+    return projectionAuthTerminalResponse(projectionAuthFailureCode(verified.reason));
+  }
+
+  const identity = {
+    sessionId: query.voiceSessionId,
+    studySetId: query.studySetId,
+    userId: verified.claims.user_id,
+  };
+  const admission = await guardVivaSessionProjectionAdmission(request, identity);
+  if (admission) return admission;
+
+  const agentBaseUrl = serverAgentBaseUrl();
+  const scopedRead = vivaAgentScopedCredential("library_read");
+  const upstream = agentBaseUrl ? agentStudyProjectionUrl(agentBaseUrl, query) : null;
+  if (!scopedRead || !upstream) return projectionUnavailableResponse();
+
+  return fetchAuthenticatedStudyProjection({
+    accessToken: presented,
+    canonicalOrigin: canonical.value.origin,
+    clientSignal: clientAbortSignal(request),
+    identity: { sessionId: query.voiceSessionId, studySetId: query.studySetId },
+    scopedCredential: scopedRead,
+    upstream,
+  });
+}
+
+type VivaSessionProjectionFailure =
+  | VivaSessionProjectionFailureClass
+  | VivaSessionProjectionAuthFailureClass;
+
+/**
+ * Steps 7-10. The deadline stays armed across the fetch, the bounded read, the parse, the
+ * credential scan, and Plan 04's validation, so a slow upstream cannot buy time in any of them.
+ */
+async function fetchAuthenticatedStudyProjection(input: {
+  accessToken: string;
+  canonicalOrigin: string;
+  clientSignal: AbortSignal | null;
+  identity: AuthenticatedStudyIdentity;
+  scopedCredential: string;
+  upstream: URL;
+}): Promise<NextResponse<AuthenticatedStudyProjectionV1 | VivaSessionProjectionFailure>> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, PROJECTION_UPSTREAM_TIMEOUT_MS);
+  const abortForClient = () => controller.abort();
+  input.clientSignal?.addEventListener("abort", abortForClient, { once: true });
+  // A caller that has already gone away gets no response body at all, only a cancelled upstream.
+  const refuseLateBody = () => {
+    if (!timedOut && input.clientSignal?.aborted) throw input.clientSignal.reason;
+  };
+
+  try {
+    const response = await fetch(input.upstream, {
+      cache: "no-store",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${input.scopedCredential}`,
+        origin: input.canonicalOrigin,
+        "x-viva-session-token": input.accessToken,
+      },
+      method: "GET",
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (!timedOut && input.clientSignal?.aborted) {
+      await cancelStreamQuietly(response.body);
+      throw input.clientSignal.reason;
+    }
+    if (timedOut) {
+      await cancelStreamQuietly(response.body);
+      return projectionTimeoutResponse();
+    }
+    if (response.status !== 200) {
+      await cancelStreamQuietly(response.body);
+      return projectionUpstreamStatusResponse(response);
+    }
+
+    const bytes = await readBoundedBody(response.body, {
+      contentLength: response.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.projectionResponse,
+      signal: controller.signal,
+    });
+    refuseLateBody();
+    if (timedOut) return projectionTimeoutResponse();
+
+    const parsed = parseBoundedJson(bytes);
+    if (!parsed.ok) return projectionUpstreamUnavailableResponse();
+    if (containsAgentOriginatedCredential(parsed.value)) {
+      // The candidate is dropped unread rather than partially sanitized: a projection that was
+      // ever going to carry a credential is not a projection this BFF can repair.
+      return projectionJson(502, "viva_session_projection_unavailable", "projection_unavailable", {
+        logError: "projection_upstream_credential_violation",
+      });
+    }
+
+    let projection: AuthenticatedStudyProjectionV1;
+    try {
+      projection = validateAuthenticatedStudyProjectionV1ForIdentity(parsed.value, input.identity);
+    } catch {
+      // Field-specific validator messages are internal; only the coarse 502 is public.
+      return projectionUpstreamUnavailableResponse();
+    }
+    refuseLateBody();
+    if (timedOut) return projectionTimeoutResponse();
+    return NextResponse.json(projection, { headers: vivaWebApiResponseHeaders(), status: 200 });
+  } catch (error) {
+    if (!timedOut && input.clientSignal?.aborted) throw error;
+    return timedOut ? projectionTimeoutResponse() : projectionUpstreamUnavailableResponse();
+  } finally {
+    clearTimeout(timeoutId);
+    input.clientSignal?.removeEventListener("abort", abortForClient);
+  }
+}
+
+/**
+ * A safe read still has to prove it came from the canonical web origin. A same-origin `GET` sends
+ * no `Origin` header at all, so the fetch metadata carries the proof and an `Origin`, when the
+ * browser does send one, must agree with it. A request with no fetch metadata is refused rather
+ * than trusted.
+ */
+function guardProjectionFetchContext(
+  request: NextRequest,
+  canonicalOrigin: string,
+): NextResponse<VivaSessionProjectionFailureClass> | null {
+  const fetchSite = request.headers.get("sec-fetch-site")?.trim().toLowerCase();
+  if (fetchSite !== "same-origin") {
+    return projectionJson(403, "cross_origin_session_request", "access_denied");
+  }
+  const origin = request.headers.get("origin")?.trim();
+  if (origin && origin !== canonicalOrigin) {
+    return projectionJson(403, "cross_origin_session_request", "access_denied");
+  }
+  return null;
+}
+
+/** Exactly `study_set_id` and `voice_session_id`, once each, both nonempty. Nothing else. */
+function exactProjectionQuery(url: URL): ProjectionQuery | null {
+  const params = url.searchParams;
+  for (const key of params.keys()) {
+    if (!PROJECTION_QUERY_KEYS.has(key)) return null;
+  }
+  for (const key of PROJECTION_QUERY_KEYS) {
+    if (params.getAll(key).length !== 1) return null;
+  }
+  const studySetId = params.get("study_set_id")?.trim() ?? "";
+  const voiceSessionId = params.get("voice_session_id")?.trim() ?? "";
+  if (!studySetId || !voiceSessionId) return null;
+  return { studySetId, voiceSessionId };
+}
+
+/**
+ * The exact `Authorization: Bearer ${accessToken}` grammar and no other.
+ *
+ * `Headers.get` joins repeated header values with a comma, so a comma is how a second value
+ * announces itself; the token itself is printable ASCII with no spaces. The scheme is matched
+ * case-sensitively on purpose: the only client is web-owned code that sends this exact spelling,
+ * and a narrower grammar is one less thing to parse on an unauthenticated edge.
+ */
+function projectionBearerCredential(value: string | null): string | null {
+  if (value === null || value.includes(",")) return null;
+  const match = /^Bearer ([\x21-\x7e]+)$/.exec(value);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Strict Plan 05 verification for a route whose caller never states a user id.
+ *
+ * The study set and the voice session are bound to the QUERY before any claim is believed, and the
+ * verified `user_id` is then bound to the configured allowlist. An unconfigured allowlist is a
+ * configuration failure, never an open door.
+ */
+function verifyProjectionAccessToken(
+  token: string,
+  query: ProjectionQuery,
+): ProjectionAccessTokenVerification {
+  const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
+  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
+  if (!allowedUserIds || !allowedStudySetIds) return { ok: false, reason: "unavailable" };
+
+  const verified = verifySessionAccessTokenForRoute({
+    allowExpired: false,
+    expectedBinding: {
+      session_id: query.voiceSessionId,
+      study_set_id: query.studySetId,
+      user_id: null,
+    },
+    token,
+  });
+  if (!verified.ok) return { ok: false, reason: verified.reason };
+  if (!allowedUserIds.has(verified.claims.user_id)) return { ok: false, reason: "access_denied" };
+  if (!allowedStudySetIds.has(verified.claims.study_set_id)) {
+    return { ok: false, reason: "access_denied" };
+  }
+  return { claims: verified.claims, ok: true };
+}
+
+/**
+ * Every rejection collapses into the one coarse 401 for the caller; only the operator code
+ * differs, and it is the same closed vocabulary the session routes already emit.
+ */
+function projectionAuthFailureCode(
+  reason: VivaSessionAccessTokenRejection | "access_denied",
+): VivaSessionAuthFailureCode {
+  switch (reason) {
+    case "access_denied":
+      return "access_denied";
+    case "binding_mismatch":
+      return "identity_mismatch";
+    case "expired":
+      return "expired";
+    case "invalid_signature":
+      return "invalid_signature";
+    default:
+      return "malformed";
+  }
+}
+
+function agentStudyProjectionUrl(agentBaseUrl: string, query: ProjectionQuery): URL | null {
+  try {
+    const url = new URL(
+      `${trimTrailingSlash(agentBaseUrl)}/v1/study-sets/${encodeURIComponent(
+        query.studySetId,
+      )}/projection`,
+    );
+    url.searchParams.set("voice_session_id", query.voiceSessionId);
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+/** Present on a real `NextRequest`; absent on the plain fixtures the route suites construct. */
+function clientAbortSignal(request: NextRequest): AbortSignal | null {
+  const signal: unknown = (request as { signal?: unknown }).signal;
+  return signal instanceof AbortSignal ? signal : null;
+}
+
+/**
+ * Recursive, order-sensitive detection of any agent-originated credential in a projection body.
+ * Keys are matched case-insensitively against the closed set plus any `_token` suffix; string
+ * LEAVES are matched against the closed value-marker list, never with a token-shaped regex over
+ * serialized JSON.
+ */
+function containsAgentOriginatedCredential(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsAgentOriginatedCredential);
+  if (typeof value === "string") return isAgentCredentialString(value);
+  if (!value || typeof value !== "object") return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (isAgentCredentialKey(key)) return true;
+    if (containsAgentOriginatedCredential(child)) return true;
+  }
+  return false;
+}
+
+function isAgentCredentialKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return AGENT_CREDENTIAL_KEYS.has(normalized) || normalized.endsWith("_token");
+}
+
+function isAgentCredentialString(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return AGENT_CREDENTIAL_VALUE_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function projectionUpstreamStatusResponse(
+  response: Response,
+): NextResponse<VivaSessionProjectionFailure> {
+  if (response.status === 401 || response.status === 403) {
+    return projectionAuthTerminalResponse("access_denied");
+  }
+  if (response.status === 404) {
+    return projectionJson(404, "viva_session_projection_not_found", "projection_unavailable");
+  }
+  if (response.status === 429) {
+    const retryAfterSeconds = boundedUpstreamRetryAfterSeconds(response.headers.get("retry-after"));
+    if (retryAfterSeconds === null) return projectionUpstreamUnavailableResponse();
+    return projectionJson(429, "session_projection_rate_limited", "rate_limit", {
+      retryAfterSeconds,
+    });
+  }
+  return projectionUpstreamUnavailableResponse();
+}
+
+/**
+ * Only whole delta-seconds inside the one-minute window survive. A missing, non-decimal, date-form,
+ * zero, or oversized value is an upstream contract violation, not a hint to pass along.
+ */
+function boundedUpstreamRetryAfterSeconds(value: string | null): number | null {
+  const raw = value?.trim();
+  if (!raw || !/^[0-9]+$/.test(raw)) return null;
+  const seconds = Number.parseInt(raw, 10);
+  return seconds >= PROJECTION_UPSTREAM_RETRY_AFTER_MIN_SECONDS &&
+    seconds <= PROJECTION_UPSTREAM_RETRY_AFTER_MAX_SECONDS
+    ? seconds
+    : null;
+}
+
+function projectionTimeoutResponse(): NextResponse<VivaSessionProjectionFailureClass> {
+  return projectionJson(504, "viva_session_projection_timeout", "projection_unavailable");
+}
+
+function projectionUpstreamUnavailableResponse(): NextResponse<VivaSessionProjectionFailureClass> {
+  return projectionJson(502, "viva_session_projection_unavailable", "projection_unavailable");
+}
+
+/**
+ * One coarse 401 for every auth rejection. The operator code is carried in the log alone, and it
+ * keeps `expired` distinct: the projection route cannot refresh, so expiry is terminal here even
+ * though the session routes classify it as recoverable, and an operator has to be able to tell an
+ * expiring browser apart from a forged one.
+ */
+function projectionAuthTerminalResponse(
+  operatorCode: VivaSessionAuthFailureCode,
+): NextResponse<VivaSessionProjectionAuthFailureClass> {
+  emitVivaSessionProjectionFailureLog({
+    error: `projection_auth_${operatorCode}`,
+    failure_class: "session_auth_failure",
+    stage: "session",
+    status: 401,
+  });
+  return NextResponse.json(
+    {
+      error: "session_auth_terminal" as const,
+      failure_class: "session_auth_failure" as const,
+      stage: "session" as const,
+      token_refresh_outcome: "terminal" as const,
+    },
+    { headers: vivaWebApiResponseHeaders(), status: 401 },
+  );
 }
 
 /** Clears every bounded in-memory record this module owns: admission, refresh, and tombstones. */
@@ -1125,11 +1589,11 @@ export async function guardVivaSessionProjectionAdmission(
   identity: SessionIdentity,
 ): Promise<NextResponse<VivaSessionProjectionFailureClass> | null> {
   const limit = validatedAdmissionLimit(PROJECTION_ADMISSION_LIMIT);
-  if (limit === null) return projectionAdmissionUnavailableResponse();
+  if (limit === null) return projectionUnavailableResponse();
   const client = trustedClientAdmissionBucket(request);
-  if (!client.ok) return projectionAdmissionUnavailableResponse();
+  if (!client.ok) return projectionUnavailableResponse();
   const selection = vivaSessionSecurityStore();
-  if (!selection.ok) return projectionAdmissionUnavailableResponse();
+  if (!selection.ok) return projectionUnavailableResponse();
 
   const nowMs = Date.now();
   const outcome = await selection.store.incrementRateLimit({
@@ -1148,35 +1612,61 @@ export async function guardVivaSessionProjectionAdmission(
     windowMs: RATE_LIMIT_WINDOW_MS,
   });
   if (outcome.ok) return null;
-  if (outcome.reason === "unavailable") return projectionAdmissionUnavailableResponse();
-  return projectionAdmissionJson(429, "session_projection_rate_limited", "rate_limit", {
+  if (outcome.reason === "unavailable") return projectionUnavailableResponse();
+  return projectionJson(429, "session_projection_rate_limited", "rate_limit", {
     retryAfterSeconds: admissionRetryAfterSeconds(outcome.resetAtMs, nowMs),
   });
 }
 
-function projectionAdmissionUnavailableResponse(): NextResponse<VivaSessionProjectionFailureClass> {
-  return projectionAdmissionJson(
-    503,
-    "viva_session_projection_unavailable",
-    "projection_unavailable",
-  );
+function projectionUnavailableResponse(): NextResponse<VivaSessionProjectionFailureClass> {
+  return projectionJson(503, "viva_session_projection_unavailable", "projection_unavailable");
 }
 
-function projectionAdmissionJson(
+/**
+ * The one pre-loop response builder for the whole projection surface: the admission guard and the
+ * route share it, so every projection failure carries the same header set and the same operator
+ * log. `logError` overrides only the OPERATOR code; the public body stays coarse.
+ */
+function projectionJson(
   status: number,
   error: string,
   failureClass: string,
-  options: { retryAfterSeconds?: number } = {},
+  options: { logError?: string; retryAfterSeconds?: number } = {},
 ): NextResponse<VivaSessionProjectionFailureClass> {
   const headers = vivaWebApiResponseHeaders(
     options.retryAfterSeconds === undefined
       ? {}
       : { "retry-after": String(options.retryAfterSeconds) },
   );
+  emitVivaSessionProjectionFailureLog({
+    error: options.logError ?? error,
+    failure_class: failureClass,
+    stage: "pre_loop",
+    status,
+  });
   return NextResponse.json(
     { error, failure_class: failureClass, stage: "pre_loop" as const },
     { headers, status },
   );
+}
+
+function emitVivaSessionProjectionFailureLog(input: {
+  error: string;
+  failure_class: string;
+  stage: "pre_loop" | "session";
+  status: number;
+}): void {
+  const payload: VivaSessionProjectionFailureLog = {
+    deploy_sha: deploymentSha(),
+    error: input.error,
+    event: "viva_session_projection_failure",
+    failure_class: input.failure_class,
+    route: "projection",
+    service: "web",
+    stage: input.stage,
+    status: input.status,
+  };
+  console.warn(JSON.stringify(payload));
 }
 
 /** Whole seconds only, never below one, and never derived from a raw bucket key. */
@@ -2222,7 +2712,7 @@ function verifySessionAccessTokenDetailed(input: {
   token: string;
   secretBytes: Uint8Array;
   now: number;
-  expectedBinding: SessionTokenBinding;
+  expectedBinding: SessionAccessTokenExpectedBinding;
   clockSkewSeconds: number;
 }): SessionAccessTokenVerificationDetail {
   const rejected = (
@@ -2352,7 +2842,7 @@ function verifySessionAccessTokenDetailed(input: {
   if (input.now - skew >= expiresAt) return rejected("expired", claims);
 
   if (
-    userId !== input.expectedBinding.user_id ||
+    (input.expectedBinding.user_id !== null && userId !== input.expectedBinding.user_id) ||
     studySetId !== input.expectedBinding.study_set_id ||
     sessionId !== input.expectedBinding.session_id
   ) {
@@ -2704,7 +3194,7 @@ function utf8Bytes(value: string): Uint8Array {
  */
 function verifySessionAccessTokenForRoute(input: {
   token: string;
-  expectedBinding: SessionTokenBinding;
+  expectedBinding: SessionAccessTokenExpectedBinding;
   allowExpired: boolean;
 }): SessionAccessTokenRouteVerification {
   const keys = sessionAccessTokenVerificationKeys();
@@ -2728,7 +3218,8 @@ function verifySessionAccessTokenForRoute(input: {
     // Binding is enforced after the time window, so an expired token still has to prove
     // its identity here before the route treats expiry as recoverable.
     if (
-      last.claims.user_id !== input.expectedBinding.user_id ||
+      (input.expectedBinding.user_id !== null &&
+        last.claims.user_id !== input.expectedBinding.user_id) ||
       last.claims.study_set_id !== input.expectedBinding.study_set_id ||
       last.claims.session_id !== input.expectedBinding.session_id
     ) {

@@ -1,7 +1,12 @@
 import * as bunTest from "bun:test";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import {
+  type AuthenticatedStudyProjectionV1,
+  validateAuthenticatedStudyProjectionV1,
+} from "@viva/core";
 import type { NextRequest } from "next/server";
+import { GET as fetchStudyProjection } from "../app/api/viva-session/projection/route";
 import { POST as refreshSession } from "../app/api/viva-session/refresh/route";
 import {
   guardVivaSessionProjectionAdmission,
@@ -2899,6 +2904,671 @@ describe("Viva destructive capability store contract", () => {
   });
 });
 
+/**
+ * `WEBAPI-010` — the authenticated study projection BFF.
+ *
+ * Every case drives the real route handler. The upstream body always starts from Plan 04's shared
+ * cross-language fixture (`agent/fixtures/learning-core/study-projection-v1.json`, read only here)
+ * so the BFF and the Rust producer are answering the same bytes; only the two identity fields are
+ * rewritten onto the queried identity, because the plan pins the browser query and the upstream
+ * URL to `biology-midterm` / `server-session` verbatim.
+ */
+describe("Viva authenticated study projection BFF", () => {
+  beforeEach(() => {
+    console.warn = () => {};
+    resetVivaSessionSecurityStoreForTests();
+    applyCanonicalOriginTestEnv();
+    applySharedSecurityStoreTestEnv();
+  });
+
+  afterEach(() => {
+    console.warn = originalConsoleWarn;
+    globalThis.fetch = originalFetch;
+    resetVivaSessionSecurityStoreForTests();
+    for (const [name, value] of Object.entries(originalEnv)) restoreEnv(name, value);
+  });
+
+  test("returns the validated v1 projection over the exact Plan 08 endpoint and header pair", async () => {
+    const accessToken = signedAgentAccessToken();
+    const calls: Array<{ init?: RequestInit; url: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(input) });
+      return jsonResponse(200, studyProjectionFixture("ready_session_with_active_question"));
+    }) as typeof fetch;
+
+    const response = await fetchStudyProjection(studyProjectionRequest({ accessToken }));
+    const body = (await response.json()) as AuthenticatedStudyProjectionV1;
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual(
+      validateAuthenticatedStudyProjectionV1(
+        studyProjectionFixture("ready_session_with_active_question"),
+      ),
+    );
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("pragma")).toBe("no-cache");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("access-control-allow-origin")).toBe(null);
+
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    if (!call) throw new Error("the projection route must contact the agent exactly once");
+    expect(new URL(call.url).pathname + new URL(call.url).search).toBe(
+      "/v1/study-sets/biology-midterm/projection?voice_session_id=server-session",
+    );
+    const headers = new Headers(call.init?.headers);
+    expect(headers.get("authorization")).toBe(`Bearer ${SCOPED_LIBRARY_READ_BEARER}`);
+    expect(headers.get("x-viva-session-token")).toBe(accessToken);
+    expect(headers.get("origin")).toBe(CANONICAL_WEB_ORIGIN);
+    expect(call.init?.cache).toBe("no-store");
+    expect(call.init?.redirect).toBe("error");
+    expect(call.init?.body ?? null).toBe(null);
+    expect(call.url).not.toContain(accessToken);
+    expect(call.url).not.toContain(SCOPED_LIBRARY_READ_BEARER);
+  });
+
+  test("returns the smallest valid v1 case unchanged", async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+      )) as typeof fetch;
+
+    const response = await fetchStudyProjection(studyProjectionRequest());
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(
+      validateAuthenticatedStudyProjectionV1(
+        studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+      ),
+    );
+  });
+
+  test("refuses every unusable authorization header before the agent", async () => {
+    const observed: Array<{ headers: Record<string, string>; status: number; body: unknown }> = [];
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, studyProjectionFixture("ready_session_with_active_question"));
+    }) as typeof fetch;
+
+    const cases: Array<Record<string, string>> = [
+      {},
+      { authorization: "" },
+      { authorization: "Bearer" },
+      { authorization: "Bearer " },
+      { authorization: `Basic ${signedAgentAccessToken()}` },
+      { authorization: `bearer  ${signedAgentAccessToken()}` },
+      { authorization: `Bearer ${signedAgentAccessToken()}, Bearer ${signedAgentAccessToken()}` },
+      { authorization: `Bearer ${flipOneSignatureByte(signedAgentAccessToken())}` },
+      {
+        authorization: `Bearer ${signedAgentAccessToken({
+          expires_at: Math.floor(Date.now() / 1000) - 1,
+          issued_at: Math.floor(Date.now() / 1000) - 900,
+          not_before: Math.floor(Date.now() / 1000) - 900,
+        })}`,
+      },
+      { authorization: `Bearer ${signedAgentAccessToken({ study_set_id: "other-set" })}` },
+      { authorization: `Bearer ${signedAgentAccessToken({ session_id: "other-session" })}` },
+      { authorization: `Bearer ${signedAgentAccessToken({ user_id: "not-allowlisted" })}` },
+    ];
+
+    for (const headers of cases) {
+      const response = await fetchStudyProjection(
+        studyProjectionRequest({ accessToken: null, headers }),
+      );
+      observed.push({ body: await response.json(), headers, status: response.status });
+    }
+
+    expect(calls).toEqual([]);
+    expect(observed.map((entry) => entry.status)).toEqual(cases.map(() => 401));
+    for (const entry of observed) {
+      expect(entry.body).toEqual({
+        error: "session_auth_terminal",
+        failure_class: "session_auth_failure",
+        stage: "session",
+        token_refresh_outcome: "terminal",
+      });
+    }
+  });
+
+  test("refuses a query that is not exactly the two allowed parameters", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, studyProjectionFixture("ready_session_with_active_question"));
+    }) as typeof fetch;
+
+    const queries = [
+      "study_set_id=biology-midterm",
+      "voice_session_id=server-session",
+      "study_set_id=biology-midterm&voice_session_id=server-session&user_id=synthetic-user",
+      "study_set_id=biology-midterm&study_set_id=biology-midterm&voice_session_id=server-session",
+      "study_set_id=biology-midterm&voice_session_id=server-session&voice_session_id=other",
+      "study_set_id=&voice_session_id=server-session",
+      "study_set_id=biology-midterm&voice_session_id=",
+    ];
+    const statuses: number[] = [];
+    const bodies: unknown[] = [];
+    for (const query of queries) {
+      const response = await fetchStudyProjection(studyProjectionRequest({ query }));
+      statuses.push(response.status);
+      bodies.push(await response.json());
+    }
+
+    expect(calls).toEqual([]);
+    expect(statuses).toEqual(queries.map(() => 400));
+    for (const body of bodies) {
+      expect(body).toEqual({
+        error: "viva_session_projection_request_invalid",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      });
+    }
+  });
+
+  test("requires a same-origin safe-read fetch context", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, studyProjectionFixture("ready_session_with_active_question"));
+    }) as typeof fetch;
+
+    const contexts: Array<Record<string, string>> = [
+      {},
+      { "sec-fetch-site": "cross-site" },
+      { "sec-fetch-site": "same-site" },
+      { "sec-fetch-site": "none" },
+      { origin: "https://attacker.example", "sec-fetch-site": "same-origin" },
+    ];
+    const statuses: number[] = [];
+    const bodies: unknown[] = [];
+    for (const context of contexts) {
+      const response = await fetchStudyProjection(
+        studyProjectionRequest({ fetchSite: null, headers: context }),
+      );
+      statuses.push(response.status);
+      bodies.push(await response.json());
+    }
+
+    expect(calls).toEqual([]);
+    expect(statuses).toEqual(contexts.map(() => 403));
+    for (const body of bodies) {
+      expect(body).toEqual({
+        error: "cross_origin_session_request",
+        failure_class: "access_denied",
+        stage: "pre_loop",
+      });
+    }
+  });
+
+  test("keeps the eight-second deadline armed through fetch, bounded read, and validation", async () => {
+    const timers = captureDeadlineTimers();
+    try {
+      const upstreamSignals: Array<AbortSignal | undefined> = [];
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        upstreamSignals.push(init?.signal ?? undefined);
+        timers.fire(PROJECTION_UPSTREAM_TIMEOUT_MS);
+        // Exactly what a real `fetch` does once its signal aborts mid-flight.
+        throw new DOMException("The operation was aborted.", "AbortError");
+      }) as typeof fetch;
+
+      const duringFetch = await fetchStudyProjection(studyProjectionRequest());
+      const duringFetchBody = await duringFetch.json();
+
+      expect(timers.delays).toContain(PROJECTION_UPSTREAM_TIMEOUT_MS);
+      expect(upstreamSignals[0]?.aborted).toBe(true);
+      expect(duringFetch.status).toBe(504);
+      expect(duringFetchBody).toEqual({
+        error: "viva_session_projection_timeout",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      });
+
+      timers.reset();
+      globalThis.fetch = (async () => {
+        let pulled = false;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (!pulled) {
+                pulled = true;
+                controller.enqueue(new TextEncoder().encode('{"version":'));
+                timers.fire(PROJECTION_UPSTREAM_TIMEOUT_MS);
+              }
+              // The producer stalls; the deadline has to beat the read. The quarter-second
+              // backstop only exists so a route that armed NO deadline fails instead of hanging
+              // the suite — it is thirty-two times shorter than the deadline under test.
+              return new Promise<void>((_resolve, reject) => {
+                setTimeout(() => reject(new Error("the upstream body stalled")), 250);
+              });
+            },
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }) as typeof fetch;
+
+      const duringRead = await fetchStudyProjection(studyProjectionRequest());
+
+      expect(duringRead.status).toBe(504);
+      expect(await duringRead.json()).toEqual({
+        error: "viva_session_projection_timeout",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      });
+    } finally {
+      timers.restore();
+    }
+  });
+
+  test("sanitizes every malicious upstream projection body to the coarse 502", async () => {
+    const cases: Array<{ body: BodyInit; name: string }> = [
+      { body: oversizedProjectionBody(), name: "over one mebibyte" },
+      { body: new Uint8Array([0x7b, 0x22, 0xff, 0xfe, 0x22, 0x7d]), name: "malformed utf-8" },
+      { body: '{"version": 1,', name: "malformed json" },
+      {
+        body: JSON.stringify({
+          ...studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+          version: 2,
+        }),
+        name: "wrong schema version",
+      },
+      {
+        body: JSON.stringify({
+          ...studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+          rubric: "the grading rubric the learner may not see",
+        }),
+        name: "unknown field",
+      },
+      {
+        body: duplicateIdentityProjectionBody(),
+        name: "duplicate identity key",
+      },
+      {
+        body: JSON.stringify(
+          studyProjectionFixture("failed_ingestion_is_reported_not_hidden", {
+            studySetId: "some-other-set",
+          }),
+        ),
+        name: "identity disagrees with the verified session",
+      },
+      {
+        body: JSON.stringify(
+          studyProjectionFixture("failed_ingestion_is_reported_not_hidden", {
+            sessionId: "some-other-session",
+          }),
+        ),
+        name: "session identity disagrees with the verified session",
+      },
+      { body: "[]", name: "not an object" },
+    ];
+
+    const observed: Array<{ name: string; status: number; body: unknown }> = [];
+    for (const entry of cases) {
+      globalThis.fetch = (async () =>
+        new Response(entry.body, {
+          headers: { "content-type": "application/json" },
+          status: 200,
+        })) as typeof fetch;
+      const response = await fetchStudyProjection(studyProjectionRequest());
+      observed.push({ body: await response.json(), name: entry.name, status: response.status });
+    }
+
+    expect(observed.map((entry) => entry.status)).toEqual(cases.map(() => 502));
+    for (const entry of observed) {
+      expect(entry.body).toEqual({
+        error: "viva_session_projection_unavailable",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      });
+    }
+  });
+
+  test("treats any upstream credential key or value as a contract violation, not a projection", async () => {
+    const logs: string[] = [];
+    console.warn = (line: unknown) => {
+      logs.push(String(line));
+    };
+
+    const hostile: Array<{ body: unknown; leaked: string[]; name: string }> = [
+      {
+        body: {
+          ...studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+          session_token: "viva1.forged-projection-credential",
+        },
+        leaked: ["session_token", "viva1.forged-projection-credential"],
+        name: "top-level credential key",
+      },
+      {
+        body: (() => {
+          const value = studyProjectionFixture("ready_session_with_active_question");
+          const question = value.activeQuestion as Record<string, unknown>;
+          const citations = question.sourceCitations as Array<Record<string, unknown>>;
+          const citation = citations[0] as Record<string, unknown>;
+          citation.api_key = "viva-fixture-upstream-api-key";
+          return value;
+        })(),
+        leaked: ["api_key", "viva-fixture-upstream-api-key"],
+        name: "deeply nested credential key",
+      },
+      {
+        body: (() => {
+          const value = studyProjectionFixture("failed_ingestion_is_reported_not_hidden");
+          const studySet = value.studySet as Record<string, unknown>;
+          studySet.title = "Bearer viva-fixture-upstream-leaked-credential";
+          return value;
+        })(),
+        leaked: ["Bearer viva-fixture-upstream-leaked-credential"],
+        name: "credential-shaped string leaf that would otherwise validate",
+      },
+      {
+        body: (() => {
+          const value = studyProjectionFixture("failed_ingestion_is_reported_not_hidden");
+          const session = value.session as Record<string, unknown>;
+          session.goal = "viva-control1.forged-capability";
+          return value;
+        })(),
+        leaked: ["viva-control1.forged-capability"],
+        name: "BFF capability prefix in a nullable string leaf",
+      },
+    ];
+
+    const observed: Array<{ name: string; status: number; text: string }> = [];
+    for (const entry of hostile) {
+      logs.length = 0;
+      globalThis.fetch = (async () => jsonResponse(200, entry.body)) as typeof fetch;
+      const response = await fetchStudyProjection(studyProjectionRequest());
+      const text = await response.text();
+      observed.push({ name: entry.name, status: response.status, text });
+      const joinedLogs = logs.join("\n");
+      for (const leak of entry.leaked) {
+        expect(text).not.toContain(leak);
+        expect(joinedLogs).not.toContain(leak);
+      }
+      expect(joinedLogs).toContain("projection_upstream_credential_violation");
+    }
+
+    expect(observed.map((entry) => entry.status)).toEqual(hostile.map(() => 502));
+    for (const entry of observed) {
+      expect(JSON.parse(entry.text)).toEqual({
+        error: "viva_session_projection_unavailable",
+        failure_class: "projection_unavailable",
+        stage: "pre_loop",
+      });
+    }
+  });
+
+  test("admits sixty projections a minute over atomic ip and session keys", async () => {
+    process.env.VIVA_SESSION_PROJECTION_MAX_PER_MINUTE = "60";
+    globalThis.fetch = (async () =>
+      jsonResponse(
+        200,
+        studyProjectionFixture("ready_session_with_active_question"),
+      )) as typeof fetch;
+
+    const statuses: number[] = [];
+    for (let index = 0; index < 61; index += 1) {
+      const response = await fetchStudyProjection(studyProjectionRequest());
+      statuses.push(response.status);
+      if (index === 60) {
+        expect(await response.json()).toEqual({
+          error: "session_projection_rate_limited",
+          failure_class: "rate_limit",
+          stage: "pre_loop",
+        });
+        expect(isBoundedRetryAfter(response.headers.get("retry-after"))).toBe(true);
+      }
+    }
+
+    expect(statuses.slice(0, 60)).toEqual(Array.from({ length: 60 }, () => 200));
+    expect(statuses[60]).toBe(429);
+  });
+
+  test("fails closed with no agent contact when a public deployment has no shared store", async () => {
+    restoreEnv("NODE_ENV", "production");
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_URL;
+    delete process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN;
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, studyProjectionFixture("ready_session_with_active_question"));
+    }) as typeof fetch;
+
+    const response = await fetchStudyProjection(studyProjectionRequest());
+
+    expect(calls).toEqual([]);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: "viva_session_projection_unavailable",
+      failure_class: "projection_unavailable",
+      stage: "pre_loop",
+    });
+    expect(response.headers.get("retry-after")).toBe(null);
+  });
+
+  test("maps every upstream status onto its recorded public projection failure", async () => {
+    const cases: Array<{
+      expected: { body: Record<string, unknown>; retryAfter: boolean; status: number };
+      upstream: { headers?: Record<string, string>; status: number };
+    }> = [
+      {
+        expected: {
+          body: {
+            error: "session_auth_terminal",
+            failure_class: "session_auth_failure",
+            stage: "session",
+            token_refresh_outcome: "terminal",
+          },
+          retryAfter: false,
+          status: 401,
+        },
+        upstream: { status: 401 },
+      },
+      {
+        expected: {
+          body: {
+            error: "session_auth_terminal",
+            failure_class: "session_auth_failure",
+            stage: "session",
+            token_refresh_outcome: "terminal",
+          },
+          retryAfter: false,
+          status: 401,
+        },
+        upstream: { status: 403 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_not_found",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 404,
+        },
+        upstream: { status: 404 },
+      },
+      {
+        expected: {
+          body: {
+            error: "session_projection_rate_limited",
+            failure_class: "rate_limit",
+            stage: "pre_loop",
+          },
+          retryAfter: true,
+          status: 429,
+        },
+        upstream: { headers: { "retry-after": "30" }, status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { headers: { "retry-after": "0" }, status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { headers: { "retry-after": "61" }, status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { headers: { "retry-after": "1.5" }, status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { headers: { "retry-after": "Wed, 26 Aug 2026 00:00:00 GMT" }, status: 429 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { status: 500 },
+      },
+      {
+        expected: {
+          body: {
+            error: "viva_session_projection_unavailable",
+            failure_class: "projection_unavailable",
+            stage: "pre_loop",
+          },
+          retryAfter: false,
+          status: 502,
+        },
+        upstream: { status: 204 },
+      },
+    ];
+
+    const observed: Array<{ body: unknown; retryAfter: string | null; status: number }> = [];
+    for (const entry of cases) {
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            authorization: "Bearer viva-fixture-upstream-error-detail",
+            detail: "https://agent.example/internal/path",
+          }),
+          {
+            headers: { "content-type": "application/json", ...(entry.upstream.headers ?? {}) },
+            status: entry.upstream.status,
+          },
+        )) as typeof fetch;
+      const response = await fetchStudyProjection(studyProjectionRequest());
+      observed.push({
+        body: await response.json(),
+        retryAfter: response.headers.get("retry-after"),
+        status: response.status,
+      });
+    }
+
+    for (const [index, entry] of cases.entries()) {
+      const actual = observed[index];
+      if (!actual) throw new Error("every upstream case must produce a response");
+      expect({ body: actual.body, status: actual.status }).toEqual({
+        body: entry.expected.body,
+        status: entry.expected.status,
+      });
+      if (entry.expected.retryAfter) {
+        expect(actual.retryAfter).toBe("30");
+      } else {
+        expect(actual.retryAfter).toBe(null);
+      }
+      expect(JSON.stringify(actual.body)).not.toContain("viva-fixture-upstream-error-detail");
+      expect(JSON.stringify(actual.body)).not.toContain("agent.example");
+    }
+  });
+
+  test("cancels the upstream read and authors no late body when the client aborts", async () => {
+    const client = new AbortController();
+    const upstreamSignals: Array<AbortSignal | undefined> = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      upstreamSignals.push(init?.signal ?? undefined);
+      client.abort(new Error("the learner navigated away"));
+      // Watching the client signal as well as the upstream one keeps a route that forwards
+      // NEITHER from hanging the suite; the assertion below still proves the upstream one aborted.
+      return abortableJsonResponse([init?.signal, client.signal]);
+    }) as typeof fetch;
+
+    let refused: unknown = null;
+    let delivered: unknown = "the route authored a response for a caller that had gone away";
+    try {
+      delivered = await fetchStudyProjection(studyProjectionRequest({ signal: client.signal }));
+    } catch (error) {
+      refused = error;
+    }
+
+    expect(delivered).toBe("the route authored a response for a caller that had gone away");
+    expect(refused instanceof Error).toBe(true);
+    expect((refused as Error).message).toBe("the learner navigated away");
+    expect(upstreamSignals[0]?.aborted).toBe(true);
+  });
+
+  test("keeps the projection credential detector in step with the library proxy's", () => {
+    const projectionSource = readFileSync(
+      new URL("../app/api/viva-session/shared.ts", import.meta.url),
+      "utf8",
+    );
+    const librarySource = readFileSync(
+      new URL("../app/api/viva-library/[[...path]]/route.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(agentCredentialKeyLiterals(projectionSource)).toEqual(
+      agentCredentialKeyLiterals(librarySource),
+    );
+    expect(agentCredentialValueMarkerLiterals(projectionSource)).toEqual(
+      agentCredentialValueMarkerLiterals(librarySource),
+    );
+  });
+});
+
 /** The one coarse public body every D-07 Branch A refresh terminal returns. */
 const COARSE_SESSION_AUTH_TERMINAL = {
   error: "session_auth_terminal",
@@ -3332,4 +4002,191 @@ function restoreEnv(name: string, value: string | undefined) {
   } else {
     process.env[name] = value;
   }
+}
+
+/**
+ * Plan 04's shared cross-language study-projection fixture, read only. Plan 11 consumes it exactly
+ * as Plan 05's token vectors are consumed: never edited, never re-derived, and reported by path in
+ * the Task 11 handoff.
+ */
+const PLAN_04_STUDY_PROJECTION_FIXTURE_PATH =
+  "agent/fixtures/learning-core/study-projection-v1.json";
+const planFourStudyProjectionFixture = JSON.parse(
+  readFileSync(
+    new URL(`../../../${PLAN_04_STUDY_PROJECTION_FIXTURE_PATH}`, import.meta.url),
+    "utf8",
+  ),
+) as { projections: Record<string, Record<string, unknown>>; schema: string };
+
+/** The identity the plan pins into both the browser query and the upstream URL, verbatim. */
+const PROJECTION_STUDY_SET_ID = "biology-midterm";
+const PROJECTION_SESSION_ID = "server-session";
+const PROJECTION_QUERY = `study_set_id=${PROJECTION_STUDY_SET_ID}&voice_session_id=${PROJECTION_SESSION_ID}`;
+/**
+ * Restated here from the plan rather than imported, so a production drift off the eight-second
+ * deadline breaks the test instead of silently redefining it.
+ */
+const PROJECTION_UPSTREAM_TIMEOUT_MS = 8_000;
+
+/**
+ * One fixture case, deep-copied, with only its two identity fields rewritten onto the queried
+ * identity. Nothing else about Plan 04's bytes is touched: the shapes, the nesting, the citation
+ * confidences, and the review-schedule authority all stay exactly as the shared fixture states.
+ */
+function studyProjectionFixture(
+  name: string,
+  overrides: { sessionId?: string; studySetId?: string } = {},
+): Record<string, unknown> {
+  const source = planFourStudyProjectionFixture.projections[name];
+  if (!source) {
+    throw new Error(`Plan 04 study projection fixture is missing case ${name}`);
+  }
+  const value = JSON.parse(JSON.stringify(source)) as Record<string, unknown>;
+  (value.studySet as Record<string, unknown>).id = overrides.studySetId ?? PROJECTION_STUDY_SET_ID;
+  (value.session as Record<string, unknown>).id = overrides.sessionId ?? PROJECTION_SESSION_ID;
+  return value;
+}
+
+function studyProjectionRequest(
+  options: {
+    accessToken?: string | null;
+    fetchSite?: string | null;
+    headers?: Record<string, string>;
+    query?: string;
+    signal?: AbortSignal;
+  } = {},
+): NextRequest {
+  const accessToken =
+    options.accessToken === undefined ? signedAgentAccessToken() : options.accessToken;
+  const fetchSite = options.fetchSite === undefined ? "same-origin" : options.fetchSite;
+  const headers = new Headers({ "x-forwarded-for": "203.0.113.10" });
+  if (accessToken !== null) headers.set("authorization", `Bearer ${accessToken}`);
+  if (fetchSite !== null) headers.set("sec-fetch-site", fetchSite);
+  for (const [name, value] of Object.entries(options.headers ?? {})) headers.set(name, value);
+  return {
+    headers,
+    method: "GET",
+    nextUrl: new URL(
+      `${CANONICAL_WEB_ORIGIN}/api/viva-session/projection?${options.query ?? PROJECTION_QUERY}`,
+    ),
+    ...(options.signal ? { signal: options.signal } : {}),
+  } as unknown as NextRequest;
+}
+
+/**
+ * Records every `setTimeout` delay the route arms and lets one be fired on demand, so the exact
+ * eight-second deadline is asserted as a value AND its expiry is observed at a chosen moment —
+ * without a test that actually waits eight seconds.
+ */
+function captureDeadlineTimers(): {
+  delays: number[];
+  fire(delayMs: number): void;
+  reset(): void;
+  restore(): void;
+} {
+  const originalSetTimeout = globalThis.setTimeout;
+  const delays: number[] = [];
+  let pending: Array<{ delay: number; fire: () => void; id: ReturnType<typeof setTimeout> }> = [];
+  globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+    const id = (originalSetTimeout as (...rest: unknown[]) => ReturnType<typeof setTimeout>)(
+      handler,
+      delay,
+      ...args,
+    );
+    if (typeof handler === "function" && typeof delay === "number") {
+      delays.push(delay);
+      pending.push({ delay, fire: () => (handler as () => void)(), id });
+    }
+    return id;
+  }) as unknown as typeof globalThis.setTimeout;
+  return {
+    delays,
+    fire(delayMs: number) {
+      const matched = pending.filter((entry) => entry.delay === delayMs);
+      pending = pending.filter((entry) => entry.delay !== delayMs);
+      for (const entry of matched) {
+        clearTimeout(entry.id);
+        entry.fire();
+      }
+    },
+    reset() {
+      for (const entry of pending) clearTimeout(entry.id);
+      pending = [];
+      delays.length = 0;
+    },
+    restore() {
+      for (const entry of pending) clearTimeout(entry.id);
+      pending = [];
+      globalThis.setTimeout = originalSetTimeout;
+    },
+  };
+}
+
+/** Streams one byte past the projection response budget in uneven chunks, never prebuilt. */
+function oversizedProjectionBody(): ReadableStream<Uint8Array> {
+  const limit = 1 * 1024 * 1024;
+  let sent = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent > limit) {
+        controller.close();
+        return;
+      }
+      const size = Math.min(4_096 + (sent % 97), limit + 1 - sent);
+      controller.enqueue(new Uint8Array(size).fill(0x20));
+      sent += size;
+    },
+  });
+}
+
+/** A syntactically valid JSON document whose identity object is stated twice. */
+function duplicateIdentityProjectionBody(): string {
+  const serialized = JSON.stringify(
+    studyProjectionFixture("failed_ingestion_is_reported_not_hidden"),
+  );
+  return `${serialized.slice(0, -1)},"session":{"id":"${PROJECTION_SESSION_ID}","mode":"quiz","goal":null}}`;
+}
+
+/** A body that never arrives and errors as soon as any of the given signals aborts. */
+function abortableJsonResponse(signals: Array<AbortSignal | null | undefined>): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        const cancel = () => {
+          try {
+            controller.error(new Error("upstream cancelled"));
+          } catch {
+            // The stream was already errored by the first signal to fire.
+          }
+        };
+        for (const signal of signals) {
+          if (!signal) continue;
+          if (signal.aborted) {
+            cancel();
+            return;
+          }
+          signal.addEventListener("abort", cancel, { once: true });
+        }
+      },
+    }),
+    { headers: { "content-type": "application/json" }, status: 200 },
+  );
+}
+
+function agentCredentialKeyLiterals(source: string): string[] {
+  return sourceArrayLiterals(source, "AGENT_CREDENTIAL_KEYS");
+}
+
+function agentCredentialValueMarkerLiterals(source: string): string[] {
+  return sourceArrayLiterals(source, "AGENT_CREDENTIAL_VALUE_MARKERS");
+}
+
+/** Reads one declared array literal out of a source file so two copies cannot drift apart. */
+function sourceArrayLiterals(source: string, name: string): string[] {
+  const declaration = source.indexOf(`const ${name}`);
+  if (declaration < 0) throw new Error(`source must declare ${name}`);
+  const open = source.indexOf("[", declaration);
+  const close = source.indexOf("]", open);
+  if (open < 0 || close < 0) throw new Error(`${name} must be declared as an array literal`);
+  return [...source.slice(open, close).matchAll(/"([^"]*)"/g)].map((match) => match[1] ?? "");
 }
