@@ -174,11 +174,21 @@ export async function waitForHttp(url, timeoutMs, label) {
   );
 }
 
-/** Launches Chromium with fake media devices, matching this repo's e2e harness. */
+/**
+ * Launches Chromium with fake media devices, matching this repo's e2e
+ * harness. `--enable-precise-memory-info` asks Chromium for a finer-grained
+ * `performance.memory.usedJSHeapSize` than its default coarse bucketing —
+ * `scripts/frontend-performance.mjs`'s heap-growth budget needs real
+ * resolution, not a value quantized to the nearest ~100 KB.
+ */
 export async function launchChromium() {
   return chromium.launch({
     headless: process.env.PLAYWRIGHT_HEADLESS !== "0",
-    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      "--enable-precise-memory-info",
+    ],
   });
 }
 
@@ -526,5 +536,47 @@ export async function withFrontendProductionServer({ artifactDir, extraEnv = {} 
 export async function setCpuThrottlingRate(page, rate) {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("Emulation.setCPUThrottlingRate", { rate });
+  return cdp;
+}
+
+/**
+ * Disables CSP enforcement (CDP `Page.setBypassCSP`) for `page`, entirely a
+ * test-harness-side workaround — it changes nothing about what the server
+ * sends or what real users' browsers enforce.
+ *
+ * Exists because of a real, confirmed, currently-active defect spanning two
+ * files this plan does not own: `apps/web/proxy.ts` (`WEBAPI-015`)'s
+ * `validatedAgentOrigin` accepts only a bare-origin
+ * `NEXT_PUBLIC_VIVA_AGENT_WS_URL` (its own dedicated test,
+ * `viva-security-headers.test.ts`, explicitly rejects any path-bearing
+ * value, e.g. `"https://agent.example/socket"`), while
+ * `apps/web/lib/viva-agent-client.ts` (Plan 10's) uses that exact same env
+ * var *verbatim* as the literal WebSocket connect URL
+ * (`connectVivaAgent`/`vivaAgentWsUrl`, whose own hardcoded default is
+ * `"ws://127.0.0.1:4318/ws"` — the `/ws` path is load-bearing, since nothing
+ * appends it later). No value of that env var can satisfy both: a bare
+ * origin reaches the wrong path, and a `/ws`-suffixed one satisfies the
+ * client but is rejected by the CSP `connect-src` builder, so the browser's
+ * own CSP blocks the connection (confirmed directly: Chromium logs
+ * `"Connecting to 'ws://…' violates … connect-src"` and no agent
+ * WebSocket ever opens). Separately, under a production (`next start`)
+ * build, `apps/web/app/session/page.tsx` (also not owned here — see the
+ * commit reverting this lane's earlier, out-of-scope fix to it) never
+ * receives Next's per-request CSP nonce on any of its `<script>` tags
+ * either, so the route never hydrates at all without this bypass.
+ *
+ * This is reported upstream (to whoever owns `proxy.ts`/
+ * `viva-agent-client.ts`/`session/page.tsx`) rather than fixed here; bypassing
+ * CSP in this harness's own Chromium session lets `frontend-accessibility.mjs`
+ * and `frontend-performance.mjs` still mount a real, connected, fully
+ * hydrated session to check the things they actually own (session landmark/
+ * skip link/Transcript semantics, and representative performance sampling)
+ * despite it.
+ *
+ * @param {import("playwright").Page} page
+ */
+export async function bypassCsp(page) {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Page.setBypassCSP", { enabled: true });
   return cdp;
 }

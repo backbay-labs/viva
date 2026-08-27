@@ -14,6 +14,7 @@ import {
   checkCumulativeLayoutShift,
   checkFrameIntervalP95,
   checkHeapGrowthBytes,
+  checkHeapMemoryApiAvailable,
   checkTotalBlockingTime,
 } from "./frontend-performance.mjs";
 
@@ -1701,6 +1702,20 @@ test("checkTargetSize rejects a min-height that resolves below the target, namin
   );
 });
 
+test("checkTargetSize rejects a min-height one pixel below the target (43px vs. the 44px target)", () => {
+  const fixture = `.button { min-height: 43px; }`;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.resolvedBlockSizePx, 43);
+  assert.ok(
+    result.errors.some((error) => error.includes("43px")),
+    `expected an error naming the resolved 43px value, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
 test("checkTargetSize accepts a literal rem min-height that resolves to exactly the target", () => {
   const fixture = `.button { min-height: 2.75rem; }`;
   const result = checkTargetSize([["fixture", fixture]], {
@@ -1737,6 +1752,35 @@ test("checkTargetSize rejects a width cap below the target even when min-height 
     result.errors.some((error) => error.includes("max-width") && error.includes("32")),
     `expected an error naming the max-width cap, got: ${JSON.stringify(result.errors)}`,
   );
+});
+
+test("checkTargetSize rejects a 43x44 target: a 43px max-width cap one pixel below the target, even though min-height alone resolves to exactly 44px", () => {
+  const fixture = `
+    .button { min-height: 2.75rem; }
+    .button-primary { max-width: 43px; }
+  `;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button", ".button-primary"],
+    minPx: 44,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((error) => error.includes("max-width") && error.includes("43px")),
+    `expected an error naming the 43px max-width cap, got: ${JSON.stringify(result.errors)}`,
+  );
+});
+
+test("checkTargetSize accepts a max-width cap of exactly the target (44px is not 'below' 44px)", () => {
+  const fixture = `
+    .button { min-height: 2.75rem; }
+    .button-primary { max-width: 44px; }
+  `;
+  const result = checkTargetSize([["fixture", fixture]], {
+    selectors: [".button", ".button-primary"],
+    minPx: 44,
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
 });
 
 test("checkTargetSize rejects selectors that are present but declare no block-size constraint at all", () => {
@@ -1881,6 +1925,14 @@ test("checkHeapGrowthBytes rejects 8 MiB plus one byte", () => {
 
 test("checkHeapGrowthBytes accepts exactly 8 MiB", () => {
   assert.equal(checkHeapGrowthBytes(8 * 1024 * 1024), true);
+});
+
+test("checkHeapMemoryApiAvailable rejects an unavailable performance.memory (the budget would otherwise silently carry no evidence)", () => {
+  assert.equal(checkHeapMemoryApiAvailable(false), false);
+});
+
+test("checkHeapMemoryApiAvailable accepts an available performance.memory", () => {
+  assert.equal(checkHeapMemoryApiAvailable(true), true);
 });
 
 test("checkCumulativeLayoutShift rejects 0.051, just over the 0.05 budget", () => {

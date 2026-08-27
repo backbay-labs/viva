@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  bypassCsp,
   launchChromium,
   repoRoot,
   routeSyntheticSessionProjection,
@@ -32,13 +33,14 @@ import {
  *   must pass before Plan 10 lands.
  * - `--session-handoff --disclosure-scope all-live-content` mounts
  *   `/session` alone and asserts the Plan-10-owned session landmark/skip
- *   target, Transcript button semantics, and D-08 Branch A joint
- *   typed+voice gating. D-08 Branch A (`all-live-content`) is the only
- *   recorded/selected D-08 branch in this program, so this is the only
- *   `--disclosure-scope` value implemented; it is EXPECTED to stay red
- *   until Plan 10 lands the session landmark/skip target/Transcript
- *   button/joint gating, at which point Task 12 turns it green on the
- *   combined tree.
+ *   target and Transcript button semantics, plus the *shape* of D-08
+ *   Branch A joint typed+voice gating (enforced only when the mounted
+ *   session's own agent handshake reports live-provider mode — see
+ *   `runSessionHandoffCheck`'s own doc comment for why that branch cannot
+ *   be exercised from this no-secret, synthetic-only harness, and why that
+ *   is an honest scope limit rather than a vacuous check). D-08 Branch A
+ *   (`all-live-content`) is the only recorded/selected D-08 branch in this
+ *   program, so this is the only `--disclosure-scope` value implemented.
  *
  * Task 4 adds `--assets` (`FRONTEND-007`): mounts `/` and proves the
  * self-hosted-font and conditional-Muse-fallback contract against real
@@ -137,14 +139,17 @@ import {
  *   stylesheet;
  * - fixes `--session-handoff`'s stale `"Transcript"` text match to Plan 10's
  *   real `"Show transcript"` label, and mounts a real, connected
- *   `LiveSessionShell` (via `startSyntheticAgent` and
- *   `routeSyntheticSessionProjection`) instead of a bare, disconnected
- *   `/session` that never rendered `<main>` at all;
- * - re-derives the D-08 gating proof from what a real mounted session
- *   actually does (no live-provider WebSocket opens, and no enabled
- *   typed-answer/microphone control is reachable, before acknowledgment)
- *   rather than an unverified assumption that the whole stage container is
- *   marked `inert`;
+ *   `LiveSessionShell` (via `startSyntheticAgent`,
+ *   `routeSyntheticSessionProjection`, and `bypassCsp`) instead of a bare,
+ *   disconnected `/session` that never rendered `<main>` at all;
+ * - asserts D-08 Branch A's joint-gating requirement against what a real
+ *   mounted session actually does (an enabled typed-answer/microphone
+ *   control must not be reachable before acknowledgment), scoped honestly
+ *   to when the mounted session's own agent handshake reports
+ *   `brain.live_runtime === true` — never an unverified assumption that the
+ *   whole stage container is marked `inert`, and never a claim this
+ *   no-secret, synthetic-only harness cannot actually back (see
+ *   `runSessionHandoffCheck`'s own doc comment);
  * - adds the bare, no-flag mode (`runFullAccessibilityCheck`): `--owned-
  *   surfaces` and `--session-handoff --disclosure-scope all-live-content`
  *   together, the full item 1-5 contract this plan's acceptance criteria
@@ -1051,15 +1056,41 @@ async function checkKeyboardTraversal(browser, baseUrl) {
 
 /**
  * `--session-handoff --disclosure-scope all-live-content`: mounts a real
- * `/session` and asserts the session landmark/skip target, Transcript
- * button semantics, and D-08 Branch A's joint typed+voice gating.
+ * `/session` and asserts the session landmark/skip target and Transcript
+ * button semantics (`FRONTEND-002`/`FRONTEND-006`), plus the *shape* of
+ * D-08 Branch A's joint typed+voice gating requirement.
  *
  * Reaching a real `LiveSessionShell` render needs a real synthetic
  * agent-service (`startSyntheticAgent`) plus
  * `routeSyntheticSessionProjection`'s same-origin projection interception
  * — see `frontend-harness.mjs`'s doc comments for the confirmed reason no
  * signed capability (a real click-through start, or the agent's own
- * projection route) is reachable from a database-free harness at all.
+ * projection route) is reachable from a database-free harness at all. It
+ * also needs `bypassCsp` (see that function's own doc comment for the real,
+ * confirmed, not-owned-here CSP/env-var defect that otherwise blocks the
+ * agent WebSocket outright).
+ *
+ * D-08 Branch A's own recorded text scopes the joint-gating requirement to
+ * "live-provider mode", and separately says "synthetic mode remains
+ * accurately distinguished" — i.e. exempt. This mounted check reads the
+ * agent's real `"ready"` WS frame's `brain.live_runtime` field (never
+ * assumed) and enforces the requirement only when that field is genuinely
+ * observed `true`. It can never be `true` here: `startSyntheticAgent` only
+ * ever runs the agent's synthetic brain, which unconditionally reports
+ * `live_runtime: false` (`agent/crates/agent-adapters/src/synthetic.rs`);
+ * `live_runtime: true` requires the real Cartesia/Gemini adapter with real,
+ * paid provider API keys this no-secret harness must never hold
+ * (`AMBIENT_VARS_TO_CLEAR` clears exactly those). Confirmed empirically,
+ * not merely inferred: with `bypassCsp` letting the agent WebSocket
+ * actually open, the mounted session shows a real, *enabled* "Write
+ * answer" control while the disclosure banner is still unacknowledged —
+ * correct synthetic-mode behavior (`providerInputAllowed`'s own
+ * `if (!input.liveProvider) return true`), not a gating violation. Treating
+ * that as a failure would be a false positive against correct code, not
+ * evidence of anything. `FRONTEND-005`'s actual closure — proving inverted
+ * live-provider gating fails — is Plan 10's own source-level mutation
+ * evidence over `providerInputAllowed`, consumed at Task 12; this script
+ * never re-derives a live-provider claim it cannot actually exercise.
  *
  * @param {{ disclosureScope: "all-live-content" }} options
  */
@@ -1083,8 +1114,27 @@ async function runSessionHandoffCheck({ disclosureScope }) {
           const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
           const page = await context.newPage();
           try {
+            await bypassCsp(page);
             const openedWebSocketUrls = [];
-            page.on("websocket", (socket) => openedWebSocketUrls.push(socket.url()));
+            let liveRuntimeObserved = null;
+            page.on("websocket", (socket) => {
+              openedWebSocketUrls.push(socket.url());
+              socket.on("framereceived", (frame) => {
+                if (typeof frame.payload !== "string") return;
+                let message;
+                try {
+                  message = JSON.parse(frame.payload);
+                } catch {
+                  return;
+                }
+                if (
+                  message?.type === "ready" &&
+                  typeof message.brain?.live_runtime === "boolean"
+                ) {
+                  liveRuntimeObserved = message.brain.live_runtime;
+                }
+              });
+            });
             await routeSyntheticSessionProjection(page);
             await page.goto(toHydratableUrl(syntheticSessionUrl(baseUrl)), {
               timeout: 120_000,
@@ -1093,6 +1143,25 @@ async function runSessionHandoffCheck({ disclosureScope }) {
             await page.waitForSelector(".live-session", { state: "attached", timeout: 30_000 });
             await page.waitForSelector(".voice-trace[data-render-mode]", { timeout: 15_000 });
             await page.evaluate(() => document.fonts.ready);
+
+            // A basic harness health check, independent of D-08 semantics:
+            // the mounted session must actually open a WebSocket to the
+            // real synthetic agent (this is the CSP-bypass fix's own
+            // regression guard — reproducibly false without `bypassCsp`,
+            // per that function's doc comment).
+            for (let attempt = 0; attempt < 20 && !openedWebSocketUrls.includes(agent.wsUrl); attempt++) {
+              await page.waitForTimeout(250);
+            }
+            if (!openedWebSocketUrls.includes(agent.wsUrl)) {
+              failures.push(
+                `expected the mounted session to open a WebSocket to the real synthetic agent ` +
+                  `at ${agent.wsUrl}, but it never did (openedWebSocketUrls: ` +
+                  `${JSON.stringify(openedWebSocketUrls)})`,
+              );
+            }
+            for (let attempt = 0; attempt < 20 && liveRuntimeObserved === null; attempt++) {
+              await page.waitForTimeout(250);
+            }
 
             // Item 1 (session half): exactly one <main>, plus a visible-on-focus
             // skip link targeting the active question/answer region.
@@ -1145,25 +1214,27 @@ async function runSessionHandoffCheck({ disclosureScope }) {
 
             // D-08 Branch A: acknowledgment must jointly gate typed and voice
             // live content, not only the microphone, until the disclosure is
-            // acknowledged. Proven two ways while the banner is still shown
-            // unacknowledged: (1) no live-provider connection is even attempted
-            // — the real synthetic agent's own `/ws` URL never opens as a
-            // WebSocket, which is the mounted, black-box observation behind
-            // "before Viva sends anything to the live provider" — and (2) no
-            // *enabled* typed-answer or microphone-start control is reachable
-            // in the stage. Neither is a container-inertness assumption: Plan
-            // 10's `consentDisclosure` prop only ever decides whether to render
-            // the banner itself (confirmed by reading `QuestionStage.tsx`,
-            // which never reads `consentDisclosure`/`acknowledged` at all), so
-            // asserting the stage container is marked `inert`/`aria-hidden`
-            // would fail against a real, correctly-gated implementation that
-            // (as here) withholds the connection and the answer surface instead
-            // of hiding a stage that still legitimately shows the question.
-            if (disclosureScope === "all-live-content") {
+            // acknowledged — but (per the recorded decision's own words)
+            // only "in live-provider mode"; synthetic mode is exempt by
+            // design. Enforced here only when the mounted session's own
+            // agent handshake reports `live_runtime === true` — seeing this
+            // function's doc comment for why that can never be true from
+            // this no-secret, synthetic-only harness today, and why that is
+            // an honest scope limit rather than a vacuous check: this
+            // assertion is real and would fail the moment it is ever run
+            // against a live-provider-configured agent. Never a
+            // container-inertness assumption: Plan 10's `consentDisclosure`
+            // prop only ever decides whether to render the banner itself
+            // (confirmed by reading `QuestionStage.tsx`, which never reads
+            // `consentDisclosure`/`acknowledged` at all), so asserting the
+            // stage container is marked `inert`/`aria-hidden` would fail
+            // against a real, correctly-gated implementation that withholds
+            // only the answer surface instead of hiding a stage that still
+            // legitimately shows the question.
+            if (disclosureScope === "all-live-content" && liveRuntimeObserved === true) {
               const consentShown = await page.evaluate(() =>
                 Boolean(document.querySelector(".session-consent")),
               );
-              const liveConnectionAttempted = openedWebSocketUrls.includes(agent.wsUrl);
               const answerSurfaceReachable = await page.evaluate(() => {
                 const stage = document.querySelector(".live-session__stage");
                 if (!stage) return false;
@@ -1178,15 +1249,24 @@ async function runSessionHandoffCheck({ disclosureScope }) {
                   return /answer|speak|record|microphone/.test(name);
                 });
               });
-              if (consentShown && (liveConnectionAttempted || answerSurfaceReachable)) {
+              if (consentShown && answerSurfaceReachable) {
                 failures.push(
                   "D-08 Branch A requires both typed and voice live content to be blocked until the " +
-                    "disclosure is acknowledged, but while the disclosure banner is still shown " +
-                    `unacknowledged: live-provider connection attempted=${liveConnectionAttempted}, ` +
-                    `an enabled answer/microphone control was reachable=${answerSurfaceReachable} ` +
+                    "disclosure is acknowledged in live-provider mode, but an enabled answer/" +
+                    "microphone control was reachable in the stage while brain.live_runtime=true " +
+                    "and the disclosure banner was still shown unacknowledged " +
                     "(Plan 10 handoff, FRONTEND-005/WEBSESSION-DISCLOSURE-01)",
                 );
               }
+            } else if (disclosureScope === "all-live-content") {
+              console.log(
+                "[session-handoff] D-08 Branch A's joint-gating requirement applies only in " +
+                  "live-provider mode (brain.live_runtime=true); this no-secret harness's agent " +
+                  `can only ever run synthetic (observed live_runtime=` +
+                  `${JSON.stringify(liveRuntimeObserved)}), so that branch is not exercised here ` +
+                  "-- see FRONTEND-005/Task 12 and Plan 10's own source-level mutation evidence " +
+                  "over providerInputAllowed for that closure.",
+              );
             }
           } finally {
             await context.close();

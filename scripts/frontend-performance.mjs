@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  bypassCsp,
   launchChromium,
   repoRoot,
   routeSyntheticSessionProjection,
@@ -135,6 +136,17 @@ export function checkHealthyPngRequestCount(healthyPngRequestCount) {
 /** At most one canvas may be simultaneously animated on a route. */
 export function checkAnimatedCanvasCount(animatedCanvasCount) {
   return animatedCanvasCount <= 1;
+}
+
+/**
+ * The non-standard `performance.memory` API `checkHeapGrowthBytes`'s input
+ * depends on must actually be present in the sampled browser — otherwise
+ * `heapGrowthBytes` silently reports `0` and the budget passes vacuously
+ * regardless of real heap behavior. A loud, named failure here beats a
+ * check that can never fail.
+ */
+export function checkHeapMemoryApiAvailable(heapMemoryApiAvailable) {
+  return heapMemoryApiAvailable === true;
 }
 
 /**
@@ -287,6 +299,29 @@ async function runPolicyOnlyCheck() {
                 `${rootAttrAfterToggle}`,
             );
           }
+          // `FRONTEND-008`: the explicit preference must stop decorative
+          // animations too, not only make the canvas static — proven against
+          // a real DOM element's *computed* animation-duration (never a CSS
+          // source grep), with no OS-level `prefers-reduced-motion`/
+          // `prefers-reduced-transparency` active in this context, so only
+          // `html[data-viva-effects="reduced"]` itself can be responsible for
+          // collapsing it.
+          const headlineAnimationDurationAfterToggle = await page.evaluate(() => {
+            const el = document.querySelector(".viva-copy__headline");
+            return el ? getComputedStyle(el).animationDuration : null;
+          });
+          if (
+            headlineAnimationDurationAfterToggle === null ||
+            Number.parseFloat(headlineAnimationDurationAfterToggle) > 0.01
+          ) {
+            failures.push(
+              `[toggle] expected .viva-copy__headline's animation-duration to collapse to ~0 ` +
+                `once the explicit "reduced" preference is set with no OS reduced-motion/` +
+                `reduced-transparency signal active, got ${JSON.stringify(
+                  headlineAnimationDurationAfterToggle,
+                )}`,
+            );
+          }
           expectAttrs(failures, "toggle", await glyphAttributes(page), {
             dprCap: "1.5",
             fpsBudget: "0",
@@ -358,9 +393,18 @@ function currentGitSha() {
  * `frontend-accessibility.mjs`'s `checkMuseFallbackRecovery` already uses,
  * for the identical reason: Playwright's own request/response events do
  * not reliably distinguish a cache replay from a real transfer) and
- * accumulates `encodedDataLength` — the actual wire bytes — per asset
- * class, correlating `Network.responseReceived` (url) with
+ * accumulates `encodedDataLength` — the actual wire bytes — per byte-budget
+ * asset class, correlating `Network.responseReceived` (url) with
  * `Network.loadingFinished` (`encodedDataLength`) by `requestId`.
+ *
+ * `healthyPngRequestCount` is counted differently, on `Network.
+ * requestWillBeSent` (fired for every *attempt*, not only a completed
+ * transfer): a healthy load must never even attempt the PNG fallback, so a
+ * failed/aborted/canceled PNG request is exactly the defect this budget
+ * exists to catch, and `Network.loadingFinished` never fires for a request
+ * that never completes. Counting on the attempt also means it can never
+ * double-count a single completed request the way folding it into the same
+ * `loadingFinished` handler as the byte totals once did.
  *
  * @param {import("playwright").Page} page
  */
@@ -369,6 +413,9 @@ async function trackNetworkTransfers(page) {
   await cdp.send("Network.enable");
   const pendingByRequestId = new Map();
   const totals = { css: 0, healthyPngRequestCount: 0, webp: 0, woff2: 0 };
+  cdp.on("Network.requestWillBeSent", (event) => {
+    if (event.request.url.endsWith("/viva-muse.png")) totals.healthyPngRequestCount += 1;
+  });
   cdp.on("Network.responseReceived", (event) => {
     pendingByRequestId.set(event.requestId, event.response.url);
   });
@@ -380,7 +427,6 @@ async function trackNetworkTransfers(page) {
     if (url.endsWith(".css")) totals.css += bytes;
     else if (url.endsWith(".woff2")) totals.woff2 += bytes;
     else if (url.endsWith("/viva-muse.webp")) totals.webp += bytes;
-    else if (url.endsWith("/viva-muse.png")) totals.healthyPngRequestCount += 1;
   });
   return totals;
 }
@@ -402,6 +448,9 @@ async function sampleScenario(page) {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("HeapProfiler.enable");
   await cdp.send("HeapProfiler.collectGarbage");
+  const heapMemoryApiAvailable = await page.evaluate(
+    () => typeof performance.memory !== "undefined",
+  );
   const heapBeforeBytes = await page.evaluate(() => performance.memory?.usedJSHeapSize ?? 0);
 
   await page.evaluate(() => {
@@ -443,6 +492,7 @@ async function sampleScenario(page) {
     cumulativeLayoutShift: sample.clsValue,
     frameIntervalP95Ms: intervals.length > 0 ? intervals[p95Index] : 0,
     heapGrowthBytes: Math.max(0, heapAfterBytes - heapBeforeBytes),
+    heapMemoryApiAvailable,
     totalBlockingTimeMs: sample.longTaskDurationsMs.reduce(
       (sum, duration) => sum + Math.max(0, duration - 50),
       0,
@@ -522,6 +572,15 @@ async function runFullPerformanceCheck() {
               const transfers = await trackNetworkTransfers(page);
 
               if (scenario === "session") {
+                // See `bypassCsp`'s doc comment (`frontend-harness.mjs`) for
+                // the confirmed, cross-file, not-owned-here CSP defect this
+                // works around: without it, `/session` never opens its
+                // agent WebSocket (blocked by `connect-src`) and — under a
+                // production build — never hydrates any client JS at all
+                // (blocked by `script-src`, since Next never applies a CSP
+                // nonce to this route's script tags), making a performance
+                // sample of it meaningless rather than merely degraded.
+                await bypassCsp(page);
                 await routeSyntheticSessionProjection(page);
                 await page.goto(toHydratableUrl(syntheticSessionUrl(baseUrl)), {
                   timeout: 120_000,
@@ -562,6 +621,7 @@ async function runFullPerformanceCheck() {
                 frameIntervalP95Ms: sampled.frameIntervalP95Ms,
                 healthyPngRequestCount: transfers.healthyPngRequestCount,
                 heapGrowthBytes: sampled.heapGrowthBytes,
+                heapMemoryApiAvailable: sampled.heapMemoryApiAvailable,
                 totalBlockingTimeMs: sampled.totalBlockingTimeMs,
                 webpTransferBytes: transfers.webp,
                 woff2TransferBytes: transfers.woff2,
@@ -576,6 +636,11 @@ async function runFullPerformanceCheck() {
                 [
                   checkTotalBlockingTime(result.totalBlockingTimeMs),
                   `total blocking time ${result.totalBlockingTimeMs}ms > 300ms`,
+                ],
+                [
+                  checkHeapMemoryApiAvailable(result.heapMemoryApiAvailable),
+                  "performance.memory is unavailable in this browser; JS heap growth cannot be " +
+                    "measured (this budget would otherwise silently carry no evidence)",
                 ],
                 [
                   checkHeapGrowthBytes(result.heapGrowthBytes),
