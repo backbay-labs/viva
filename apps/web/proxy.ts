@@ -100,7 +100,17 @@ function contentSecurityPolicy(nonce: string): string {
     ["frame-ancestors", "'none'"],
     ["frame-src", "'none'"],
     ["script-src", ...scriptSources],
-    ["style-src", "'self'", GOOGLE_FONTS_STYLESHEET_HOST],
+    // `A-32`: real-run measurement attributed every style-src CSP violation to Next's own
+    // framework-injected `<style>`/stylesheet elements, never a mounted-UI stylesheet, and
+    // A-30's dynamic rendering is what lets Next stamp this same request's nonce onto them
+    // (confirmed directly: the production `<link rel="stylesheet">` Next itself emits for
+    // these routes already carries this exact nonce). Carrying it here — the identical
+    // value already forwarded for `script-src`, not a second nonce — lets any such element
+    // validate without ever admitting `'unsafe-inline'`, which stays explicitly out. (Next's
+    // `next dev`-only error-overlay chrome, `<nextjs-portal>`, injects its own unnonced
+    // shadow-DOM styles that no nonce here reaches; verified absent from a production build,
+    // so it is a dev-console-noise/harness-environment question, not a shipped-policy gap.)
+    ["style-src", "'self'", `'nonce-${nonce}'`, GOOGLE_FONTS_STYLESHEET_HOST],
     // Mounted UI sets React style attributes, which are inline styles the browser attributes to
     // the element rather than to a nonce. Stating it as its own directive keeps `style-src` free
     // of `'unsafe-inline'`, so a stylesheet still cannot be injected.
