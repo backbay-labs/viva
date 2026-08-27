@@ -291,6 +291,18 @@ type Harness = {
   mount(node: ReactElement): void;
   rerender(node: ReactElement): void;
   resizeTo(width: number, height: number): void;
+  /**
+   * [A-31.4(a) forced addition — Plan 13 lane, per
+   * `docs/decisions/2026-08-23-plan-amendments.md` A-31.4(a); this file is
+   * Plan-10-owned.] Drives `document.hidden` and dispatches a real
+   * `visibilitychange` so the existing fake rAF clock (`pendingFrameCount`/
+   * `drainFrames`, both pre-existing and unchanged by this addition) can
+   * prove the animation loop actually stops/resumes SCHEDULING frames, not
+   * merely that a listener is attached. Revert recipe: delete this method,
+   * its one `overrideGlobal("hidden", ...)` companion line in
+   * `createHarness`, and the one test that calls it below.
+   */
+  setHidden(hidden: boolean): void;
   setMedia(next: Partial<MediaState>): void;
   trace(): HTMLElement;
   unmount(): void;
@@ -344,6 +356,13 @@ function createHarness(options?: {
 
   overrideGlobal("devicePixelRatio", 3, window);
   overrideGlobal("hardwareConcurrency", options?.hardwareConcurrency ?? 8, navigator);
+  // [A-31.4(a) forced addition — see the matching `Harness.setHidden` doc
+  // comment above for the revert recipe.] Establishes `document.hidden` as
+  // an own, writable, configurable property (real happy-dom `document`
+  // exposes it only as a `!defaultView` getter with no setter) so
+  // `setHidden` below can flip it without touching anything else this file
+  // already owns.
+  overrideGlobal("hidden", false, document);
   if (options?.saveData !== undefined) {
     overrideGlobal("connection", { saveData: options.saveData }, navigator);
   }
@@ -567,6 +586,12 @@ function createHarness(options?: {
         flushTimeouts();
       });
     },
+    setHidden(hidden) {
+      overrideGlobal("hidden", hidden, document);
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+    },
     setMedia(next) {
       Object.assign(media, next);
       act(() => {
@@ -776,6 +801,38 @@ describe("VoiceTraceCanvas effects budget", () => {
     expect(harness.pendingFrameCount()).toBe(0);
     expect(harness.pendingTimeoutCount()).toBe(0);
     harness = null;
+  });
+
+  /**
+   * [A-31.4(a) forced addition — Plan 13 lane, per
+   * `docs/decisions/2026-08-23-plan-amendments.md` A-31.4(a); this file is
+   * Plan-10-owned. See `Harness.setHidden`'s doc comment above for the
+   * revert recipe.] The behavioral background-pause proof rows 463/558
+   * named as missing for VoiceTrace specifically: the "unmount releases
+   * every listener" test above only proves a `visibilitychange` listener is
+   * attached/detached, which cannot distinguish a loop that genuinely stops
+   * SCHEDULING frames from one that keeps rescheduling itself regardless.
+   * This drives the pre-existing fake rAF clock directly instead.
+   */
+  test("stops scheduling animation frames while the tab is hidden, and resumes when visible again", () => {
+    harness = createHarness();
+    harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
+    expect(harness.trace().getAttribute("data-render-mode")).toBe("animated");
+    expect(harness.pendingFrameCount()).toBe(1);
+
+    harness.setHidden(true);
+    expect(harness.pendingFrameCount()).toBe(0);
+    harness.drainFrames(5, 33);
+    expect(harness.pendingFrameCount()).toBe(0);
+
+    harness.setHidden(false);
+    expect(harness.pendingFrameCount()).toBe(1);
+    harness.drainFrames(1, 33);
+    // `loop()` reschedules itself as its first statement whenever
+    // `animating` is true, so one drained frame leaves a fresh successor
+    // pending — proving this is a genuine, self-perpetuating loop that
+    // resumed, not a single one-off frame.
+    expect(harness.pendingFrameCount()).toBe(1);
   });
 });
 
