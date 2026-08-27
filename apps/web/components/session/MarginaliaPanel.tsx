@@ -557,19 +557,6 @@ function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["s
 }
 
 /**
- * `WEBSESSION-TASK10-LOCAL-DATE-01`: the projection's persisted due instant,
- * rendered on the RUNTIME-LOCAL calendar.
- *
- * The instant itself is the server's; only its presentation is local.
- * `Intl.DateTimeFormat` with the runtime's own locale and time zone is what
- * makes `2026-08-24T01:00:00Z` read as August 23 to a learner in Los Angeles —
- * extracting UTC calendar fields would send them to revise on the wrong day.
- * An instant that cannot be parsed renders safe copy rather than `Invalid Date`
- * or the raw value. The old hard-coded "core FSRS" label is gone with the
- * client-side scheduler that produced it: the authority rendered beside the date
- * is the projection's own.
- */
-/**
  * The schedule authority the learner READS.
  *
  * `authority` is the projection's own display field and the raw D-01 identifier
@@ -592,6 +579,19 @@ function recapAuthorityLabel(authority: SessionReviewPlanItem["authority"]): str
   }
 }
 
+/**
+ * `WEBSESSION-TASK10-LOCAL-DATE-01`: the projection's persisted due instant,
+ * rendered on the RUNTIME-LOCAL calendar.
+ *
+ * The instant itself is the server's; only its presentation is local.
+ * `Intl.DateTimeFormat` with the runtime's own locale and time zone is what
+ * makes `2026-08-24T01:00:00Z` read as August 23 to a learner in Los Angeles —
+ * extracting UTC calendar fields would send them to revise on the wrong day.
+ * An instant that cannot be parsed renders safe copy rather than `Invalid Date`
+ * or the raw value. The old hard-coded "core FSRS" label is gone with the
+ * client-side scheduler that produced it: the authority rendered beside the date
+ * is the projection's own.
+ */
 function formatRecapDueDate(dueAt: string): string {
   const parsed = new Date(dueAt);
   if (Number.isNaN(parsed.getTime())) return "Review date unavailable";
