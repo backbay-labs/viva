@@ -3780,6 +3780,33 @@ describe("Viva browser outbound frame boundary", () => {
     }
   ).cases.find((entry) => entry.id === "VOICE-CLIENT-REJECT-TEXT-FRAME-65537");
 
+  /**
+   * The `{code, path}` the FIXTURE declares for a case.
+   *
+   * Plan 05's differential corpus is the one cross-language source for these
+   * pairs — the Rust client-frame tests read the same file and the same fields —
+   * and carrying that coupling into the browser is the corpus's whole purpose.
+   * Restating the pair as a local literal severs it: the fixture could move to a
+   * different code or path and every assertion here would keep passing against
+   * the value the browser used to emit. So the expectation is READ FROM THE
+   * FIXTURE, exactly as the server-differential sweep above already does.
+   *
+   * Throwing on an absent field keeps it fail-closed: a case that stops
+   * declaring a diagnostic must break the test, not silently compare
+   * `undefined` to `undefined`.
+   */
+  function declaredDiagnostic(entry?: { id: string; diagnostic_code?: string; path?: string }): {
+    code: string;
+    path: string;
+  } {
+    if (typeof entry?.diagnostic_code !== "string" || typeof entry.path !== "string") {
+      throw new Error(
+        `Plan 05 differential case ${entry?.id ?? "(missing)"} declares no diagnostic_code/path`,
+      );
+    }
+    return { code: entry.diagnostic_code, path: entry.path };
+  }
+
   test("the browser frame union and controller expose no tool authority", () => {
     // A browser holds no tool authority, so a tool frame is not a member of the
     // browser-sendable union. Asserted as a type relation so the proof does not
@@ -3826,9 +3853,14 @@ describe("Viva browser outbound frame boundary", () => {
 
     const result = serializeVivaBrowserClientFrame(forged as VivaBrowserClientFrame);
 
-    expect(result).toEqual({
-      diagnostic: { code: "VOICE_PROTOCOL_FORBIDDEN_AUTHORITY", path: "$.type" },
-      status: "rejected",
+    // The fixture's own declared diagnostic, not a restatement of it: the case
+    // ships the frame AND the `{code, path}` both languages must produce for it.
+    expect({ id: forgedToolResultCase?.id, result }).toEqual({
+      id: "VOICE-CLIENT-REJECT-FORGED-TOOL-RESULT",
+      result: {
+        diagnostic: declaredDiagnostic(forgedToolResultCase),
+        status: "rejected",
+      },
     });
     // The refused frame's own payload never appears in the result.
     expect(JSON.stringify(result)).not.toContain("write_review_state");
@@ -3875,10 +3907,15 @@ describe("Viva browser outbound frame boundary", () => {
       turnId: "turn-oversized",
     });
 
-    expect(rejected).toEqual({
-      diagnostic: { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
-      status: "rejected",
-      turnId: "turn-oversized",
+    // Same coupling as the forged-authority case: the 65,537-byte fixture ships
+    // the diagnostic the browser and the Rust client parser must agree on.
+    expect({ id: oversizedTextFrameCase?.id, rejected }).toEqual({
+      id: "VOICE-CLIENT-REJECT-TEXT-FRAME-65537",
+      rejected: {
+        diagnostic: declaredDiagnostic(oversizedTextFrameCase),
+        status: "rejected",
+        turnId: "turn-oversized",
+      },
     });
     expect(socket.sent.length).toBe(sentBeforeIntent);
     expect(controller.getState().pendingSubmission).toBeUndefined();
