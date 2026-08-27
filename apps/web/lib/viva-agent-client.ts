@@ -737,14 +737,16 @@ export async function pasteStudySetToVivaApi(
     throw new Error("Viva API URL is unavailable");
   }
   const fetchImpl = options.fetchImpl ?? fetch;
+  const course = suppliedIngestionValue(input.course);
+  const examDate = suppliedIngestionValue(input.examDate);
   // Reconstructed member by member from the four contract fields. A spread of
   // `input` would carry whatever a runtime caller attached to it — exactly the
   // shape `deny_unknown_fields` now refuses — so there is no spread here.
   const requestBody: VivaPasteStudySetRequestBody = {
     pasted_text: input.pastedText,
     title: input.title,
-    ...(input.course === undefined ? {} : { course: input.course }),
-    ...(input.examDate === undefined ? {} : { exam_date: input.examDate }),
+    ...(course === undefined ? {} : { course }),
+    ...(examDate === undefined ? {} : { exam_date: examDate }),
   };
   const response = await fetchImpl(`${trimTrailingSlash(apiBaseUrl)}/study-sets/paste`, {
     method: "POST",
@@ -755,7 +757,20 @@ export async function pasteStudySetToVivaApi(
     throw new Error(`Viva paste ingestion failed with HTTP ${response.status}`);
   }
   const body = (await response.json()) as PasteIngestionResponse;
-  return studySetFromPasteIngestionResponse(body, { examDate: input.examDate });
+  return studySetFromPasteIngestionResponse(body, { examDate });
+}
+
+/**
+ * An optional ingestion field the learner left blank is ABSENT, not present and
+ * empty. Rust `PasteStudySetRequest` types `course` and `exam_date` as
+ * `Option<String>`, so `""` would arrive as `Some("")` — a supplied-looking exam
+ * input that `create_paste_study_set` would carry into its authoritative
+ * `exam_at` instant. Blankness is the ONLY thing decided here: a real value is
+ * forwarded byte for byte, padding included, because the browser does not own
+ * ingestion content.
+ */
+function suppliedIngestionValue(value: string | undefined): string | undefined {
+  return value === undefined || value.trim() === "" ? undefined : value;
 }
 
 export async function fetchVivaLibrarySnapshot(
@@ -1618,10 +1633,25 @@ export function createVivaAgentSessionController(
   }
 
   /**
-   * The controller's ONLY sender. Its parameter is Plan 05's browser-sendable
-   * union, and every byte it transmits comes from
+   * The controller's sender for command frames. Its parameter is Plan 05's
+   * browser-sendable union, and every byte it transmits comes from
    * `serializeVivaBrowserClientFrame` — so an oversized or forged frame is
    * refused here, before `WebSocket.send`, with only a typed `{code, path}`.
+   *
+   * It is deliberately NOT the controller's only `socket.send`, and must not
+   * become one. An auditor of `WEBSESSION-AUTHORITY-01` should read the call
+   * graph, not this sentence; the other two writers are:
+   *  - `sendTurnIntent`, which serializes through the SAME function above and
+   *    then sends inline, because that send has to be ordered against
+   *    `pendingSubmission` and the recap/terminal checks around it;
+   *  - Plan 03's audio transport (`pumpAudioQueue`, `cancelAudioTurn`), which
+   *    writes its own chunk/end/cancel frames against its retained ledger,
+   *    backpressure budget, and ACK accounting. Routing those through here
+   *    would impose the second audio size check this task forbids.
+   *
+   * So the boundary this function guards is the browser's TEXT-frame authority
+   * — `tool_result` unrepresentable, 64 KiB envelope cap — not "every outbound
+   * byte".
    */
   function sendFrame(frame: VivaBrowserClientFrame): boolean {
     if (socket?.readyState !== 1 || !activeGeneration) {

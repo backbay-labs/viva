@@ -3651,6 +3651,48 @@ describe("Viva paste ingestion request authority", () => {
     expect(body.title).toBe("Thermodynamics");
   });
 
+  test("a blank optional field is omitted, never sent as an empty string", async () => {
+    const bodies: string[] = [];
+    await pasteStudySetToVivaApi(
+      {
+        course: "   ",
+        examDate: "",
+        pastedText: "Entropy of mixing is configurational.",
+        title: "Thermodynamics",
+      },
+      { apiBaseUrl: "https://agent.example", fetchImpl: capturingFetch(bodies) },
+    );
+
+    // Rust `PasteStudySetRequest` declares both as `Option<String>`, so an empty
+    // string arrives as `Some("")` — a present-but-meaningless exam input that
+    // the store would carry into its `exam_at` instant. "The learner left the
+    // box empty" is `None`, which on this wire means the key is absent.
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["pasted_text", "title"]);
+    expect(body).not.toHaveProperty("exam_date");
+    expect(body).not.toHaveProperty("course");
+  });
+
+  test("an optional field that is only padded still sends its exact value", async () => {
+    const bodies: string[] = [];
+    await pasteStudySetToVivaApi(
+      {
+        course: " CHEM-401 ",
+        examDate: " 2026-09-01 ",
+        pastedText: "Enthalpy is a state function.",
+        title: "Thermodynamics",
+      },
+      { apiBaseUrl: "https://agent.example", fetchImpl: capturingFetch(bodies) },
+    );
+
+    // Blankness is the only thing this boundary decides. Trimming a real value
+    // would be the browser editing ingestion content, which it does not own.
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["course", "exam_date", "pasted_text", "title"]);
+    expect(body.course).toBe(" CHEM-401 ");
+    expect(body.exam_date).toBe(" 2026-09-01 ");
+  });
+
   test("a hostile runtime object cannot smuggle identity into the request body", async () => {
     const bodies: string[] = [];
     const hostile = {
