@@ -57,6 +57,18 @@ const conceptNodes: readonly ConceptNode[] = [
   { id: "c-7", label: "Chemical potential", status: "shaky", emphasis: 0.7 },
 ];
 
+/**
+ * The same concepts with one character moved from the head of a label to the
+ * tail of its id: a different concept set that concatenates to identical text.
+ */
+function boundaryShifted(): ConceptNode[] {
+  return conceptNodes.map((node, index) =>
+    index === 0
+      ? { ...node, id: `${node.id}${node.label.slice(0, 1)}`, label: node.label.slice(1) }
+      : { ...node },
+  );
+}
+
 function planItems(offsetX = 0, offsetY = 0): VoiceTraceLabelPlanCacheInput["items"] {
   return conceptNodes.map((node, index) => ({
     emphasis: node.emphasis,
@@ -808,5 +820,26 @@ describe("VoiceTraceCanvas label planning inside the frame budget", () => {
     expect(voiceTraceLabelPlanComputations() - plannedBefore).toBe(1);
     const drawn = harness.context.fillTexts.map((entry) => entry.text);
     expect(drawn.some((text) => isDrawOfLabel(text, "Fugacity"))).toBe(true);
+  });
+
+  test("a concept change that only moves the id/label boundary still replans", () => {
+    harness = createHarness({ media: { reducedMotion: true } });
+    harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
+    const drawsBefore = harness.drawCount();
+    const plannedBefore = voiceTraceLabelPlanComputations();
+    const textsBefore = harness.context.fillTexts.length;
+
+    // `c-1` + `Enthalpy` and `c-1E` + `nthalpy` are DIFFERENT concept sets whose
+    // parts run together into the same characters. A set identity that just
+    // concatenates the parts cannot tell them apart, so the generation never
+    // bumps, the label plan is never invalidated, and the canvas keeps drawing
+    // the previous set's lanes and label text.
+    harness.rerender(<VoiceTraceCanvas conceptNodes={boundaryShifted()} state="listening" />);
+
+    expect(harness.drawCount()).toBe(drawsBefore + 1);
+    expect(voiceTraceLabelPlanComputations() - plannedBefore).toBe(1);
+    const repainted = harness.context.fillTexts.slice(textsBefore).map((entry) => entry.text);
+    expect(repainted.some((text) => isDrawOfLabel(text, "nthalpy"))).toBe(true);
+    expect(repainted.some((text) => isDrawOfLabel(text, "Enthalpy"))).toBe(false);
   });
 });

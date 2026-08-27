@@ -515,11 +515,19 @@ function readEffectsPreference(): "reduced" | null {
  * Identity of the concept set as the label planner sees it: which concepts, in
  * what order, with what label, status, and emphasis tier (the planner's only
  * use of `emphasis` is its `>= 1` size bump).
+ *
+ * The parts are JSON-encoded rather than joined on a separator character, so
+ * the encoding is INJECTIVE and visibly so: quoting and escaping keep id `a` +
+ * label `bc` distinct from id `ab` + label `c` for every possible id and label,
+ * including ones that themselves contain whatever character a hand-rolled join
+ * would have picked. A collision would suppress the generation bump, leave the
+ * label plan un-invalidated, and keep the canvas drawing the previous concept
+ * set's lanes and label text.
  */
 function conceptSetSignature(nodes: ConceptNode[] | undefined): string {
-  return (nodes ?? [])
-    .map((node) => `${node.id}${node.label}${node.status}${node.emphasis >= 1 ? "1" : "0"}`)
-    .join("");
+  return JSON.stringify(
+    (nodes ?? []).map((node) => [node.id, node.label, node.status, node.emphasis >= 1 ? 1 : 0]),
+  );
 }
 
 export function VoiceTraceCanvas({
