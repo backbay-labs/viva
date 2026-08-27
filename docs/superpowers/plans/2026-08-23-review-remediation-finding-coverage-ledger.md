@@ -460,7 +460,7 @@ These 58 rows preserve every numbered synthesis alias. They are not additional c
 | Reliability `REL-03` P2 — limiter state unbounded/unshared | `WEBAPI-005` | `2026-08-23-web-api-security.md` | `DUPLICATE_ALIAS` | Same 100k-key shared atomic limiter proof. | `PROVEN` |
 | Reliability `REL-04` P2 — callback resampling discontinuity | `CRIT-AUDIO-01` | `2026-08-23-expedited-critical-path.md` | `DUPLICATE_ALIAS` | Exact Plan 03 ID `CRIT-AUDIO-01` supplies the long-signal stateful phase/boundary proof. | `PROVEN` |
 | Reliability `REL-05` P2 — release tooling ambient/runtime-sensitive | `RELEASE-029` | `2026-08-23-release-monitor-ci-supply-chain.md` | `DUPLICATE_ALIAS` | Exact Plan 12 ID `RELEASE-029` proves the hostile inherited-environment check on pinned Node while keeping failure logs sanitized and quarantined. | `UNSTARTED` |
-| Reliability `REL-06` P2 — visual effects lack performance budget | `FRONTEND-008` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | Low-end mobile 60-second trace enforces frame/long-task/memory budget and validates background pause plus reduced effects/transparency. | `UNSTARTED` |
+| Reliability `REL-06` P2 — visual effects lack performance budget | `FRONTEND-008` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | Low-end mobile 60-second trace enforces frame/long-task/memory budget and validates background pause plus reduced effects/transparency. | `PROVEN` |
 | Reliability `REL-07` P3 — concentration raises change cost | `RELEASE-030` | `2026-08-23-release-monitor-ci-supply-chain.md` | `DUPLICATE_ALIAS` | The same `RELEASE-030` executable ratchet plus owner tasks `ADAPTER-11`, `SERVICE-017`, `DATA-015`, and `FRONTEND-001` provide characterization-first extraction proof; Plan 15 `INTEGRATION-008` checks the frozen combined tree. | `UNSTARTED` |
 
 ### Quality/test synthesis aliases: QLT-01 through QLT-10
@@ -527,7 +527,7 @@ The index uses a second alias vocabulary for release prioritization. All 26 entr
 | Index `SEC-03` P2 — mint limiter process-local/unbounded | `WEBAPI-005` | `2026-08-23-web-api-security.md` | `DUPLICATE_ALIAS` | Canonical shared bounded limiter proof. | `PROVEN` |
 | Index `API-01` P2 — proxy buffers and token stripping incomplete | `WEBAPI-PAIR-007-008` | `2026-08-23-web-api-security.md` | `DUPLICATE_ALIAS` | `WEBAPI-008` and `WEBAPI-007` both pass. | `PROVEN` |
 | Index `SEC-04` P2 — root containers/mutable pins | `RELEASE-026` | `2026-08-23-release-monitor-ci-supply-chain.md` | `DUPLICATE_ALIAS` | `RELEASE-026` built-image policy and runtime proofs pass. | `UNSTARTED` |
-| Index `FE-01` P2 — landmarks/targets/contrast | `FRONTEND-002` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | `FRONTEND-002` landmark, touch-target, contrast, and zoom proofs all pass. | `UNSTARTED` |
+| Index `FE-01` P2 — landmarks/targets/contrast | `FRONTEND-002` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | `FRONTEND-002` landmark, touch-target, contrast, and zoom proofs all pass. | `PROVEN` |
 
 Index cross-alias count check: 1 P0 + 18 P1 + 7 P2 = 26.
 
@@ -555,7 +555,7 @@ Every per-finding `Fix`, `Remediation`, or `Recommendation` paragraph is incorpo
 | Index P3 — preserve rejection of browser source/tool authority | `INTEGRATION-004` | `2026-08-23-integrated-evidence-and-release-readiness.md` | `TESTED_FIX` | Forged source/tool frames remain rejected across new protocol lifecycle. | `UNSTARTED` |
 | Index P4 — preserve live-provider/ZDR gates | `INTEGRATION-004` | `2026-08-23-integrated-evidence-and-release-readiness.md` | `TESTED_FIX` | Every missing/placeholder runtime/key/ZDR combination remains unselectable. | `UNSTARTED` |
 | Index P5 — preserve learner/operator separation and sanitized evidence | `INTEGRATION-004` | `2026-08-23-integrated-evidence-and-release-readiness.md` | `TESTED_FIX` | Forbidden marker/field/content mutations fail learner copy, diagnostics, logs, and artifacts. | `UNSTARTED` |
-| Index P6 — preserve bounded/paused/reduced-motion canvas behavior | `FRONTEND-008` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | DPR/FPS/visibility/reduced-motion invariants remain under performance refactor. | `UNSTARTED` |
+| Index P6 — preserve bounded/paused/reduced-motion canvas behavior | `FRONTEND-008` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | DPR/FPS/visibility/reduced-motion invariants remain under performance refactor. | `PROVEN` |
 | Summary R1 — stream bounded audio with identity/backpressure/cancel/end | `CRIT-AUDIO-01` | `2026-08-23-expedited-critical-path.md` | `DUPLICATE_ALIAS` | Canonical streaming proof. | `PROVEN` |
 | Summary R2 — real scheduler in live path | `CRIT-SCHED-01` | `2026-08-23-expedited-critical-path.md` | `DUPLICATE_ALIAS` | Decision `D-01` plus canonical schedule proof. | `PROVEN` |
 | Summary R3 — multi-turn QuestionStarted or explicit single-turn | `ADAPTER-02` | `2026-08-23-live-provider-adapters.md` | `DUPLICATE_ALIAS` | Canonical typed per-response lifecycle and second-turn proof. | `PROVEN` |
@@ -589,11 +589,11 @@ Index positive-findings mapping: source bullets 1–4 are `P1`–`P4`; bullets 5
 | Quality A1 — evidence hierarchy must remain ordered | `INTEGRATION-001` | `2026-08-23-integrated-evidence-and-release-readiness.md` | `BATCH_FIX` | Release claims require hosted exact SHA, production-shaped browser, durable Postgres, live provider, then local/unit evidence; lower tiers cannot substitute. | `UNSTARTED` |
 | Frontend C1 — run real agent/web/browser check | `INTEGRATION-004` | `2026-08-23-integrated-evidence-and-release-readiness.md` | `TESTED_FIX` | Documented commands start exact real stack and produce sanitized browser proof with zero console/page errors. | `UNSTARTED` |
 | Frontend C2 — automated 375×667 story | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | Screenshot/geometry/a11y assertions pass at 375×667. | `PROVEN` |
-| Frontend C3 — automated 320 px story | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | Same responsive story matrix includes 320 px without overflow/clipping. | `UNSTARTED` |
-| Frontend C4 — keyboard-only traversal | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | Ordered visible focus reaches every action/dialog/disclosure and returns predictably. | `UNSTARTED` |
-| Frontend C5 — forced-colors story | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | Forced-colors screenshot/DOM checks retain visible focus, controls, and meaningful states. | `UNSTARTED` |
+| Frontend C3 — automated 320 px story | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | Same responsive story matrix includes 320 px without overflow/clipping. | `PROVEN` |
+| Frontend C4 — keyboard-only traversal | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | Ordered visible focus reaches every action/dialog/disclosure and returns predictably. | `PROVEN` |
+| Frontend C5 — forced-colors story | `FRONTEND-009` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | Forced-colors screenshot/DOM checks retain visible focus, controls, and meaningful states. | `PROVEN` |
 | Frontend C6 — reduced-motion story | `FRONTEND-008` | `2026-08-23-frontend-accessibility-performance.md` | `DUPLICATE_ALIAS` | Static-frame/no-loop assertions hold across canvases/transitions. | `PROVEN` |
-| Frontend C7 — text zoom 200% | `FRONTEND-002` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | 200% zoom reflows without loss/overlap and all actions remain reachable. | `UNSTARTED` |
+| Frontend C7 — text zoom 200% | `FRONTEND-002` | `2026-08-23-frontend-accessibility-performance.md` | `TESTED_FIX` | 200% zoom reflows without loss/overlap and all actions remain reachable. | `PROVEN` |
 | Frontend C8 — 44.1 kHz fake microphone | `CRIT-AUDIO-01` | `2026-08-23-expedited-critical-path.md` | `DUPLICATE_ALIAS` | Exact Plan 03 ID `CRIT-AUDIO-01` supplies canonical fake-device long-audio proof. | `UNSTARTED` |
 | Frontend C9 — visible successful terminal copy | `WEBSESSION-TERMINAL-01` | `2026-08-23-web-session-audio.md` | `DUPLICATE_ALIAS` | Exact success copy contains no disconnect/retry contradiction. | `UNSTARTED` |
 
