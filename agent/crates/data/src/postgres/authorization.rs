@@ -291,7 +291,7 @@ pub(super) async fn authorize_answer_evaluation(
             voice_session_uuid,
             response_id,
             EventAuthorizationKind::AnswerEvaluation,
-            evaluation,
+            &AnswerEvaluationEventPayload::from_browser_event(evaluation),
         )
         .await?
     {

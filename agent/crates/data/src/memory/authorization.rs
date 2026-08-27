@@ -104,6 +104,94 @@ pub(crate) struct ConceptStatusEventPayload<'a> {
     pub(crate) status: &'a ConceptStatus,
 }
 
+/// The server-derived half of the browser's `answer_evaluation` payload.
+///
+/// # ESCALATION — awaiting coordinator ratification (`A-22` follow-up)
+///
+/// **This narrows what the `answer_evaluation` gate binds, and no ratification
+/// covers the narrowing.** A-22 says the digest is written "exactly as the retired
+/// writer did … the browser-event gate's invariants transfer to the turn-outcome
+/// authority unchanged (no gate weakening)", and the plan's Step 3 says "hashes …
+/// `serde_json::to_vec` of the exact Plan 04/agent-domain type. Do not hash ad hoc
+/// maps or backend-specific projections." The retired `record_answer_evaluation`
+/// hashed the whole [`AnswerEvaluation`]; this hashes that type minus
+/// `answer_text`. A worker may not decide on its own what a gate stops binding, so
+/// this stands as an escalation, not as settled discipline: the coordinator either
+/// records the transcript boundary as an amendment or directs different work.
+///
+/// **Why it is structurally forced.** Every field except `answer_text` is
+/// something this store decided — the wire label, the feedback, the retry prompt,
+/// the re-retrieved source, the mastery value, the confidence — and all of them
+/// come from the persisted [`TurnOutcome`] and the question it names. `answer_text`
+/// is the transcript the transport carried, and no canonical persistence type has
+/// a field for it: [`TurnOutcome`] carries none, the store publishes
+/// `transcript_persistence: false`, and both production adapters set
+/// `answer_digest_hmac: None` (a keyed commitment this store holds no key for in
+/// any case). The turn-outcome authority therefore *cannot* reproduce a digest
+/// over the transcript. Binding it anyway — hashing an empty string in its place —
+/// would fail every real browser event closed, which is the defect A-22 exists to
+/// close. There is no third option inside this lane's ownership.
+///
+/// **What the narrowing costs.** Exactly one thing: a provider event that pairs a
+/// legitimately graded `response_id` with a fabricated `answer_text` is now
+/// admitted where it was previously refused. The residual exposure is small but it
+/// is not zero, and it is the coordinator's to accept: the same transcript already
+/// reaches the same browser through `transcript_delta`/`transcript_final`, which
+/// the socket's preflight hands over under its `_ => Authorized` arm with no
+/// authorization at all, so a provider that can fabricate a transcript here can
+/// already fabricate one there.
+///
+/// **What it does not cost.** Every field that *is* a server fact stays bound,
+/// including the two — `concise_feedback` and `retry_prompt` — that the
+/// `answer_attempts` row does not carry and that only this digest can hold the
+/// event to. One definition serves the gate *and* both write paths on both
+/// backends, so no write path can authorize what another cannot.
+///
+/// The two sibling payload types here ([`ConceptStatusEventPayload`],
+/// [`ReviewScheduleEventPayload`]) are already typed crate-private projections
+/// rather than wire types, and both predate A-22 — so the *shape* is the
+/// established in-tree pattern. What needs ratifying is not the shape; it is that
+/// this particular gate now binds one field fewer than it did.
+///
+/// The field order is [`AnswerEvaluation`]'s own, minus the transcript, so the
+/// canonical JSON this hashes reads as the browser payload it stands for.
+#[derive(Serialize)]
+pub(crate) struct AnswerEvaluationEventPayload {
+    pub(crate) question_id: String,
+    pub(crate) label: String,
+    pub(crate) concise_feedback: String,
+    pub(crate) retry_prompt: String,
+    pub(crate) source: StudySourceReference,
+    pub(crate) concept_status: ConceptStatus,
+    pub(crate) confidence_score: f32,
+}
+
+impl AnswerEvaluationEventPayload {
+    /// The projection of an event a browser is presenting, for the gate.
+    pub(crate) fn from_browser_event(evaluation: &AnswerEvaluation) -> Self {
+        Self {
+            question_id: evaluation.question_id.clone(),
+            label: evaluation.label.clone(),
+            concise_feedback: evaluation.concise_feedback.clone(),
+            retry_prompt: evaluation.retry_prompt.clone(),
+            source: evaluation.source.clone(),
+            concept_status: evaluation.concept_status.clone(),
+            confidence_score: evaluation.confidence_score,
+        }
+    }
+
+    /// The row projection the `answer_attempts` tuple keeps for the same event.
+    pub(crate) fn persisted_evaluation(&self) -> PersistedAnswerEvaluation {
+        PersistedAnswerEvaluation {
+            question_id: self.question_id.clone(),
+            label: self.label.clone(),
+            concept_status: self.concept_status.clone(),
+            confidence_score: self.confidence_score,
+            source: PersistedSourceReference::from(&self.source),
+        }
+    }
+}
+
 /// The replay-stable half of a scheduling outcome: the graded inputs, never the
 /// clock-derived schedule they produce. Two calls that differ only because the wall
 /// clock moved hash identically here, which is what makes a replay detectable.
@@ -304,7 +392,7 @@ pub(super) fn authorize_answer_evaluation(
         voice_session_id,
         response_id,
         EventAuthorizationKind::AnswerEvaluation,
-        evaluation,
+        &AnswerEvaluationEventPayload::from_browser_event(evaluation),
     )?;
     if !state.event_authorizations.contains(&authorization) {
         return Err(PortError::conflict(

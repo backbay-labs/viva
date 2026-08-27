@@ -895,7 +895,77 @@ pub(super) async fn record_turn_outcome(
         ));
     }
 
+    // `A-22`: an evaluated turn completes its own answer attempt and authorizes
+    // its own browser evaluation, inside this same transaction — the attempt row's
+    // evaluation columns and the digest commit with the outcome or roll back with
+    // it, exactly as the retired `record_answer_evaluation` committed them
+    // together. The published-question list is read through the transaction, so a
+    // concurrent deletion cannot leave authority behind for a question it removed.
+    if let Some(payload) = browser_answer_evaluation(
+        &outcome,
+        &PostgresStudyStore::active_questions(&mut *tx, study_set_uuid).await?,
+    ) {
+        let attempt_question = sqlx::query_scalar::<_, String>(
+            "SELECT aa.question_id
+             FROM answer_attempts aa
+             JOIN voice_sessions vs ON vs.id = aa.voice_session_id
+             WHERE aa.voice_session_id = $1
+               AND vs.user_id = $2
+               AND vs.study_set_id = $3
+               AND aa.response_id = $4",
+        )
+        .bind(voice_session_uuid)
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(&outcome.response_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        // The attempt row is the learner's capture record: this completes one a
+        // capture already wrote and never invents one. An outcome with no recorded
+        // attempt authorizes nothing, and the browser event that would have claimed
+        // it fails closed at the gate.
+        if let Some(attempt_question) = attempt_question {
+            if attempt_question != outcome.question_id {
+                return Err(PortError::conflict(
+                    "postgres",
+                    &outcome.response_id,
+                    "turn outcome question does not match the recorded answer attempt",
+                ));
+            }
+            sqlx::query(
+                "UPDATE answer_attempts
+                 SET evaluation_label = $1,
+                     concept_status = $2,
+                     confidence_score = $3,
+                     source_span_id = $4
+                 WHERE voice_session_id = $5
+                   AND response_id = $6",
+            )
+            .bind(&payload.label)
+            .bind(concept_status_str(&payload.concept_status))
+            .bind(f64::from(payload.confidence_score))
+            .bind(PostgresStudyStore::uuid_for(&payload.source.source_id)?)
+            .bind(voice_session_uuid)
+            .bind(&outcome.response_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(pg_error)?;
+            PostgresStudyStore::insert_event_authorization(
+                &mut tx,
+                user_id,
+                study_set_uuid,
+                voice_session_uuid,
+                &outcome.response_id,
+                EventAuthorizationKind::AnswerEvaluation,
+                &payload,
+            )
+            .await?;
+        }
+    }
+
     let mut scheduled = 0_usize;
+    let mut status_events = 0_usize;
     for (concept_uuid, transition) in transition_concepts {
         sqlx::query("UPDATE concepts SET status = $1, updated_at = NOW() WHERE id = $2")
             .bind(concept_status_str(&transition.to_status))
@@ -903,6 +973,55 @@ pub(super) async fn record_turn_outcome(
             .execute(&mut *tx)
             .await
             .map_err(pg_error)?;
+        // `A-22` — SCOPE EXTENSION, awaiting coordinator ratification.
+        //
+        // The same session-scoped status write the retired `record_concept_status`
+        // made, so the two backends hold the same rows for the same turn and the
+        // `concept_status` browser event of a genuinely evaluated turn is backed by
+        // a durable write, not by a digest alone.
+        //
+        // A-22's text obliges this authority to populate the attempt row and write
+        // the event-authorization digest, and says nothing about the sibling
+        // `concept_status` event — so this write is not covered by a ratified
+        // amendment line. The necessity is memory-side (that backend's
+        // `authorize_concept_status` refuses without the row) and the full record is
+        // on the twin write in `memory/learning.rs`; this backend carries it because
+        // the shared conformance suite holds the two to the same published counts.
+        let status_event = sqlx::query(
+            "INSERT INTO concept_status_events (
+                 user_id,
+                 study_set_id,
+                 voice_session_id,
+                 response_id,
+                 concept_id,
+                 payload_sha256,
+                 status
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (user_id, study_set_id, voice_session_id, response_id, concept_id, payload_sha256)
+             DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(study_set_uuid)
+        .bind(voice_session_uuid)
+        .bind(&outcome.response_id)
+        .bind(concept_uuid)
+        .bind(payload_sha256(
+            "postgres",
+            EventAuthorizationKind::ConceptStatus,
+            &outcome.response_id,
+            &ConceptStatusEventPayload {
+                concept_id: &transition.concept_id,
+                status: &transition.to_status,
+            },
+        )?)
+        .bind(concept_status_str(&transition.to_status))
+        .execute(&mut *tx)
+        .await
+        .map_err(pg_error)?;
+        if status_event.rows_affected() == 1 {
+            status_events += 1;
+        }
         PostgresStudyStore::insert_event_authorization(
             &mut tx,
             user_id,
@@ -994,6 +1113,9 @@ pub(super) async fn record_turn_outcome(
     tx.commit().await.map_err(pg_error)?;
     for _ in 0..scheduled {
         store.increment_count(WriteCountKind::ReviewItem);
+    }
+    for _ in 0..status_events {
+        store.increment_count(WriteCountKind::ConceptStatus);
     }
     Ok(PersistedTurnOutcome {
         record: TurnOutcomeRecordReceipt {
