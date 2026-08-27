@@ -2259,7 +2259,20 @@
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
+/*
+ * `FRONTEND-008`: reduced-effects support, mirroring `landing.css`'s block.
+ * Either OS-level accessibility setting (`prefers-reduced-motion`,
+ * `prefers-reduced-transparency`) or the app's own explicit preference
+ * (`html[data-viva-effects="reduced"]`, set by `MuseGlyphCanvas`) fully stops
+ * these named decorative animations (`base.css`'s universal `*` rule already
+ * collapses every animation/transition's *duration* under the same three
+ * conditions, including `.marginalia`'s border-color/box-shadow state-change
+ * transition; the named list here additionally pins
+ * `animation-iteration-count: 1` so these loops fully stop) and replaces
+ * every translucent "glass" surface with an opaque token background.
+ * Borders and focus rings are untouched.
+ */
+@media (prefers-reduced-motion: reduce), (prefers-reduced-transparency: reduce) {
   .session-plate,
   .marginalia,
   .marginalia__body > * {
@@ -2268,13 +2281,13 @@
   }
 }
 
-/*
- * `FRONTEND-008`: reduced-effects support, mirroring `landing.css`'s block.
- * Either the OS-level accessibility setting or the app's own explicit
- * preference (`html[data-viva-effects="reduced"]`, set by `MuseGlyphCanvas`)
- * replaces every translucent "glass" surface with an opaque token
- * background. Borders and focus rings are untouched.
- */
+html[data-viva-effects="reduced"] .session-plate,
+html[data-viva-effects="reduced"] .marginalia,
+html[data-viva-effects="reduced"] .marginalia__body > * {
+  animation-duration: 0.001ms;
+  animation-iteration-count: 1;
+}
+
 @media (prefers-reduced-transparency: reduce) {
   .session-capsule,
   .session-consent,

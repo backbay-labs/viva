@@ -1357,7 +1357,21 @@
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
+/*
+ * `FRONTEND-008`: reduced-effects support. Either OS-level accessibility
+ * setting (`prefers-reduced-motion`, `prefers-reduced-transparency`) or the
+ * app's own explicit preference (mirrored by `MuseGlyphCanvas` onto
+ * `html[data-viva-effects="reduced"]`) fully stops this route's named
+ * decorative animations — not just makes the canvas static — and replaces
+ * every translucent, blurred "glass" surface with an opaque token
+ * background. Never a smaller hitbox, a hidden control, or a lower-contrast
+ * one; borders and focus rings are untouched. `base.css`'s universal `*`
+ * rule already collapses every animation/transition's *duration* under the
+ * same three conditions; the named list here additionally pins
+ * `animation-iteration-count: 1` so these specific decorative loops fully
+ * stop rather than keep cycling imperceptibly fast forever.
+ */
+@media (prefers-reduced-motion: reduce), (prefers-reduced-transparency: reduce) {
   .viva-hero__paper::after,
   .viva-muse__img,
   .viva-context,
@@ -1375,14 +1389,22 @@
   }
 }
 
-/*
- * `FRONTEND-008`: reduced-effects support. Either the OS-level accessibility
- * setting or the app's own explicit preference (mirrored by `MuseGlyphCanvas`
- * onto `html[data-viva-effects="reduced"]`) replaces every translucent,
- * blurred "glass" surface with an opaque token background — never a smaller
- * hitbox, a hidden control, or a lower-contrast one. Borders and focus rings
- * are untouched.
- */
+html[data-viva-effects="reduced"] .viva-hero__paper::after,
+html[data-viva-effects="reduced"] .viva-muse__img,
+html[data-viva-effects="reduced"] .viva-context,
+html[data-viva-effects="reduced"] .viva-copy__headline,
+html[data-viva-effects="reduced"] .viva-copy__sub,
+html[data-viva-effects="reduced"] .viva-hero__begin,
+html[data-viva-effects="reduced"] .viva-hero__tagline {
+  animation-duration: 0.001ms;
+  animation-iteration-count: 1;
+}
+
+html[data-viva-effects="reduced"] .viva-muse__img {
+  opacity: 0.95;
+  transform: none;
+}
+
 @media (prefers-reduced-transparency: reduce) {
   .viva-context,
   .viva-effects-toggle {
