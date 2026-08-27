@@ -621,7 +621,11 @@ export async function createBrowserVivaAudioCaptureSource(
   options: VivaBrowserAudioCaptureOptions,
 ): Promise<VivaAudioCaptureSource> {
   const sampleRateHz = options.sampleRateHz ?? VIVA_AUDIO_SAMPLE_RATE_HZ;
-  const releases: Array<() => void | Promise<unknown>> = [];
+  // `unknown` rather than `void | Promise<unknown>`: a release may be
+  // synchronous or may hand back something awaitable, and only `releaseAll`
+  // decides what to do with it. Naming the union put `void` inside it, which
+  // reads as "this value is meaningless" on a value the caller then inspects.
+  const releases: Array<() => unknown> = [];
   let released = false;
 
   /**
