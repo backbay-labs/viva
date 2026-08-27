@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { seedStudySets } from "./fixtures";
 import {
   agentStudySetReadiness,
   createStudySetPreview,
@@ -6,7 +7,6 @@ import {
   type PasteIngestionResponse,
   studySetFromPasteIngestionResponse,
 } from "./index";
-import { seedStudySets } from "./fixtures";
 import { buildSessionRecap, evaluateAnswer } from "./testing/fake-evaluator";
 
 describe("Viva study set generation", () => {
