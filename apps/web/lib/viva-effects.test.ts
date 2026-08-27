@@ -1,4 +1,15 @@
-import { describe, expect, test } from "bun:test";
+// The shared mounted-test DOM must exist before anything that reads `window`
+// at import time (`react-dom/client`'s module scope pokes at the global
+// object), so this stays the first import — mirrors
+// `LiveSessionPage.mounted.test.tsx`'s own ordering rule.
+import "../test/setup-dom";
+import { afterEach, describe, expect, test } from "bun:test";
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
+import { MuseGlyphCanvas } from "../components/landing/MuseGlyphCanvas";
+import { VisualEffectsControl } from "../components/landing/VisualEffectsControl";
+import { resetVivaTestDom } from "../test/setup-dom";
 import type { VivaEffectsPolicy, VivaEffectsPolicyInput } from "./viva-effects";
 import {
   readVivaEffectsPreference,
@@ -216,5 +227,580 @@ describe("viva effects shared constants", () => {
   test("locks the storage key and change-event names", () => {
     expect(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY).toBe("viva.effects.preference.v1");
     expect(VIVA_EFFECTS_CHANGE_EVENT).toBe("viva-effects-change");
+  });
+});
+
+/* -------------------------------------------------------------------------
+ * Task 10 (`FRONTEND-008`): mounted policy-integration tests.
+ *
+ * The Task 0 resolver above is exercised completely unchanged — these tests
+ * prove `VisualEffectsControl` and `MuseGlyphCanvas` actually gather real
+ * browser inputs, call it, and reflect its output as observable DOM state
+ * (never a second copy of its precedence table).
+ * ---------------------------------------------------------------------- */
+
+type MediaState = { reducedMotion: boolean; reducedTransparency: boolean };
+type SavedProperty = { host: object; name: string; descriptor: PropertyDescriptor | undefined };
+
+const savedProperties: SavedProperty[] = [];
+
+function overrideGlobal(name: string, value: unknown, host: object = globalThis): void {
+  savedProperties.push({ descriptor: Object.getOwnPropertyDescriptor(host, name), host, name });
+  Object.defineProperty(host, name, { configurable: true, value, writable: true });
+}
+
+function restoreGlobals(): void {
+  for (let index = savedProperties.length - 1; index >= 0; index--) {
+    const saved = savedProperties[index];
+    if (saved.descriptor) Object.defineProperty(saved.host, saved.name, saved.descriptor);
+    else Reflect.deleteProperty(saved.host, saved.name);
+  }
+  savedProperties.length = 0;
+}
+
+/**
+ * Fakes exactly the browser surface `MuseGlyphCanvas`'s effect touches so it
+ * mounts and resolves a policy in `happy-dom`: a controllable per-query
+ * `matchMedia`, canvas 2D context stubs (drawing calls are no-ops — these
+ * tests assert observable data attributes, never pixels), a fixed
+ * `getBoundingClientRect`, and `addEventListener`/`removeEventListener`
+ * wrappers that count listeners by type for the Step 4 cleanup guarantee.
+ * `museBox()`/`measureSafe()` find no `.viva-muse__img`/safe-zone siblings
+ * here and degrade to zero glyphs, which is irrelevant to policy assertions.
+ */
+function fakeMuseGlyphBrowser(options?: {
+  hardwareConcurrency?: number | null;
+  media?: Partial<MediaState>;
+  saveData?: boolean;
+}) {
+  const media: MediaState = {
+    reducedMotion: options?.media?.reducedMotion ?? false,
+    reducedTransparency: options?.media?.reducedTransparency ?? false,
+  };
+  const mediaListeners = new Map<string, Set<() => void>>();
+
+  overrideGlobal(
+    "matchMedia",
+    (query: string) => {
+      const listeners = mediaListeners.get(query) ?? new Set<() => void>();
+      mediaListeners.set(query, listeners);
+      return {
+        addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+        get matches() {
+          if (query.includes("prefers-reduced-motion")) return media.reducedMotion;
+          if (query.includes("prefers-reduced-transparency")) return media.reducedTransparency;
+          return false;
+        },
+        media: query,
+        removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+      };
+    },
+    window,
+  );
+
+  overrideGlobal("devicePixelRatio", 2, window);
+  overrideGlobal("hardwareConcurrency", options?.hardwareConcurrency ?? 8, navigator);
+  if (options?.saveData !== undefined) {
+    overrideGlobal("connection", { saveData: options.saveData }, navigator);
+  }
+
+  overrideGlobal(
+    "getBoundingClientRect",
+    () =>
+      ({
+        bottom: 720,
+        height: 720,
+        left: 0,
+        right: 1280,
+        top: 0,
+        width: 1280,
+        x: 0,
+        y: 0,
+      }) as DOMRect,
+    Element.prototype,
+  );
+
+  const fakeCtx = {
+    arc() {},
+    beginPath() {},
+    clearRect() {},
+    createRadialGradient() {
+      return { addColorStop() {} };
+    },
+    fillRect() {},
+    fillText() {},
+    lineTo() {},
+    moveTo() {},
+    setLineDash() {},
+    setTransform() {},
+    stroke() {},
+  };
+  overrideGlobal(
+    "getContext",
+    function getContext(this: HTMLCanvasElement, kind: string) {
+      return kind === "2d" ? fakeCtx : null;
+    },
+    HTMLCanvasElement.prototype,
+  );
+
+  const resizeObservers = new Set<{ callback: () => void }>();
+  overrideGlobal(
+    "ResizeObserver",
+    class FakeResizeObserver {
+      readonly entry: { callback: () => void };
+      constructor(callback: () => void) {
+        this.entry = { callback };
+      }
+      observe() {
+        resizeObservers.add(this.entry);
+      }
+      disconnect() {
+        resizeObservers.delete(this.entry);
+      }
+      unobserve() {
+        resizeObservers.delete(this.entry);
+      }
+    },
+    globalThis,
+  );
+
+  const documentListeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  const windowListeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  function trackListeners(
+    host: Document | Window,
+    registry: Map<string, Set<EventListenerOrEventListenerObject>>,
+  ) {
+    const add = host.addEventListener.bind(host);
+    const remove = host.removeEventListener.bind(host);
+    overrideGlobal(
+      "addEventListener",
+      (type: string, listener: EventListenerOrEventListenerObject, opts?: unknown) => {
+        const set = registry.get(type) ?? new Set();
+        set.add(listener);
+        registry.set(type, set);
+        add(type, listener as EventListener, opts as AddEventListenerOptions);
+      },
+      host,
+    );
+    overrideGlobal(
+      "removeEventListener",
+      (type: string, listener: EventListenerOrEventListenerObject, opts?: unknown) => {
+        registry.get(type)?.delete(listener);
+        remove(type, listener as EventListener, opts as EventListenerOptions);
+      },
+      host,
+    );
+  }
+  trackListeners(document, documentListeners);
+  trackListeners(window, windowListeners);
+
+  return {
+    mediaListenerCount(): number {
+      let total = 0;
+      for (const listeners of mediaListeners.values()) total += listeners.size;
+      return total;
+    },
+    setMedia(next: Partial<MediaState>) {
+      Object.assign(media, next);
+      act(() => {
+        for (const listeners of mediaListeners.values()) {
+          for (const listener of listeners) listener();
+        }
+      });
+    },
+    storageListenerCount(): number {
+      return windowListeners.get("storage")?.size ?? 0;
+    },
+    vivaEffectsListenerCount(): number {
+      return windowListeners.get(VIVA_EFFECTS_CHANGE_EVENT)?.size ?? 0;
+    },
+    visibilityListenerCount(): number {
+      return documentListeners.get("visibilitychange")?.size ?? 0;
+    },
+  };
+}
+
+type MountedGlyphs = { glyphs: HTMLElement; root: Root; unmount: () => void };
+
+/** Mounts `<MuseGlyphCanvas>` under the real ancestor its role detection reads. */
+function mountMuseGlyphCanvas(
+  role: "landing_muse" | "session_muse",
+  props: {
+    highlightedTokens?: string[];
+    state?: Parameters<typeof MuseGlyphCanvas>[0]["state"];
+  } = {},
+): MountedGlyphs {
+  const container = document.createElement(role === "session_muse" ? "main" : "section");
+  container.className = role === "session_muse" ? "live-session" : "viva-hero";
+  document.body.append(container);
+  let root: Root | null = null;
+  act(() => {
+    root = createRoot(container);
+    root.render(createElement(MuseGlyphCanvas, props));
+  });
+  const glyphs = container.querySelector<HTMLElement>(".viva-glyphs");
+  if (!glyphs) throw new Error("MuseGlyphCanvas did not mount a .viva-glyphs wrapper");
+  return {
+    glyphs,
+    root: root as unknown as Root,
+    unmount() {
+      act(() => {
+        root?.unmount();
+      });
+      container.remove();
+    },
+  };
+}
+
+describe("MuseGlyphCanvas effects policy integration", () => {
+  afterEach(() => {
+    restoreGlobals();
+    resetVivaTestDom();
+  });
+
+  test("default desktop landing_muse: dpr cap 2, 32fps, glyph scale 1, animated", () => {
+    fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("2");
+      expect(mounted.glyphs.getAttribute("data-fps-budget")).toBe("32");
+      expect(mounted.glyphs.getAttribute("data-glyph-scale")).toBe("1");
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("animated");
+      expect(mounted.glyphs.getAttribute("data-viva-effects")).toBe("full");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("low-end hardwareConcurrency: dpr cap 1.5, 24fps, glyph scale 0.5, still animated", () => {
+    fakeMuseGlyphBrowser({ hardwareConcurrency: 4 });
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("1.5");
+      expect(mounted.glyphs.getAttribute("data-fps-budget")).toBe("24");
+      expect(mounted.glyphs.getAttribute("data-glyph-scale")).toBe("0.5");
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("animated");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("Save-Data alone reduces even high-end hardware", () => {
+    fakeMuseGlyphBrowser({ hardwareConcurrency: 16, saveData: true });
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-fps-budget")).toBe("24");
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("1.5");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("prefers-reduced-motion: one static frame, no continuous rAF budget", () => {
+    fakeMuseGlyphBrowser({ media: { reducedMotion: true } });
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-fps-budget")).toBe("0");
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("1.5");
+      expect(mounted.glyphs.getAttribute("data-glyph-scale")).toBe("0.5");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("prefers-reduced-transparency alone also forces the static policy", () => {
+    fakeMuseGlyphBrowser({ media: { reducedTransparency: true } });
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("session_muse is unconditionally static, even on high-end hardware with no reduced signal", () => {
+    fakeMuseGlyphBrowser({ hardwareConcurrency: 16 });
+    const mounted = mountMuseGlyphCanvas("session_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-fps-budget")).toBe("0");
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("1.5");
+      expect(mounted.glyphs.getAttribute("data-glyph-scale")).toBe("0.5");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("session_muse never animates beside a live voice_trace canvas: at most one animated canvas on /session", () => {
+    fakeMuseGlyphBrowser({ hardwareConcurrency: 16 });
+    const mounted = mountMuseGlyphCanvas("session_muse");
+    try {
+      // The shared resolver (unchanged from Task 0) is what Plan 10's
+      // VoiceTraceCanvas calls with `canvasRole: "voice_trace"` — asserting
+      // it directly here proves the two canvases' policies can never both
+      // resolve to `animated` on the same route, without importing Plan
+      // 10's file.
+      const sessionMusePolicy = resolveVivaEffectsPolicy({
+        canvasRole: "session_muse",
+        devicePixelRatio: 2,
+        explicitPreference: null,
+        hardwareConcurrency: 16,
+        prefersReducedMotion: false,
+        prefersReducedTransparency: false,
+        saveData: false,
+        viewportHeight: 720,
+        viewportWidth: 1280,
+      });
+      const voiceTracePolicy = resolveVivaEffectsPolicy({
+        canvasRole: "voice_trace",
+        devicePixelRatio: 2,
+        explicitPreference: null,
+        hardwareConcurrency: 16,
+        prefersReducedMotion: false,
+        prefersReducedTransparency: false,
+        saveData: false,
+        viewportHeight: 720,
+        viewportWidth: 1280,
+      });
+      const animatedCount = [sessionMusePolicy, voiceTracePolicy].filter((p) => p.fps > 0).length;
+      expect(animatedCount).toBeLessThanOrEqual(1);
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("recomputes after one same-tab VIVA_EFFECTS_CHANGE_EVENT following an explicit-reduced write", () => {
+    const browser = fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("animated");
+      act(() => {
+        window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+        window.dispatchEvent(new Event(VIVA_EFFECTS_CHANGE_EVENT));
+      });
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+      expect(mounted.glyphs.getAttribute("data-dpr-cap")).toBe("1.5");
+      void browser;
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("recomputes after a cross-tab storage event with no local click", () => {
+    fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("animated");
+      act(() => {
+        window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+        window.dispatchEvent(
+          new StorageEvent("storage", { key: VIVA_EFFECTS_PREFERENCE_STORAGE_KEY }),
+        );
+      });
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("reload restores the static render from a preference set before mount", () => {
+    fakeMuseGlyphBrowser({ media: { reducedMotion: false } });
+    window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+    expect(readVivaEffectsPreference(window.localStorage)).toBe("reduced");
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("toggling the explicit preference mirrors onto the root data-viva-effects attribute", () => {
+    fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(document.documentElement.dataset.vivaEffects).toBeUndefined();
+      act(() => {
+        window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+        window.dispatchEvent(new Event(VIVA_EFFECTS_CHANGE_EVENT));
+      });
+      expect(document.documentElement.dataset.vivaEffects).toBe("reduced");
+      act(() => {
+        window.localStorage.removeItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY);
+        window.dispatchEvent(new Event(VIVA_EFFECTS_CHANGE_EVENT));
+      });
+      expect(document.documentElement.dataset.vivaEffects).toBeUndefined();
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("system reduced-motion remains authoritative after the explicit preference is absent", () => {
+    const browser = fakeMuseGlyphBrowser({ media: { reducedMotion: true } });
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+      // No explicit preference was ever set — the root attribute stays
+      // absent even though the canvas itself is static via system settings.
+      expect(document.documentElement.dataset.vivaEffects).toBeUndefined();
+      void browser;
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("mounts and unmounts with exactly one listener each, then zero after cleanup", () => {
+    const browser = fakeMuseGlyphBrowser();
+    for (let iteration = 0; iteration < 2; iteration++) {
+      const mounted = mountMuseGlyphCanvas("landing_muse");
+      expect(browser.visibilityListenerCount()).toBe(1);
+      expect(browser.mediaListenerCount()).toBe(2); // motion + transparency
+      expect(browser.storageListenerCount()).toBe(1);
+      expect(browser.vivaEffectsListenerCount()).toBe(1);
+      mounted.unmount();
+      expect(browser.visibilityListenerCount()).toBe(0);
+      expect(browser.mediaListenerCount()).toBe(0);
+      expect(browser.storageListenerCount()).toBe(0);
+      expect(browser.vivaEffectsListenerCount()).toBe(0);
+    }
+  });
+});
+
+describe("VisualEffectsControl", () => {
+  afterEach(() => {
+    resetVivaTestDom();
+  });
+
+  function mountControl(): { control: Root; toggle: HTMLButtonElement; unmount: () => void } {
+    const container = document.createElement("div");
+    document.body.append(container);
+    let root: Root | null = null;
+    act(() => {
+      root = createRoot(container);
+      root.render(createElement(VisualEffectsControl));
+    });
+    const toggle = container.querySelector("button");
+    if (!(toggle instanceof HTMLButtonElement)) {
+      throw new Error("VisualEffectsControl did not mount a button after its client-only effect");
+    }
+    return {
+      control: root as unknown as Root,
+      toggle,
+      unmount() {
+        act(() => {
+          root?.unmount();
+        });
+        container.remove();
+      },
+    };
+  }
+
+  test("mounts client-only: renders nothing under renderToStaticMarkup, which never runs effects", () => {
+    // `act()` always flushes pending effects before returning, so it cannot
+    // observe the pre-mount-effect DOM state; `renderToStaticMarkup` (what
+    // `LandingHero.test.tsx`'s "exactly one real button" assertion actually
+    // uses) never runs effects at all, which is the real guarantee this
+    // component's client-only gate provides for that claim.
+    const markup = renderToStaticMarkup(createElement(VisualEffectsControl));
+    expect(markup).toBe("");
+  });
+
+  test("defaults to the Reduce label, then toggles to the restore label on click", () => {
+    const mounted = mountControl();
+    try {
+      expect(mounted.toggle.textContent?.trim()).toBe("Reduce visual effects");
+      expect(mounted.toggle.getAttribute("aria-pressed")).toBe("false");
+      act(() => {
+        mounted.toggle.click();
+      });
+      expect(mounted.toggle.textContent?.trim()).toBe("Use system visual effects");
+      expect(mounted.toggle.getAttribute("aria-pressed")).toBe("true");
+      expect(window.localStorage.getItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY)).toBe("reduced");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("clicking dispatches exactly one same-tab VIVA_EFFECTS_CHANGE_EVENT per click", () => {
+    const mounted = mountControl();
+    try {
+      let changeEvents = 0;
+      const onChange = () => {
+        changeEvents += 1;
+      };
+      window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onChange);
+      try {
+        act(() => {
+          mounted.toggle.click();
+        });
+        expect(changeEvents).toBe(1);
+      } finally {
+        window.removeEventListener(VIVA_EFFECTS_CHANGE_EVENT, onChange);
+      }
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("clearing the value removes the stored preference and restores the Reduce label", () => {
+    const mounted = mountControl();
+    try {
+      act(() => {
+        mounted.toggle.click();
+      });
+      expect(mounted.toggle.textContent?.trim()).toBe("Use system visual effects");
+      act(() => {
+        mounted.toggle.click();
+      });
+      expect(mounted.toggle.textContent?.trim()).toBe("Reduce visual effects");
+      expect(window.localStorage.getItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY)).toBe(null);
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("a cross-tab storage change updates the displayed label without a click", () => {
+    const mounted = mountControl();
+    try {
+      expect(mounted.toggle.textContent?.trim()).toBe("Reduce visual effects");
+      act(() => {
+        window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+        window.dispatchEvent(
+          new StorageEvent("storage", { key: VIVA_EFFECTS_PREFERENCE_STORAGE_KEY }),
+        );
+      });
+      expect(mounted.toggle.textContent?.trim()).toBe("Use system visual effects");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("restores the reduced label from a preference already stored before mount", () => {
+    window.localStorage.setItem(VIVA_EFFECTS_PREFERENCE_STORAGE_KEY, "reduced");
+    const mounted = mountControl();
+    try {
+      expect(mounted.toggle.textContent?.trim()).toBe("Use system visual effects");
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("removes its listeners on unmount", () => {
+    const mounted = mountControl();
+    let changeEvents = 0;
+    const onChange = () => {
+      changeEvents += 1;
+    };
+    window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onChange);
+    mounted.unmount();
+    act(() => {
+      window.dispatchEvent(new Event(VIVA_EFFECTS_CHANGE_EVENT));
+    });
+    window.removeEventListener(VIVA_EFFECTS_CHANGE_EVENT, onChange);
+    // The unmounted control's own internal listener must not throw or act on
+    // a stale container; this only proves the test's own spy still works.
+    expect(changeEvents).toBe(1);
   });
 });

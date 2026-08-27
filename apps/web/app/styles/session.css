@@ -2267,3 +2267,32 @@
     animation-iteration-count: 1;
   }
 }
+
+/*
+ * `FRONTEND-008`: reduced-effects support, mirroring `landing.css`'s block.
+ * Either the OS-level accessibility setting or the app's own explicit
+ * preference (`html[data-viva-effects="reduced"]`, set by `MuseGlyphCanvas`)
+ * replaces every translucent "glass" surface with an opaque token
+ * background. Borders and focus rings are untouched.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  .session-capsule,
+  .session-consent,
+  .session-plate,
+  .marginalia,
+  .session-controls__panel {
+    background: var(--viva-paper);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+html[data-viva-effects="reduced"] .session-capsule,
+html[data-viva-effects="reduced"] .session-consent,
+html[data-viva-effects="reduced"] .session-plate,
+html[data-viva-effects="reduced"] .marginalia,
+html[data-viva-effects="reduced"] .session-controls__panel {
+  background: var(--viva-paper);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}

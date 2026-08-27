@@ -1,6 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  readVivaEffectsPreference,
+  resolveVivaEffectsPolicy,
+  VIVA_EFFECTS_CHANGE_EVENT,
+  type VivaEffectsPolicy,
+  type VivaEffectsPolicyInput,
+} from "../../lib/viva-effects";
 
 /**
  * MuseGlyphCanvas — the "living manuscript" layer.
@@ -128,10 +135,48 @@ function byFontThenColor(a: Glyph, b: Glyph): number {
   return 0;
 }
 
+/** `navigator.connection` is not in the DOM lib; only `saveData` is read. */
+type SaveDataNavigator = Navigator & { connection?: { saveData?: boolean } };
+
+function readSaveDataPreference(): boolean {
+  return (navigator as SaveDataNavigator).connection?.saveData === true;
+}
+
+/**
+ * Plan 13A's `viva-effects` module owns the storage key and the fail-closed
+ * parse; this only guards the `window.localStorage` *access*, which itself
+ * throws in some privacy modes (mirrors `VoiceTraceCanvas`'s own helper).
+ */
+function readEffectsPreference(): "reduced" | null {
+  try {
+    return readVivaEffectsPreference(window.localStorage);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mirrors the raw explicit preference (never the derived per-role policy —
+ * `session_muse` is always static regardless of what the user chose) onto
+ * the root element so `landing.css`/`session.css` can react to
+ * `html[data-viva-effects="reduced"]` without reading storage themselves.
+ * `MuseGlyphCanvas` mounts on both `/` and `/session`, so this is correct
+ * after a fresh load of either route, not only after a same-tab toggle on
+ * the landing page where `VisualEffectsControl` lives.
+ */
+function syncRootEffectsAttribute(explicitPreference: "reduced" | null): void {
+  if (explicitPreference === "reduced") {
+    document.documentElement.dataset.vivaEffects = "reduced";
+  } else {
+    delete document.documentElement.dataset.vivaEffects;
+  }
+}
+
 export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyphCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef<MuseGlyphState>(state);
   const highlightRef = useRef<Set<string>>(new Set());
+  const [effectsPolicy, setEffectsPolicy] = useState<VivaEffectsPolicy | null>(null);
   stateRef.current = state;
 
   useEffect(() => {
@@ -140,12 +185,22 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    // canvas -> aria-hidden wrapper -> .viva-hero
+    // canvas -> aria-hidden wrapper -> .viva-hero (landing) or .live-session (session)
     const hero = canvas?.parentElement?.parentElement;
     if (!canvas || !hero) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const cv = canvas;
+
+    // `FRONTEND-008`: the same component decorates both the landing hero and
+    // the live session background (`LiveSessionShell` mounts it verbatim,
+    // unedited by this plan) — detected from real DOM structure rather than
+    // a prop, so Plan 10's mount site needs no change. `session_muse` is
+    // unconditionally static in the shared policy table, which is what
+    // removes this canvas from contention with Plan 10's `voice_trace`.
+    const canvasRole: VivaEffectsPolicyInput["canvasRole"] = canvas.closest(".live-session")
+      ? "session_muse"
+      : "landing_muse";
 
     // `FRONTEND-007`: resolve the field's colors from the real design
     // tokens (`packages/tokens/src/theme.css`, the one runtime token
@@ -206,9 +261,37 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     let sampler: { data: Uint8ClampedArray; w: number; h: number } | null = null;
     let samplerReady = false;
 
-    const reduceMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const reduceMotionMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const reduceTransparencyMQ = window.matchMedia("(prefers-reduced-transparency: reduce)");
     const SAFE_MARGIN = 66;
-    const FRAME = 1000 / 32;
+
+    /**
+     * Plan 13A owns the effects table; this canvas only gathers its own
+     * browser inputs and consumes `mode`/`dprCap`/`fps`/`glyphCountScale`.
+     * There is deliberately no local DPR/FPS/particle-count literal left to
+     * drift from it. Also mirrors the raw explicit preference onto the root
+     * element (see `syncRootEffectsAttribute`) so reduced-transparency CSS
+     * is correct after a fresh load of either owning route.
+     */
+    function resolvePolicy(): VivaEffectsPolicy {
+      const explicitPreference = readEffectsPreference();
+      syncRootEffectsAttribute(explicitPreference);
+      return resolveVivaEffectsPolicy({
+        canvasRole,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        explicitPreference,
+        hardwareConcurrency:
+          typeof navigator.hardwareConcurrency === "number" ? navigator.hardwareConcurrency : null,
+        prefersReducedMotion: reduceMotionMQ.matches,
+        prefersReducedTransparency: reduceTransparencyMQ.matches,
+        saveData: readSaveDataPreference(),
+        viewportHeight: window.innerHeight,
+        viewportWidth: window.innerWidth,
+      });
+    }
+
+    let policy = resolvePolicy();
+    setEffectsPolicy(policy);
 
     // --- muse density map (offscreen, same-origin so getImageData is allowed) ---
     const img = new Image();
@@ -344,9 +427,18 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     }
 
     function counts() {
-      if (cssW <= 620) return { glyph: 240, spark: 10, large: 4 };
-      if (cssW <= 900) return { glyph: 520, spark: 18, large: 6 };
-      return { glyph: 880, spark: 26, large: 9 };
+      const base =
+        cssW <= 620
+          ? { glyph: 240, spark: 10, large: 4 }
+          : cssW <= 900
+            ? { glyph: 520, spark: 18, large: 6 }
+            : { glyph: 880, spark: 26, large: 9 };
+      const scale = policy.glyphCountScale;
+      return {
+        glyph: Math.max(1, Math.round(base.glyph * scale)),
+        large: Math.max(1, Math.round(base.large * scale)),
+        spark: Math.max(1, Math.round(base.spark * scale)),
+      };
     }
 
     function glyphColorKey(): string {
@@ -459,7 +551,7 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
       if (!rect) return;
       cssW = rect.width;
       cssH = rect.height;
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const dpr = Math.min(policy.dprCap, window.devicePixelRatio || 1);
       cv.width = Math.round(cssW * dpr);
       cv.height = Math.round(cssH * dpr);
       cv.style.width = `${cssW}px`;
@@ -543,7 +635,9 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     function loop(now: number) {
       if (!animating) return;
       raf = requestAnimationFrame(loop);
-      if (now - last < FRAME) return;
+      const frame = policy.fps > 0 ? 1000 / policy.fps : 0;
+      if (frame <= 0) return;
+      if (now - last < frame) return;
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       const target = STATE_ENERGY[stateRef.current] ?? 0;
@@ -552,7 +646,7 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     }
 
     function startAnim() {
-      if (animating || reduceMQ.matches) return;
+      if (animating || policy.fps <= 0) return;
       animating = true;
       last = performance.now();
       raf = requestAnimationFrame(loop);
@@ -570,10 +664,35 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
       createParticles();
       // Always paint one frame synchronously so the field is visible immediately —
       // before the first rAF, and even while the tab is hidden (rAF is suspended
-      // when backgrounded). Continuous motion then resumes via startAnim().
-      drawFrame(reduceMQ.matches ? 0 : performance.now() / 1000);
-      if (reduceMQ.matches) stopAnim();
+      // when backgrounded). Continuous motion then resumes via startAnim() unless
+      // the policy is static (`session_muse`, reduced motion/transparency, or an
+      // explicit reduced preference), in which case this is the only frame drawn.
+      drawFrame(policy.fps <= 0 ? 0 : performance.now() / 1000);
+      if (policy.fps <= 0) stopAnim();
       else startAnim();
+    }
+
+    /**
+     * One policy path for every signal that can change it — media query,
+     * stored preference (same-tab custom event or cross-tab `storage`), or
+     * viewport (handled by the existing debounced `ResizeObserver`, which
+     * calls `rebuild()` directly). A changed policy stops the current loop
+     * before rebuilding so a mode flip never leaves two loops running, and
+     * a policy that resolved to the *same* values skips the particle
+     * re-seed entirely.
+     */
+    function applyPolicy() {
+      const next = resolvePolicy();
+      const changed =
+        next.mode !== policy.mode ||
+        next.fps !== policy.fps ||
+        next.dprCap !== policy.dprCap ||
+        next.glyphCountScale !== policy.glyphCountScale;
+      policy = next;
+      setEffectsPolicy((current) => (current && !changed ? current : next));
+      if (!changed) return;
+      stopAnim();
+      rebuild();
     }
 
     let resizeTimer: ReturnType<typeof setTimeout>;
@@ -589,8 +708,11 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
     };
     document.addEventListener("visibilitychange", onVisibility);
 
-    const onReduce = () => rebuild();
-    reduceMQ.addEventListener("change", onReduce);
+    const onPolicySignal = () => applyPolicy();
+    reduceMotionMQ.addEventListener("change", onPolicySignal);
+    reduceTransparencyMQ.addEventListener("change", onPolicySignal);
+    window.addEventListener("storage", onPolicySignal);
+    window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
 
     // If the muse is already decoded (commonly cached by MuseBackdrop), sample it
     // now so the very first frame — including the static reduced-motion frame — is
@@ -606,14 +728,25 @@ export function MuseGlyphCanvas({ state = "idle", highlightedTokens }: MuseGlyph
       clearTimeout(resizeTimer);
       ro.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
-      reduceMQ.removeEventListener("change", onReduce);
+      reduceMotionMQ.removeEventListener("change", onPolicySignal);
+      reduceTransparencyMQ.removeEventListener("change", onPolicySignal);
+      window.removeEventListener("storage", onPolicySignal);
+      window.removeEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
       img.onload = null;
       img.onerror = null;
     };
   }, []);
 
   return (
-    <div aria-hidden="true" className="viva-glyphs">
+    <div
+      aria-hidden="true"
+      className="viva-glyphs"
+      data-dpr-cap={effectsPolicy ? String(effectsPolicy.dprCap) : undefined}
+      data-fps-budget={effectsPolicy ? String(effectsPolicy.fps) : undefined}
+      data-glyph-scale={effectsPolicy ? String(effectsPolicy.glyphCountScale) : undefined}
+      data-render-mode={effectsPolicy ? (effectsPolicy.fps > 0 ? "animated" : "static") : undefined}
+      data-viva-effects={effectsPolicy?.mode}
+    >
       <canvas className="viva-glyphs__canvas" ref={canvasRef} />
     </div>
   );
