@@ -100,10 +100,11 @@ import {
  *   client-side 6000ms abort/timeout policy is real, not merely unit-level)
  *   and never navigates.
  *
- * The complementary proof that a successful start hands Plan 10's
- * not-yet-published `replaceBrowserSessionCredential` vault seam the
- * complete start response, strictly before navigation, is a Bun-test/
- * happy-dom-mounted concern (`apps/web/lib/viva-library.test.ts`,
+ * The complementary proof that a successful start hands Plan 10's real,
+ * published `replaceBrowserSessionCredential` vault seam the complete start
+ * response — `LibraryStatusPanel.tsx`'s production default since A-28.4 —
+ * strictly before navigation, is a Bun-test/happy-dom-mounted concern
+ * (`apps/web/lib/viva-library.test.ts`,
  * `apps/web/components/landing/LandingEntry.test.tsx`) rather than this
  * script's: observing an in-page JS call's exact arguments has no natural
  * black-box browser signal, whereas a real DOM mount gives direct access.

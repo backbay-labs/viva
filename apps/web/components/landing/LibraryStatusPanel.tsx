@@ -669,6 +669,31 @@ async function requestServerSession(
   return { ok: true, startResponse: outcome.startResponse, target: outcome.target };
 }
 
+/**
+ * A hard document load, not an in-app route transition: `/session` starts
+ * over as a fresh page with a fresh JS module graph. `completeServerSessionStart`
+ * above writes the complete credential into Plan 10's real vault
+ * (`apps/web/lib/use-viva-agent-session.ts`) correctly, exactly once, in
+ * *this* document's JS context — but that module's own header comment
+ * documents module-scope memory as its only store, by design: a page
+ * reload legitimately loses it, falling back to a nonrenewable direct entry
+ * rather than ever persisting the refresh half to storage, a cookie, or the
+ * URL (all three ruled out explicitly by that same comment). So this
+ * navigate discards the refresh half of what was just written before
+ * `/session`'s own script ever runs.
+ *
+ * Known residual gap surfaced by A-28.4's adversarial review (finding 2),
+ * not resolved by that amendment and not fixed here: closing it means
+ * either this transition stops being a full page load, or the refresh half
+ * is carried across it some other way — and both options reach outside this
+ * file's ownership (this transition's destination, `LiveSessionPage.tsx`'s
+ * mount-time read, is Plan-10-owned and not edited by this plan; `/session`'s
+ * rendering mode is owned by whoever owns `apps/web/proxy.ts` /
+ * `apps/web/next.config.ts` — a Plan-13 worker changing that unilaterally
+ * was already reverted once, see the "opt /session into dynamic rendering
+ * so its CSP nonce applies" commit and its revert). Tracked for an explicit
+ * coordinator ruling rather than decided here.
+ */
 function navigateToSession(target: string) {
   if (typeof window !== "undefined") window.location.assign(target);
 }

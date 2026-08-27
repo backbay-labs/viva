@@ -507,16 +507,17 @@ describe("Viva library projection", () => {
  * half, `FRONTEND-011`): the pure helpers `LibraryStatusPanel.tsx` composes
  * around the same-origin `/api/viva-session/start` mint.
  *
- * `browserSessionCredentialVaultInputFromStartResponse` is the "small local
- * indirection" this task owns in place of Plan 10's not-yet-published
- * `replaceBrowserSessionCredential` (`apps/web/lib/use-viva-agent-session.ts`
- * has no such export in this tree yet — confirmed by reading that file
- * before writing this test). It shapes exactly the fields the plan names —
- * `session_token`, `refresh_token`, `refresh_expires_at`,
- * `session_absolute_expires_at`, identity, `mode: "retain-token-only"` —
- * from a start response, tolerating the refresh fields' current absence from
- * the real (Plan-11-owned, unmodified-by-this-task) route response so this
- * task's own behavior is provable today, not only once those fields exist.
+ * `browserSessionCredentialVaultInputFromStartResponse` is the shape-builder
+ * this task owns for Plan 10's `replaceBrowserSessionCredential`
+ * (`apps/web/lib/use-viva-agent-session.ts`). That export has since been
+ * published and, as of A-28.4, is `LibraryStatusPanel.tsx`'s real production
+ * vault default; this helper itself is unchanged by that swap — it only
+ * shapes exactly the fields the plan names — `session_token`,
+ * `refresh_token`, `refresh_expires_at`, `session_absolute_expires_at`,
+ * identity, `mode: "retain-token-only"` — from a start response, tolerating
+ * the refresh fields' current absence from the real (Plan-11-owned,
+ * unmodified-by-this-task) route response so this task's own behavior is
+ * provable today, not only once those fields exist.
  */
 describe("D-07 Branch A session bootstrap composition (FRONTEND-011)", () => {
   describe("browserSessionCredentialVaultInputFromStartResponse", () => {

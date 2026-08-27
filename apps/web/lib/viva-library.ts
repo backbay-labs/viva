@@ -230,15 +230,15 @@ function stripBrowserOnlyTokenFields(
  * the pure logic that path composes around: the exact "complete start
  * response" shape a successful mint returns, a bounded (6000ms) timeout
  * wrapper around the start fetch — headers *and* body, one shared deadline —
- * so a hung mint can never hang the UI forever, and the "small local
- * indirection" this task owns in place of
- * Plan 10's not-yet-published `replaceBrowserSessionCredential`
- * (`apps/web/lib/use-viva-agent-session.ts` has no such export in this tree
- * — confirmed by reading that file before writing this code; Plan 10 wires
- * the real export into this seam once it exists, which is Phase 13B
- * integration work, not this task's). Nothing here reads `window`,
- * `localStorage`/`sessionStorage`, or calls `console.*` — the browser-bound
- * capability this composes around must never persist or log.
+ * so a hung mint can never hang the UI forever, and
+ * `browserSessionCredentialVaultInputFromStartResponse`, the shape-builder
+ * this task owns for Plan 10's `replaceBrowserSessionCredential`
+ * (`apps/web/lib/use-viva-agent-session.ts`). That export has since been
+ * published, and A-28.4 swapped `LibraryStatusPanel.tsx`'s default onto it
+ * directly — this file still imports nothing from that module, it only
+ * builds the input shape the real vault's seam accepts. Nothing here reads
+ * `window`, `localStorage`/`sessionStorage`, or calls `console.*` — the
+ * browser-bound capability this composes around must never persist or log.
  * -------------------------------------------------------------------- */
 
 /**
@@ -315,12 +315,16 @@ export function browserSessionCredentialVaultInputFromStartResponse(
 }
 
 /**
- * Phase-13A placeholder for Plan 10's not-yet-published
- * `replaceBrowserSessionCredential`. Every successful same-origin start
- * composes its call around this seam so the wiring is provable now; the
- * function itself stays inert (no storage, no network, no console output —
- * never a leak surface) until Plan 10's real export lands and this default
- * is swapped for it.
+ * Phase-13A placeholder for Plan 10's `replaceBrowserSessionCredential`.
+ * Every successful same-origin start composed its call around this seam so
+ * the wiring was provable before that export existed; the function itself
+ * stays inert (no storage, no network, no console output — never a leak
+ * surface). Plan 10's real export has since been published, and A-28.4
+ * swapped `LibraryStatusPanel.tsx`'s production default onto it directly —
+ * this stub is no longer that default and has zero production consumers.
+ * Retained only for its own inertness test below, pending an explicit
+ * coordinator disposition (keep as documented dead code, or remove both);
+ * this comment does not decide that.
  */
 export const pendingBrowserSessionCredentialVault: BrowserSessionCredentialVault = {
   replaceBrowserSessionCredential: () => {},
