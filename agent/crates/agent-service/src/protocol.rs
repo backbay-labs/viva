@@ -2975,11 +2975,34 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        // Plan 04's turn-outcome authority owns the concept transition: the graded
-        // status is persisted inside the turn outcome and its review card, not as a
-        // standalone `concept_statuses` row. The `concept_status` wire event above is
-        // still emitted and still asserted frame-exactly; only the store shape moved.
-        assert!(snapshot.concept_statuses.is_empty());
+        // CROSS-LANE FALLOUT — AWAITING COORDINATOR SANCTION (A-07/A-08/A-17
+        // category). This file is Plan 05/08's; the `A-22` store change that forces
+        // this value was made in Plan 09's `data` crate. Revert recipe if the
+        // sanction is refused: restore `assert!(snapshot.concept_statuses.is_empty())`
+        // here and in the fake-Cartesia twin below, and both tests go red until the
+        // owning lane re-pins them.
+        //
+        // The record this supersedes, kept verbatim, because reversing another
+        // lane's recorded reasoning is that lane's call and not this one's:
+        //   "Plan 04's turn-outcome authority owns the concept transition: the
+        //    graded status is persisted inside the turn outcome and its review
+        //    card, not as a standalone `concept_statuses` row. The `concept_status`
+        //    wire event above is still emitted and still asserted frame-exactly;
+        //    only the store shape moved."
+        // Its first sentence still holds. Its second no longer does: `A-22` made the
+        // turn-outcome authority also record the session-scoped status row, because
+        // memory's `authorize_concept_status` refuses a `concept_status` browser
+        // event with no persisted status write behind it — so without that row a
+        // genuinely graded turn is refused at the socket.
+        //
+        // What arbitrates the new value: the untouched `store_snapshot` block of
+        // both frozen v5 runtime evidence packs (`concept_statuses: 1`), reached by
+        // the replay tests after their frame-exact `server` comparison passes.
+        // `count-truth-table.json`'s `happy` scenario states the same count as a
+        // program-level contract, but it does not arbitrate this line: its only
+        // consumer drives the retired `record_answer_evaluation`/
+        // `record_concept_status` writers, never `record_turn_outcome`.
+        assert_eq!(snapshot.concept_statuses.len(), 1);
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }
@@ -3038,11 +3061,14 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.answer_attempts.len(), 1);
-        // Plan 04's turn-outcome authority owns the concept transition: the graded
-        // status is persisted inside the turn outcome and its review card, not as a
-        // standalone `concept_statuses` row. The `concept_status` wire event above is
-        // still emitted and still asserted frame-exactly; only the store shape moved.
-        assert!(snapshot.concept_statuses.is_empty());
+        // CROSS-LANE FALLOUT — AWAITING COORDINATOR SANCTION, the same one recorded
+        // in full on `synthetic_runtime_output_matches_full_session_fixture_exactly`
+        // above: `A-22` made Plan 04's turn-outcome authority also record the
+        // session-scoped status row its `concept_status` browser event is authorized
+        // against, superseding the "not as a standalone `concept_statuses` row" half
+        // of this file's earlier record. Arbitrated by the untouched `store_snapshot`
+        // block of both frozen v5 evidence packs, not by `count-truth-table.json`.
+        assert_eq!(snapshot.concept_statuses.len(), 1);
         assert_eq!(snapshot.review_items.len(), 1);
         assert_eq!(snapshot.recaps.len(), 1);
     }

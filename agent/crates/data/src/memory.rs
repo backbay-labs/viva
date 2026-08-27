@@ -21,7 +21,7 @@ use agent_domain::{
     AnswerAttemptEnvelope, AnswerCaptureMode, AnswerCaptureStatus, AnswerContentPolicy,
     AnswerEvaluation, AuthenticatedStudyProjectionV1, ChallengeDisposition, ChallengeResolution,
     ConceptStatus, ConceptStatusTransition, CreateFileStudySet, CreatePasteStudySet,
-    LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
+    EvaluationLabel, LibraryNextReviewSummary, LibrarySessionRecapSummary, LibrarySessionSummary,
     LibraryStudyDocumentSummary, LibraryStudySetSummary, PersistedTurnOutcome, PortError,
     ProgressionPolicyId, QuestionDisposition, QuestionProgressionCursor, QuestionProgressionResult,
     ReviewScheduleCapReasonV1, ReviewScheduleDecisionV1, ReviewSchedulingContextV1, SessionConfig,
@@ -64,18 +64,18 @@ mod authorization;
 mod privacy;
 
 pub(crate) use authorization::{
-    current_epoch_seconds, event_authorization_record, payload_sha256, ConceptStatusEventPayload,
-    EventAuthorizationKind, EventAuthorizationRecord, ReviewScheduleEventPayload,
-    SESSION_TOKEN_NONCE_SKEW_SECONDS,
+    current_epoch_seconds, event_authorization_record, payload_sha256,
+    AnswerEvaluationEventPayload, ConceptStatusEventPayload, EventAuthorizationKind,
+    EventAuthorizationRecord, ReviewScheduleEventPayload, SESSION_TOKEN_NONCE_SKEW_SECONDS,
 };
 #[cfg(test)]
 use ingestion::MAX_PASTE_SOURCE_EXCERPT_CHARS;
 pub(crate) use ingestion::{generate_file_study_set, generate_paste_study_set};
 pub(crate) use learning::{
-    cursor_current_question, last_reviewed_at, projection_active_question,
-    require_selected_progression_policy, review_schedule_summaries, session_answered_questions,
-    turn_outcome_disposition, turn_outcome_transitions, validate_challenge_resolution,
-    validate_turn_outcome,
+    browser_answer_evaluation, cursor_current_question, last_reviewed_at,
+    projection_active_question, require_selected_progression_policy, review_schedule_summaries,
+    session_answered_questions, turn_outcome_disposition, turn_outcome_transitions,
+    validate_challenge_resolution, validate_turn_outcome,
 };
 /// The raw-payload inventory is a schema gate, exercised only by the migration
 /// suite that enforces it.
@@ -1732,6 +1732,10 @@ impl StudyMemoryStore for InMemoryStudyStore {
             PortError::invalid_input("memory", &evaluation.question_id, reason)
         })?;
         let persisted_evaluation = PersistedAnswerEvaluation::from(&evaluation);
+        // `A-22`: one digest definition for the `answer_evaluation` event, shared
+        // with the turn-outcome authority that superseded this writer and with the
+        // gate that reads it. A second definition here would authorize on one
+        // write path what the other cannot.
         let authorization = event_authorization_record(
             "memory",
             user_id,
@@ -1739,7 +1743,7 @@ impl StudyMemoryStore for InMemoryStudyStore {
             voice_session_id,
             response_id,
             EventAuthorizationKind::AnswerEvaluation,
-            &evaluation,
+            &AnswerEvaluationEventPayload::from_browser_event(&evaluation),
         )?;
         // `DATA-012`: one write lock spans the validation and the write, so a
         // deletion that commits first cannot be followed by a late attempt row or
@@ -4615,7 +4619,12 @@ mod tests {
             StudyStoreWriteCounts {
                 sessions: 1,
                 answer_attempts: 1,
-                concept_statuses: 1,
+                // Two distinct concepts move exactly once each: the explicit
+                // `nadh` call, and the graded transition on
+                // `oxidative-phosphorylation` that the turn outcome now records
+                // under `A-22`, so that turn's `concept_status` browser event is
+                // backed by a durable write rather than a digest alone.
+                concept_statuses: 2,
                 // Two distinct concepts are scheduled exactly once each: the
                 // explicit `atp-synthase` call, and the graded transition on
                 // `oxidative-phosphorylation` that the turn outcome schedules
@@ -4629,13 +4638,84 @@ mod tests {
         let state = store.snapshot();
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.answer_attempts.len(), 1);
-        assert_eq!(state.concept_statuses.len(), 1);
+        assert_eq!(state.concept_statuses.len(), 2);
         assert_eq!(state.review_items.len(), 2);
         assert_eq!(state.review_schedule_decisions.len(), 1);
         assert_eq!(state.recaps.len(), 1);
         assert_eq!(state.turn_outcomes.len(), 1);
         assert_eq!(state.question_progressions.len(), 1);
         assert_eq!(state.voice_usage_events.len(), 1);
+    }
+
+    /// `A-22`: the six wire tokens a browser evaluation is authorized against,
+    /// pinned arm by arm.
+    ///
+    /// The mapping is duplicated in
+    /// `agent_adapters::cartesia_gemini::projection::evaluation_label_wire` with no
+    /// compile-time link between the copies (see the hazard note on
+    /// `learning::evaluation_label_wire`). Only two arms are exercised end to end
+    /// by a fixture — `strong` in the frozen v5 replays, `mostly correct` in the
+    /// shared conformance suite — so the other four were unpinned in either copy,
+    /// and a rename of one of them would have surfaced only as a live session
+    /// closing with `provider source authority rejected`.
+    ///
+    /// Three separate facts, because each fails differently:
+    /// 1. the literal token of every arm, so a rename in this copy is a red test;
+    /// 2. every token passes `AnswerEvaluation::validate_fail_closed`, the check
+    ///    the event itself must survive — a token this store hashed but the domain
+    ///    refuses could never be presented at all;
+    /// 3. no two labels share a token, because the digest is the only thing
+    ///    separating two differently graded turns of the same response identity.
+    #[test]
+    fn a22_evaluation_label_wire_pins_every_arm() {
+        let mapping = [
+            (EvaluationLabel::Strong, "strong"),
+            (EvaluationLabel::MostlyCorrect, "mostly correct"),
+            (EvaluationLabel::PartiallyCorrect, "partially correct"),
+            (EvaluationLabel::Vague, "vague"),
+            (EvaluationLabel::Wrong, "wrong"),
+            (
+                EvaluationLabel::InsufficientEvidence,
+                "insufficient evidence",
+            ),
+        ];
+        let presented = |label: &str| AnswerEvaluation {
+            question_id: "q-1".to_owned(),
+            answer_text: "the learner said something".to_owned(),
+            label: label.to_owned(),
+            concise_feedback: "feedback".to_owned(),
+            retry_prompt: String::new(),
+            source: fixture_source_reference(),
+            concept_status: ConceptStatus::Shaky,
+            confidence_score: 0.5,
+        };
+        for (label, token) in mapping {
+            assert_eq!(
+                super::learning::evaluation_label_wire(label),
+                token,
+                "the browser is shown `{token}` for {label:?}"
+            );
+            presented(token)
+                .validate_fail_closed()
+                .unwrap_or_else(|error| {
+                    panic!("`{token}` must be a label the browser contract accepts: {error}")
+                });
+        }
+        // The negative control: the same construction with a token outside the
+        // rubric is refused for exactly the label reason, so the assertion above is
+        // testing the label and not merely a well-formed struct.
+        assert_eq!(
+            presented("mostly_correct").validate_fail_closed(),
+            Err("answer evaluation label is not in the typed rubric"),
+            "the canonical serde token is not a browser token"
+        );
+        let tokens: std::collections::BTreeSet<&str> =
+            mapping.iter().map(|(_, token)| *token).collect();
+        assert_eq!(
+            tokens.len(),
+            mapping.len(),
+            "two labels sharing a wire token would let one grade authorize the other's event"
+        );
     }
 }
 

@@ -2243,6 +2243,107 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*\*\ Ordered\ exactly\ as\ Plan\ 05\ pins\ it:\ bounded\ size,\ `viva1\.<claims>\.<signature>`\ framing,\s*$/,
     ]),
   },
+  // A-24 (2026-08-26): coordinator-applied sanction rows for the A-22/A-24
+  // authorization-gate work in the data crate. Dual-keyed, file-filtered,
+  // anchored literals of reviewed lines. Plan 12 reconciles at 12B.
+  {
+    file: "agent/crates/data/src/memory.rs",
+    marker: "answer_evaluation_event_payload",
+    patterns: Object.freeze([
+      /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(\&evaluation\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ "the\ learner\ said\ something"\.to_owned\(\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory.rs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*EventAuthorizationRecord,\ ReviewScheduleEventPayload,\ SESSION_TOKEN_NONCE_SKEW_SECONDS,\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory.rs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*"the\ browser\ is\ shown\ `\{token\}`\ for\ \{label:\?\}"\s*$/,
+      /^\s*panic!\("`\{token\}`\ must\ be\ a\ label\ the\ browser\ contract\ accepts:\ \{error\}"\)\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/authorization.rs",
+    marker: "answer_evaluation_event_payload",
+    patterns: Object.freeze([
+      /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(evaluation\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/authorization.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ `answer_text`\.\ A\ worker\ may\ not\ decide\ on\ its\ own\ what\ a\ gate\ stops\ binding,\ so\s*$/,
+      /^\s*\/\/\/\ \*\*Why\ it\ is\ structurally\ forced\.\*\*\ Every\ field\ except\ `answer_text`\ is\s*$/,
+      /^\s*\/\/\/\ come\ from\ the\ persisted\ \[`TurnOutcome`\]\ and\ the\ question\ it\ names\.\ `answer_text`\s*$/,
+      /^\s*\/\/\/\ legitimately\ graded\ `response_id`\ with\ a\ fabricated\ `answer_text`\ is\ now\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/authorization.rs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*\/\/\/\ reaches\ the\ same\ browser\ through\ `transcript_delta`\/`transcript_final`,\ which\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/learning.rs",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*if\ !authorization::is_recorded_locked\(\&state,\ \&authorization\)\ \{\s*$/,
+      /^\s*authorization::record_locked\(\&mut\ state,\ authorization\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/store_conformance.rs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*answer_text:\ \&str,\s*$/,
+      /^\s*answer_text:\ answer_text\.to_owned\(\),\s*$/,
+      /^\s*retranscribed\.answer_text\ =\ "A\ different\ transcript\ of\ the\ same\ turn\."\.to_owned\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/store_conformance.rs",
+    marker: "serde_token",
+    patterns: Object.freeze([
+      /^\s*let\ mut\ serde_token\ =\ mostly_correct_evaluation\.clone\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/memory/store_conformance.rs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*\/\/\ ungated\ `transcript_final`\ frame\ already\ carried\ this\ same\ text\ to\ this\ same\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/postgres.rs",
+    marker: "answer_evaluation_event_payload",
+    patterns: Object.freeze([
+      /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(\&evaluation\),\s*$/,
+    ]),
+  },
+  {
+    file: "agent/crates/data/src/postgres/authorization.rs",
+    marker: "answer_evaluation_event_payload",
+    patterns: Object.freeze([
+      /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(evaluation\),\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
