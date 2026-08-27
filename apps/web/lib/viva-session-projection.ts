@@ -1259,9 +1259,12 @@ function statusLabel(status: ConceptStatus): string {
 }
 
 export function conceptStatusVerdict(status: ConceptStatus): string {
-  // Interim A-08 bridge: the client-side FSRS interval fabrication was removed
-  // with D-01A (packages/core no longer exports it). The authoritative in-session
-  // review verdict arrives with Plan 10's node-10 rewrite of this projection.
+  // A-08 / node-10 ruling (coordinator, 2026-08-27): the client-side FSRS
+  // interval fabrication was removed with D-01A, and the verdict deliberately
+  // renders the status label alone. The one interval a learner sees comes from
+  // the persisted review decision on the recap surface — a single authority,
+  // so no cross-surface conflict can exist. This is the settled state, not an
+  // interim bridge.
   return statusLabel(status);
 }
 
