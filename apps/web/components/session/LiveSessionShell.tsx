@@ -1,4 +1,7 @@
+"use client";
+
 import type { ConceptStatus, SessionRecap, StudyMode, StudySetIngestionStatus } from "@viva/core";
+import { useState } from "react";
 import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import {
@@ -47,6 +50,9 @@ export function LiveSessionShell({
   textAnswer,
   checkingControl,
   levelRef,
+  transcriptId = "live-session-transcript",
+  transcriptOpen = false,
+  onTranscriptOpenChange = () => {},
   onEndSession,
   onHint,
   onShowSource,
@@ -90,6 +96,14 @@ export function LiveSessionShell({
   textAnswer?: TextAnswerState;
   checkingControl?: CheckingControl;
   levelRef?: VoiceTraceLevelRef;
+  /**
+   * `WEBSESSION-A11Y-01`: the transcript disclosure's state is the OWNER's.
+   * The defaults keep a static render coherent (closed, inert) without
+   * introducing a second, differently-named control.
+   */
+  transcriptId?: string;
+  transcriptOpen?: boolean;
+  onTranscriptOpenChange?: (open: boolean) => void;
   onEndSession: () => void;
   onHint: () => void;
   onShowSource: () => void;
@@ -111,7 +125,8 @@ export function LiveSessionShell({
     });
 
   return (
-    <section className="live-session" data-generation-id={generationId}>
+    <main className="live-session" data-generation-id={generationId} id="live-session-main">
+      <SkipToTurnLink />
       <MuseBackdrop />
       <MuseGlyphCanvas highlightedTokens={highlightedTokens} state={glyphState} />
       <div className="live-session__veil" />
@@ -142,7 +157,7 @@ export function LiveSessionShell({
             </button>
           </section>
         ) : null}
-        <div className="live-session__stage">
+        <div className="live-session__stage" id="live-session-turn" tabIndex={-1}>
           <div className="session-plate" data-state={state}>
             <QuestionStage
               highlightedTokens={highlightedTokens}
@@ -161,7 +176,10 @@ export function LiveSessionShell({
             <SessionBottomControls
               onEndSession={onEndSession}
               onShowSources={onShowSource}
+              onTranscriptOpenChange={onTranscriptOpenChange}
               transcript={transcript}
+              transcriptId={transcriptId}
+              transcriptOpen={transcriptOpen}
             />
           </div>
 
@@ -190,7 +208,38 @@ export function LiveSessionShell({
           />
         </div>
       </div>
-    </section>
+    </main>
+  );
+}
+
+/**
+ * `WEBSESSION-A11Y-02`: the keyboard entrance to the turn stage.
+ *
+ * It is the first focusable child of the session landmark, so a keyboard learner
+ * reaches the question they are being examined on in one Tab instead of walking
+ * past two backdrop canvases, the header, and the study-context bar. It is
+ * visually hidden until focused — the class swap is what makes it appear, so the
+ * behaviour lives with the component and no stylesheet is touched — and it moves
+ * focus explicitly rather than relying on a fragment navigation whose focus
+ * behaviour differs between browsers.
+ */
+function SkipToTurnLink() {
+  const [focused, setFocused] = useState(false);
+  return (
+    // biome-ignore lint/a11y/useValidAnchor: a skip link IS in-page navigation — it must stay an anchor with a real fragment href so assistive technology announces it as a link. The click handler only hardens the focus move that some engines skip for a `tabindex="-1"` target; it is not a button masquerading as a link.
+    <a
+      className={focused ? "session-skip-link" : "session-skip-link sr-only"}
+      href="#live-session-turn"
+      onBlur={() => setFocused(false)}
+      onClick={(event) => {
+        event.preventDefault();
+        const target = document.getElementById("live-session-turn");
+        target?.focus();
+      }}
+      onFocus={() => setFocused(true)}
+    >
+      Skip to current question and answer
+    </a>
   );
 }
 

@@ -181,6 +181,12 @@ export type SessionProjectionStage =
       retryAfterSeconds?: number;
     };
 
+/**
+ * The one transcript region id the disclosure button points at. It is a stable
+ * constant so `aria-controls` and the region can never drift apart.
+ */
+export const VIVA_SESSION_TRANSCRIPT_REGION_ID = "live-session-transcript";
+
 /** The all-null identity both the server render and the first client render use. */
 export const NEUTRAL_SESSION_ROUTE_IDENTITY: SessionRouteIdentity = {
   sessionId: null,
@@ -235,6 +241,10 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // poll lifecycle below, so a reconnect or a re-render cannot double-count.
   const [readinessFailures, setReadinessFailures] = useState(0);
   const [sourceOpen, setSourceOpen] = useState(false);
+  // `WEBSESSION-A11Y-01`: the transcript disclosure's state lives HERE, not in
+  // the control, so a terminal recap, a route change, and an unmount can all
+  // close it deterministically.
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [textAnswerEnabled, setTextAnswerEnabled] = useState(false);
   const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
@@ -295,6 +305,9 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const handledCancelRef = useRef(0);
   const reducedMotionRef = useRef(reducedMotion);
   const mountedRef = useRef(true);
+  // Read by `startMic`, which runs from a gesture callback that may fire after
+  // the recap has already committed.
+  const sessionTerminalRef = useRef(false);
 
   useEffect(() => {
     reducedMotionRef.current = reducedMotion;
@@ -772,6 +785,9 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       setHintShown(false);
       setTextRetryOpen(false);
       setSubmittedTextAnswer(undefined);
+      // A restored or replaced route is a new session surface: a transcript
+      // disclosure left open would be showing the previous generation's words.
+      setTranscriptOpen(false);
       stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
       resetPlaybackForGeneration();
       if (plan.action === "renew_credential") {
@@ -866,12 +882,32 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // A session that has said its last word releases the retained turn: the bytes
   // can no longer be admitted, so holding them would be a false promise.
   const sessionTerminal = Boolean(agentRecapState) || agentTerminalReason !== undefined;
+  sessionTerminalRef.current = sessionTerminal;
   useEffect(() => {
     if (!sessionTerminal) return;
     if (!agentRef.current.getRetainedAudioTurn()) return;
     discardActiveAudioTurn();
     setRetainedAudioTurn(null);
   }, [discardActiveAudioTurn, sessionTerminal]);
+
+  /**
+   * `WEBSESSION-TERMINAL-01`: the ONE terminal effect.
+   *
+   * A session that has ended stops being a live session: the microphone is
+   * released, the examiner's remaining audio is cancelled rather than left
+   * talking over the recap, every armed recovery timer and in-flight recovery
+   * request is dropped, and the transcript disclosure is closed. The recap
+   * itself is untouched — it is the only thing left on screen.
+   */
+  useEffect(() => {
+    if (!sessionTerminal) return;
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef);
+    playbackRef.current?.cancel(null);
+    clearRecoveryTimer();
+    recoveryAbortRef.current?.abort();
+    recoveryAbortRef.current = null;
+    setTranscriptOpen(false);
+  }, [clearRecoveryTimer, sessionTerminal]);
 
   useEffect(() => {
     return () => {
@@ -1004,6 +1040,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
         consentAcknowledged: recordingConsentAcknowledgedRef.current,
         liveProvider: liveProviderRef.current,
         scope: VIVA_DISCLOSURE_SCOPE,
+        sessionTerminal: sessionTerminalRef.current,
         textAnswerMode: textAnswerModeRef.current,
       })
     ) {
@@ -1435,11 +1472,19 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // With no projection there is no readiness to state, so no runtime copy is
   // produced at all — the page renders its pre-loop shell instead of asserting
   // an ingestion status the server never sent.
+  // `WEBSESSION-TERMINAL-01`: the page states completion ONLY for an authorized,
+  // complete `recap_ready` it has actually parsed and retained — Plan 04's
+  // `session_completed` state, whose authority is a durable store event. That
+  // statement is what lets success copy outrank a terminal phase or a transport
+  // close that lands after the recap.
+  const sessionCompletion: { recapPersisted: true } | undefined =
+    agent.derived.recapState?.kind === "complete" ? { recapPersisted: true } : undefined;
   const runtime = useMemo(
     () =>
       projectionReadiness
         ? projectRuntimeCopy({
             close: agent.agentState.close,
+            completion: sessionCompletion,
             deferredTurn: agent.derived.deferredTurn,
             diagnostics: agent.derived.diagnostics,
             lastServerError: agent.derived.lastServerError,
@@ -1468,6 +1513,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       agent.derived.diagnostics,
       agent.derived.lastServerError,
       agent.derived.recapState,
+      sessionCompletion,
       agent.derived.structuredErrors,
       agent.derived.termination,
       agent.derived.terminalReason,
@@ -1504,7 +1550,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       scope: VIVA_DISCLOSURE_SCOPE,
     });
   const textAnswerRequired = micState === "denied" || micState === "unsupported";
-  const textAnswerAvailable = websocketReady;
+  const textAnswerAvailable = answerSurfaceAvailable({ sessionTerminal, websocketReady });
   const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
   const textAnswerState = useMemo(
     () =>
@@ -1679,7 +1725,10 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
           sessionMode: studyProjection.session.mode,
           title: studyProjection.studySet.title,
         }}
+        onTranscriptOpenChange={setTranscriptOpen}
         transcript={agent.derived.transcript}
+        transcriptId={VIVA_SESSION_TRANSCRIPT_REGION_ID}
+        transcriptOpen={transcriptOpen}
         textAnswer={textAnswerState}
         turnTaking={turnTaking}
       />
@@ -1876,6 +1925,21 @@ function SessionPreloopShell({
       </div>
     </section>
   );
+}
+
+/**
+ * `WEBSESSION-TERMINAL-01`: whether an answer surface may exist at all.
+ *
+ * A live socket that has reached ready is what makes an answer SENDABLE, and a
+ * session that has said its last word — a complete recap, a partial recap, or a
+ * terminal reason — takes no more answers however healthy the socket still
+ * looks. Both halves have to hold.
+ */
+export function answerSurfaceAvailable(input: {
+  sessionTerminal: boolean;
+  websocketReady: boolean;
+}): boolean {
+  return input.websocketReady && !input.sessionTerminal;
 }
 
 export function textAnswerStateForSession(input: {
@@ -2212,8 +2276,13 @@ export function canStartMicrophoneCapture(input: {
   consentAcknowledged: boolean;
   liveProvider?: boolean;
   scope?: DisclosureScope;
+  sessionTerminal?: boolean;
   textAnswerMode: boolean;
 }): boolean {
+  // `WEBSESSION-TERMINAL-01`: a session that has said its last word takes no
+  // more answers. Opening the microphone after a recap would record audio no
+  // turn can ever carry.
+  if (input.sessionTerminal) return false;
   if (input.captureStarted || input.textAnswerMode) return false;
   return providerInputAllowed({
     acknowledged: input.consentAcknowledged,

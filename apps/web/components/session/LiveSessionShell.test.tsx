@@ -1313,3 +1313,140 @@ function boxesOverlap(
 ) {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
+
+/**
+ * `WEBSESSION-A11Y-02` — the live session is a landmark with a keyboard entrance.
+ *
+ * A keyboard or screen-reader learner arriving on this route lands before the
+ * backdrop canvases, the header, and the study-context bar; without a landmark
+ * and a skip target, reaching the question they are being examined on is a long
+ * blind walk. The route exposes exactly ONE `main`, and its first focusable child
+ * jumps straight to the question/answer stage.
+ */
+describe("live session landmark and skip target (WEBSESSION-A11Y-02)", () => {
+  function renderSession(state: Parameters<typeof LiveSessionShell>[0]["state"] = "listening") {
+    return renderToStaticMarkup(
+      <LiveSessionShell
+        conceptNodes={[]}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={[]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={state === "recap" ? trustedRecap : undefined}
+        reviewPlan={state === "recap" ? trustedReviewPlan : undefined}
+        runtime={runtime}
+        state={state}
+      />,
+    );
+  }
+
+  test("renders exactly one main landmark with a stable id, before and after recap", () => {
+    for (const state of ["listening", "recap"] as const) {
+      const markup = renderSession(state);
+      expect((markup.match(/<main[\s>]/g) ?? []).length).toBe(1);
+      expect(markup).toContain('id="live-session-main"');
+      expect(markup).toContain('class="live-session"');
+      // The old generic <section> root is gone, not merely wrapped.
+      expect(markup).not.toContain('<section class="live-session"');
+    }
+  });
+
+  test("the skip link is the first focusable child and targets the turn stage", () => {
+    const markup = renderSession();
+
+    expect(markup).toContain("Skip to current question and answer");
+    expect(markup).toContain('href="#live-session-turn"');
+    expect(markup).toContain('id="live-session-turn"');
+    expect(markup).toContain('tabindex="-1"');
+    // First focusable: nothing focusable may precede the skip link in source order.
+    const skipIndex = markup.indexOf("Skip to current question and answer");
+    const firstButton = markup.indexOf("<button");
+    expect(skipIndex).toBeGreaterThan(-1);
+    expect(firstButton === -1 || skipIndex < firstButton).toBe(true);
+    // Visually hidden until focused, using the existing Plan-13-owned utility.
+    const skipTag = markup.slice(markup.lastIndexOf("<a", skipIndex), skipIndex);
+    expect(skipTag).toContain("sr-only");
+  });
+});
+
+/**
+ * `WEBSESSION-TASK10-LOCAL-DATE-01` — review dates are the learner's own calendar.
+ *
+ * The instant is the server's; only its PRESENTATION is local. Extracting UTC
+ * fields tells a learner in Los Angeles to review on the 24th when their own
+ * calendar says the 23rd.
+ */
+describe("local review dates and schedule authority (WEBSESSION-TASK10-LOCAL-DATE-01)", () => {
+  const LATE_UTC_INSTANT = "2026-08-24T01:00:00.000Z";
+
+  function renderReviewPlan(dueAt: string) {
+    return renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={trustedRecap}
+        reviewPlan={[
+          {
+            authority: "server_persisted_fsrs",
+            conceptId: "atp-synthase",
+            dueAt,
+            intervalLabel: "tomorrow",
+            label: "ATP synthase",
+            status: "missed",
+          },
+        ]}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+  }
+
+  test("an instant late in the UTC day renders on the runtime-local calendar", () => {
+    const markup = renderReviewPlan(LATE_UTC_INSTANT);
+
+    const due = /Due ([^<·]+)/.exec(markup)?.[1]?.trim();
+    // `Date#getDate` / `getUTCDate` are the local and UTC calendar days WITHOUT
+    // going through the formatter under test, so this is an independent oracle
+    // in every zone: the label must carry the LOCAL day, never the UTC one.
+    const localDay = new Date(LATE_UTC_INSTANT).getDate();
+    const utcDay = new Date(LATE_UTC_INSTANT).getUTCDate();
+    expect(due).toContain(String(localDay));
+    if (utcDay !== localDay) expect(due).not.toContain(String(utcDay));
+
+    // The two zones the plan pins, asserted literally where they apply.
+    if (process.env.TZ === "America/Los_Angeles") expect(due).toBe("Aug 23, 2026");
+    if (process.env.TZ === "UTC") expect(due).toBe("Aug 24, 2026");
+  });
+
+  test("an unparseable instant renders safe copy, never Invalid Date or the raw value", () => {
+    const markup = renderReviewPlan("not-an-instant");
+
+    expect(markup).toContain("Review date unavailable");
+    expect(markup).not.toContain("Invalid Date");
+    expect(markup).not.toContain("not-an-instant");
+    expect(markup).not.toContain("NaN");
+  });
+
+  test("the projection's own schedule authority is rendered, never a hard-coded scheduler", () => {
+    const markup = renderReviewPlan("2026-08-29T09:00:00.000Z");
+
+    expect(markup).toContain("server_persisted_fsrs");
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("core_fsrs_read_time");
+  });
+});

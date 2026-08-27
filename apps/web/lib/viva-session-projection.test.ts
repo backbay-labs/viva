@@ -1711,6 +1711,151 @@ describe("projectVoiceOutcomeCopy", () => {
   });
 });
 
+/**
+ * `WEBSESSION-TERMINAL-01` — a session that said its last word is never
+ * re-described as a disconnect.
+ *
+ * A recap is the SERVER's own account of how the session ended. Once the browser
+ * has parsed and retained one, no transport fact, no reconnect attempt, and no
+ * later terminal phase may overwrite it with generic "closed"/"interrupted"
+ * copy — the learner would be told their finished session failed.
+ */
+describe("terminal recap precedence in the runtime projection (WEBSESSION-TERMINAL-01)", () => {
+  const unexpectedClose = { code: 1006, wasClean: false } as const;
+
+  test("a persisted complete recap on a closed socket is success copy, not a disconnect", () => {
+    const copy = projectRuntimeCopy({
+      close: unexpectedClose,
+      completion: { recapPersisted: true },
+      readiness: trustedReadiness,
+      recap: { kind: "complete", recap: recapPayload() },
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    expect(copy.capsuleLabel).toBe("Session complete");
+    expect(copy.marginaliaTitle).toBe("Session recap ready.");
+    expect(copy.marginaliaText).toBe("Viva saved the evidence-backed recap and review plan.");
+    expect(copy.statusLabel).toBe("session complete");
+    expect(copy.cause).toBe("recap_success");
+    expect(copy.nextActionLabel).toBe("Start a new session");
+    expect(copy.primaryActionLabel).toBe("Start a new session");
+    expect(copy.primaryActionIntent).toBe("start_session");
+
+    const rendered = JSON.stringify(copy);
+    expect(rendered).not.toContain("Session not connected");
+    expect(rendered).not.toContain("Retry agent");
+    expect(rendered).not.toContain("Reconnect");
+    expect(rendered).not.toContain("interrupted");
+  });
+
+  test("a completed session outranks a terminal phase that arrives after the recap", () => {
+    // `VOICE-TERMINAL-SESSION-PHASE-ONLY`'s `drained` reason can land right after
+    // a successful recap during a deploy drain. The learner's session finished;
+    // telling them it was "drained" would be false.
+    const copy = projectRuntimeCopy({
+      close: { code: 1001, wasClean: true },
+      completion: { recapPersisted: true },
+      readiness: trustedReadiness,
+      recap: { kind: "complete", recap: recapPayload() },
+      status: "closed",
+      terminalReason: "drained",
+    });
+
+    expect(copy.cause).toBe("recap_success");
+    expect(copy.capsuleLabel).toBe("Session complete");
+    expect(copy.primaryActionIntent).toBe("start_session");
+  });
+
+  test("a partial recap keeps its own terminal copy through a later close", () => {
+    // `VOICE-TERMINAL-PARTIAL-RECAP-THEN-PHASE`: the partial recap and the
+    // terminal phase name the SAME reason, and the learner still has a usable
+    // artifact — the terminal copy alone would hide it.
+    const copy = projectRuntimeCopy({
+      close: unexpectedClose,
+      readiness: trustedReadiness,
+      recap: { kind: "partial", partialReason: "provider_timeout", recap: recapPayload() },
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      terminalReason: "provider_timeout",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    const contractState = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+      (state) => state.terminal_reason === "provider_timeout",
+    );
+    if (!contractState) throw new Error("Expected a provider_timeout contract state");
+    expect(copy.capsuleLabel).toBe(contractState.copy.capsule_label);
+    expect(copy.statusLabel).toBe(contractState.copy.status_label);
+    expect(copy.marginaliaText).toBe(
+      `${contractState.copy.marginalia_text} The session ended with a usable partial recap you can still review.`,
+    );
+    expect(copy.marginaliaText).toContain("partial recap");
+
+    const rendered = JSON.stringify(copy);
+    expect(rendered).not.toContain("Reconnecting");
+    expect(rendered).not.toContain("Connection lost");
+    expect(rendered).not.toContain("could not reopen");
+  });
+
+  test("an unexpected close with no recap keeps the bounded recovery copy", () => {
+    const reconnecting = projectRuntimeCopy({
+      close: unexpectedClose,
+      readiness: trustedReadiness,
+      reconnect: { attempt: 2, kind: "connecting" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+    const exhausted = projectRuntimeCopy({
+      close: unexpectedClose,
+      readiness: trustedReadiness,
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    expect(reconnecting.capsuleLabel).toBe("Reconnecting…");
+    expect(reconnecting.primaryActionDisabled).toBe(true);
+    expect(exhausted.capsuleLabel).toBe("Connection lost");
+    expect(exhausted.cause).toBe("unexpected_close");
+    expect(exhausted.nextActionLabel).toBe("Reconnect");
+  });
+
+  test("completion is only a completed session when a complete recap backs it", () => {
+    // The page states `recapPersisted` about a recap it actually retained.
+    // Neither half alone is a completion: a completion claim with no complete
+    // recap behind it must not manufacture success copy over the terminal
+    // reason the server named, and a complete recap the page has not stated
+    // persisted must not outrank one either.
+    const noRecap = projectRuntimeCopy({
+      completion: { recapPersisted: true },
+      readiness: trustedReadiness,
+      status: "closed",
+      terminalReason: "provider_timeout",
+    });
+    const partialRecap = projectRuntimeCopy({
+      completion: { recapPersisted: true },
+      readiness: trustedReadiness,
+      recap: { kind: "partial", partialReason: "turn_cap", recap: recapPayload() },
+      status: "closed",
+      terminalReason: "turn_cap",
+    });
+    const bare = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      status: "closed",
+      terminalReason: "provider_timeout",
+    });
+
+    expect(noRecap.cause).toBe("provider_timeout");
+    expect(noRecap.capsuleLabel).not.toBe("Session complete");
+    expect(partialRecap.cause).toBe("turn_cap");
+    expect(partialRecap.capsuleLabel).not.toBe("Session complete");
+    expect(partialRecap.marginaliaText).toContain("partial recap");
+    expect(bare.cause).toBe("provider_timeout");
+  });
+});
+
 function recapPayload(): AgentStudySessionRecap {
   return {
     concepts: [{ concept_id: "concept-fixture-1", label: "Fixture concept", status: "strong" }],

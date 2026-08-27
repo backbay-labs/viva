@@ -2105,3 +2105,409 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
     expect(readiness.starts()).toBe(started);
   });
 });
+
+/**
+ * `WEBSESSION-TERMINAL-01` / `WEBSESSION-A11Y-01` / `WEBSESSION-A11Y-02`.
+ *
+ * The mounted route, not a fragment of it: one landmark, one keyboard entrance to
+ * the turn stage, an explicit transcript disclosure the page owns, and a terminal
+ * recap that stops the machinery while leaving the recap on screen.
+ */
+describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-TERMINAL-01)", () => {
+  type PlaybackRecord = {
+    factory: LiveSessionPageDependencies["createAudioPlaybackSink"];
+    cancels: Array<string | null | undefined>;
+    closes: number;
+    enqueued: string[];
+    resets: number;
+  };
+
+  function recordingPlayback(): PlaybackRecord {
+    const record: PlaybackRecord = {
+      cancels: [],
+      closes: 0,
+      enqueued: [],
+      factory: (() => ({
+        cancel: (responseId?: string | null) => {
+          record.cancels.push(responseId);
+        },
+        close: async () => {
+          record.closes += 1;
+        },
+        enqueue: (input: { responseId: string }) => {
+          record.enqueued.push(input.responseId);
+        },
+        getOutputLevel: () => 0,
+        getState: () => ({}),
+        resetForGeneration: () => {
+          record.resets += 1;
+        },
+        unlock: async () => ({}),
+      })) as unknown as LiveSessionPageDependencies["createAudioPlaybackSink"],
+      resets: 0,
+    };
+    return record;
+  }
+
+  const COMPLETE_RECAP = {
+    concepts: [{ concept_id: "enthalpy", label: "Enthalpy", status: "strong" }],
+    deferred_turns: 0,
+    headline: "You held the state-function argument.",
+    next_action: "Review the Gibbs derivation before the oral final.",
+    review_schedule: [
+      {
+        authority: "server_persisted_fsrs",
+        concept_id: "enthalpy",
+        due_at: "2026-09-01T00:00:00Z",
+      },
+    ],
+    schema: "viva.study_session_recap.v2",
+    source_moments: [],
+    summary: "The recap and review plan are saved.",
+    voice_session_id: ROUTE_IDENTITY.sessionId,
+  } as unknown as NonNullable<VivaAgentSessionState["recap"]>["recap"];
+
+  const COMPLETE_RECAP_STATE = {
+    kind: "complete",
+    recap: COMPLETE_RECAP,
+  } as unknown as VivaAgentSessionState["recap"];
+
+  async function step(clock: FakeReconnectClock, ms = 0, rounds = 4) {
+    for (let round = 0; round < rounds; round += 1) {
+      await act(async () => {
+        clock.advance(round === 0 ? ms : 0);
+        await new Promise<void>((resolve) => {
+          globalThis.setTimeout(resolve, 0);
+        });
+      });
+    }
+  }
+
+  async function mountSession(
+    controller: ProgrammableController,
+    clock: FakeReconnectClock,
+    overrides: Partial<LiveSessionPageDependencies> = {},
+  ) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    const dependencies = testDependencies({
+      createAgentController: controller.factory,
+      reconnectClock: clock,
+      renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      ...overrides,
+    });
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage dependencies={dependencies} />
+        </StrictMode>,
+      );
+    });
+    await step(clock);
+    return { container, root };
+  }
+
+  function transcriptToggle(container: HTMLElement): HTMLButtonElement {
+    const toggle = [...container.querySelectorAll("button")].find((button) =>
+      /transcript/i.test(button.textContent ?? ""),
+    );
+    if (!toggle) throw new Error("no transcript disclosure button");
+    return toggle as HTMLButtonElement;
+  }
+
+  test("renders exactly one main landmark and one skip link into the turn stage", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountSession(controller, clock);
+
+    expect(container.querySelectorAll("main")).toHaveLength(1);
+    expect(container.querySelector("main")?.id).toBe("live-session-main");
+
+    const skip = [...container.querySelectorAll("a")].filter(
+      (link) => link.textContent?.trim() === "Skip to current question and answer",
+    );
+    expect(skip).toHaveLength(1);
+    expect(skip[0]?.getAttribute("href")).toBe("#live-session-turn");
+
+    const turn = container.querySelector("#live-session-turn");
+    expect(turn).not.toBe(null);
+    expect(turn?.getAttribute("tabindex")).toBe("-1");
+
+    // Still exactly one main once the session has closed on its recap.
+    await act(async () => {
+      controller.push({ recap: COMPLETE_RECAP_STATE, ready: READY_FRAME, status: "open" });
+    });
+    await step(clock);
+    expect(container.querySelectorAll("main")).toHaveLength(1);
+  });
+
+  test("the skip link is hidden until focused and moves focus to the turn stage", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountSession(controller, clock);
+
+    const skip = container.querySelector<HTMLAnchorElement>("a[href='#live-session-turn']");
+    if (!skip) throw new Error("no skip link");
+
+    // `.sr-only` is Plan 13's visually-hidden utility; carrying it is what keeps
+    // the link out of the visual design until a keyboard reaches it.
+    expect(skip.classList.contains("sr-only")).toBe(true);
+
+    await act(async () => {
+      skip.focus();
+    });
+    expect(document.activeElement === skip).toBe(true);
+    expect(skip.classList.contains("sr-only")).toBe(false);
+
+    await act(async () => {
+      skip.click();
+    });
+    // Identity by id rather than by element, so a FAILING run reports the id it
+    // found instead of trying to serialize the whole document graph.
+    expect(document.activeElement?.id).toBe("live-session-turn");
+    expect(document.activeElement?.className).toContain("live-session__stage");
+
+    await act(async () => {
+      skip.blur();
+    });
+    expect(skip.classList.contains("sr-only")).toBe(true);
+  });
+
+  test("the transcript disclosure is an explicit toggle the page owns", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountSession(controller, clock);
+
+    await act(async () => {
+      controller.push({
+        ready: READY_FRAME,
+        status: "open",
+        transcript: "NADH donates electrons.",
+      });
+    });
+    await step(clock);
+
+    const toggle = transcriptToggle(container);
+    // A native button is what makes Enter and Space activate this control at all;
+    // a `<details>`/`<summary>` or a div would not carry that guarantee.
+    expect(toggle.tagName).toBe("BUTTON");
+    expect(toggle.getAttribute("type")).toBe("button");
+    expect(toggle.textContent).toContain("Show transcript");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+
+    const regionId = toggle.getAttribute("aria-controls");
+    expect(regionId).toBe("live-session-transcript");
+    const region = container.querySelector(`#${regionId}`);
+    expect(region).not.toBe(null);
+    expect(region?.hasAttribute("hidden")).toBe(true);
+
+    await act(async () => {
+      toggle.focus();
+      toggle.click();
+    });
+
+    expect(transcriptToggle(container).textContent).toContain("Hide transcript");
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector(`#${regionId}`)?.hasAttribute("hidden")).toBe(false);
+    expect(container.querySelector(`#${regionId}`)?.textContent).toContain(
+      "NADH donates electrons.",
+    );
+
+    await act(async () => {
+      transcriptToggle(container).click();
+    });
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("false");
+    // Focus stays on the control that was activated, never lost to the document.
+    expect(document.activeElement === transcriptToggle(container)).toBe(true);
+  });
+
+  test("a complete recap leaves only the approved next-session action", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const captures: number[] = [];
+    const { container } = await mountSession(controller, clock, {
+      createAudioCaptureSource: (async () => {
+        captures.push(1);
+        throw new Error("capture must not start after a recap");
+      }) as LiveSessionPageDependencies["createAudioCaptureSource"],
+      createAudioPlaybackSink: recordingPlayback().factory,
+    });
+
+    await act(async () => {
+      controller.push({ ready: READY_FRAME, status: "open" });
+    });
+    await step(clock);
+    // Acknowledging the disclosure is the gesture that lets capture be attempted
+    // at all; the microphone then resolves as unavailable in this DOM, so the
+    // typed-answer surface is required and present BEFORE the recap.
+    const acknowledge = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Acknowledge",
+    );
+    await act(async () => {
+      acknowledge?.click();
+    });
+    await step(clock);
+    expect(container.querySelector("textarea")).not.toBe(null);
+    // Before the recap the session offers no next-session action.
+    expect(container.textContent).not.toContain("Start a new session");
+
+    await act(async () => {
+      controller.push({ recap: COMPLETE_RECAP_STATE, ready: READY_FRAME, status: "open" });
+    });
+    await step(clock);
+
+    // The answer form is gone with the turn loop it belonged to…
+    expect(container.querySelector("textarea")).toBe(null);
+    // …no later gesture can reopen the microphone…
+    await act(async () => {
+      window.dispatchEvent(new Event("pointerdown"));
+      container.querySelector("button")?.click();
+    });
+    expect(captures).toEqual([]);
+    // …and the only session-level action offered is the approved next session.
+    expect(container.textContent).toContain("Start a new session");
+  });
+
+  test("a partial recap keeps its terminal reason and still ends the turn loop", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountSession(controller, clock);
+
+    await act(async () => {
+      controller.push({
+        close: { code: 1006, wasClean: false },
+        recap: {
+          kind: "partial",
+          partialReason: "provider_timeout",
+          recap: COMPLETE_RECAP,
+        } as unknown as VivaAgentSessionState["recap"],
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      });
+    });
+    await step(clock);
+
+    // The terminal reason the SERVER named is what the learner reads — never
+    // recovery copy over a session that is not coming back.
+    expect(container.textContent).toContain("Provider timeout");
+    expect(container.textContent).not.toContain("Reconnecting");
+    expect(container.textContent).not.toContain("Connection lost");
+    // The partial recap itself is still on screen, and the turn loop is over.
+    expect(container.textContent).toContain("Closing fold");
+    expect(container.querySelector("textarea")).toBe(null);
+    expect(clock.pending()).toEqual([]);
+  });
+
+  test("a recap mid-recovery aborts the attempt instead of opening a new generation", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    let releaseRenewal: (() => void) | undefined;
+    const renewalGate = new Promise<void>((resolve) => {
+      releaseRenewal = resolve;
+    });
+    let renewals = 0;
+    await mountSession(controller, clock, {
+      createAudioPlaybackSink: recordingPlayback().factory,
+      renewCredential: async ({ credential }) => {
+        renewals += 1;
+        // The ENTRY renewal must settle so the page can bootstrap; only the
+        // recovery renewal is held open.
+        if (renewals > 1) await renewalGate;
+        return { credential, status: "renewed" };
+      },
+    });
+
+    // An unclean close arms the bounded recovery loop…
+    await act(async () => {
+      controller.push({
+        close: { code: 1006, wasClean: false },
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      });
+    });
+    await step(clock);
+    // …and its first attempt starts, blocking on the credential renewal.
+    await step(clock, 600);
+    expect(renewals).toBeGreaterThan(1);
+    const generationsBefore = controller.connects.length;
+
+    // The recap lands while that renewal is still in flight. The SAME
+    // termination object is retained, so nothing but the terminal effect itself
+    // can stop the attempt.
+    await act(async () => {
+      controller.push({ recap: COMPLETE_RECAP_STATE });
+    });
+    await step(clock);
+    await act(async () => {
+      releaseRenewal?.();
+    });
+    await step(clock, 10_000);
+
+    // No replacement generation was opened for a session that has ended.
+    expect(controller.connects).toHaveLength(generationsBefore);
+    expect(clock.pending()).toEqual([]);
+  });
+
+  test("a terminal recap closes the transcript, stops the machinery, and stays on screen", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const playback = recordingPlayback();
+    const { container } = await mountSession(controller, clock, {
+      createAudioPlaybackSink: playback.factory,
+    });
+
+    await act(async () => {
+      controller.push({
+        audio: [{ frame: { pcm16_base64: "AAA=" }, responseId: "response-1" }],
+        ready: READY_FRAME,
+        status: "open",
+        transcript: "NADH donates electrons.",
+      } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+    expect(playback.enqueued).toEqual(["response-1"]);
+
+    await act(async () => {
+      transcriptToggle(container).click();
+    });
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("true");
+
+    // An unclean close arms the bounded recovery loop first…
+    await act(async () => {
+      controller.push({
+        close: { code: 1006, wasClean: false },
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      });
+    });
+    await step(clock);
+    expect(clock.pending().length).toBeGreaterThan(0);
+
+    // …and then the recap lands, together with the terminal phase a deploy
+    // drain sends right behind it.
+    await act(async () => {
+      controller.push({
+        close: { code: 1001, wasClean: true },
+        recap: COMPLETE_RECAP_STATE,
+        status: "closed",
+        terminalReason: "drained",
+      });
+    });
+    await step(clock);
+
+    // The recap is the session's last word: success copy, not a disconnect and
+    // not the drain the transport happened to report after it.
+    expect(container.textContent).toContain("Session complete");
+    expect(container.textContent).not.toContain("Session drained");
+    expect(container.textContent).toContain("You held the state-function argument.");
+    expect(container.textContent).not.toContain("Retry agent");
+    expect(container.textContent).not.toContain("Reconnecting");
+    // …and the transcript disclosure is closed deterministically by the page.
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("false");
+    // …playback is cancelled rather than left speaking over the recap.
+    expect(playback.cancels).toContain(null);
+    // …and no recovery timer survives the terminal state.
+    expect(clock.pending()).toEqual([]);
+  });
+});

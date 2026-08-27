@@ -143,7 +143,14 @@ export function MarginaliaPanel({
             question={question}
           />
         ) : null}
-        {isRecap ? <RecapFold recap={recap} reviewPlan={reviewPlan} /> : null}
+        {isRecap ? (
+          <RecapFold
+            onNextSession={onSubmitAnswer}
+            recap={recap}
+            reviewPlan={reviewPlan}
+            runtime={runtime}
+          />
+        ) : null}
         {isSource ? (
           <SourceFolio
             challengeDisabled={challengeDisabled}
@@ -320,11 +327,15 @@ function StudentHand({ answer, uncertain }: { answer: string; uncertain?: boolea
 }
 
 function RecapFold({
+  onNextSession,
   recap,
   reviewPlan,
+  runtime,
 }: {
+  onNextSession: () => void;
   recap: SessionRecap;
   reviewPlan: SessionReviewPlanItem[];
+  runtime: RuntimeCopy;
 }) {
   const masteryTiers = recapMasteryTiers(recap);
 
@@ -391,7 +402,10 @@ function RecapFold({
               <li key={item.conceptId}>
                 <span>{item.label}</span>
                 <span>
-                  {item.intervalLabel} · {formatRecapDueDate(item.dueAt)}
+                  {item.intervalLabel} · {formatRecapDueDate(item.dueAt)} ·{" "}
+                  <span className="recap-fold__authority" data-authority={item.authority}>
+                    {item.authority}
+                  </span>
                 </span>
               </li>
             ))}
@@ -428,6 +442,23 @@ function RecapFold({
         </div>
       ) : null}
       <p className="folio__footer">Conductor next action: {recap.nextAction}</p>
+      {/*
+        `WEBSESSION-TERMINAL-01`: the ONE action a closed session offers. Every
+        answer and microphone control is gone with the turn loop, so this is the
+        only way forward — and it is the approved label the learner-loop contract
+        names for the state the projection landed in, never a local invention.
+      */}
+      {runtime.primaryActionIntent === "start_session" ? (
+        <div className="margin-note__actions">
+          <SessionActionButton
+            disabled={runtime.primaryActionDisabled}
+            label={runtime.primaryActionLabel}
+            leading={<Icon color="var(--viva-paper)" name="book" size={15} strokeWidth={1.7} />}
+            onClick={onNextSession}
+            variant="primary"
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -514,17 +545,21 @@ function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["s
 }
 
 /**
- * Renders the projection's persisted due instant on the runtime-local calendar.
+ * `WEBSESSION-TASK10-LOCAL-DATE-01`: the projection's persisted due instant,
+ * rendered on the RUNTIME-LOCAL calendar.
  *
- * The instant itself is the server's; only its presentation is local, and an
- * instant that cannot be parsed renders safe copy rather than an invented date.
- * The old hard-coded "core FSRS" label is gone with the client-side scheduler
- * that produced it — the authority is the projection's own, and claiming a
- * different one on screen was a false statement about where the date came from.
+ * The instant itself is the server's; only its presentation is local.
+ * `Intl.DateTimeFormat` with the runtime's own locale and time zone is what
+ * makes `2026-08-24T01:00:00Z` read as August 23 to a learner in Los Angeles —
+ * extracting UTC calendar fields would send them to revise on the wrong day.
+ * An instant that cannot be parsed renders safe copy rather than `Invalid Date`
+ * or the raw value. The old hard-coded "core FSRS" label is gone with the
+ * client-side scheduler that produced it: the authority rendered beside the date
+ * is the projection's own.
  */
 function formatRecapDueDate(dueAt: string): string {
   const parsed = new Date(dueAt);
-  if (Number.isNaN(parsed.getTime())) return "Due date unavailable";
+  if (Number.isNaN(parsed.getTime())) return "Review date unavailable";
   return `Due ${new Intl.DateTimeFormat(undefined, {
     day: "numeric",
     month: "short",

@@ -129,7 +129,25 @@ export type RuntimeReadinessNote = {
 
 export type RuntimeMicState = "available" | "denied" | "unsupported" | "unknown";
 
-type RuntimeProjectionContext = {
+/**
+ * `WEBSESSION-TERMINAL-01`: how a session ENDED, as a first-class projection
+ * input rather than something inferred from transport state deep inside the
+ * outcome switch.
+ *
+ * `completion.recapPersisted` is the page's statement that an authorized,
+ * complete `recap_ready` was parsed and retained — Plan 04's `session_completed`
+ * state, whose authority is a durable store event. It is what licenses success
+ * copy to outrank a terminal phase that lands after the recap: the learner's
+ * session finished, and calling it "drained" or "interrupted" would be false.
+ */
+export type RuntimeCompletionProjectionInputs = {
+  recap?: VivaAgentRecapState;
+  completion?: { recapPersisted: true };
+  termination?: VivaVoiceTermination;
+  reconnectState: VivaAgentReconnectState;
+};
+
+type RuntimeProjectionContext = RuntimeCompletionProjectionInputs & {
   readiness: AgentStudySetReadiness;
   readinessProbe?: VivaAgentReadinessProbe;
   ready?: VivaReadyFrame | VivaAgentReadyEndpoint;
@@ -205,6 +223,7 @@ export function projectRuntimeCopy({
   readiness,
   ready,
   status,
+  completion,
   deferredTurn,
   diagnostics = [],
   lastServerError,
@@ -223,6 +242,7 @@ export function projectRuntimeCopy({
   ready?: VivaReadyFrame;
   readinessProbe?: VivaAgentReadinessProbe;
   status: VivaAgentConnectionStatus;
+  completion?: { recapPersisted: true };
   deferredTurn?: VivaAgentDeferredTurn;
   diagnostics?: readonly VivaAgentDiagnostic[];
   lastServerError?: Pick<VivaServerError, "code" | "retryable">;
@@ -241,21 +261,39 @@ export function projectRuntimeCopy({
   const context: RuntimeProjectionContext = {
     mic,
     close,
+    completion,
     readiness,
     readinessProbe,
     ready: readinessFacts,
+    recap,
+    reconnectState: reconnect ?? { attempts: 0, kind: "idle" },
     retainedAudioTurn,
     status,
+    termination,
     terminalReason,
     websocketReady: Boolean(ready) && status === "open",
   };
+
+  // `WEBSESSION-TERMINAL-01`: a session that has SAID ITS LAST WORD outranks
+  // every transport, terminal, and recovery fact.
+  //
+  // A completed session is one the page has seen persisted (`recapPersisted`)
+  // AND holds a complete recap for — either half alone is not a completion. A
+  // partial recap carries its own terminal reason plus a usable artifact, so it
+  // too outranks the bare terminal copy, which would hide that artifact.
+  if (completion?.recapPersisted === true && recap?.kind === "complete") {
+    return runtimeCopyFromOutcome(completedSessionOutcome(), context);
+  }
+  if (recap?.kind === "partial") {
+    return runtimeCopyFromOutcome(partialRecapOutcome(recap.partialReason), context);
+  }
 
   if (terminalReason) {
     return controlledTerminalCopy(terminalReason, context);
   }
 
-  // Terminal and recap copy always outrank recovery copy: a session that has
-  // already said its last word is never described as "Reconnecting…".
+  // Recap copy always outranks recovery copy: a session that has already said
+  // its last word is never described as "Reconnecting…".
   if (recap) {
     const recapOutcome = projectVoiceOutcomeCopy({ recap });
     if (recapOutcome) return runtimeCopyFromOutcome(recapOutcome, context);

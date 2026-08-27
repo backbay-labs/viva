@@ -18,6 +18,7 @@ import {
 } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  answerSurfaceAvailable,
   browserLifecycleReconnectPlan,
   browserSessionReconnectReason,
   canStartMicrophoneCapture,
@@ -178,6 +179,43 @@ describe("shouldStopReadinessPolling", () => {
         ready: false,
         recap: undefined,
         status: "connecting",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("answerSurfaceAvailable (WEBSESSION-TERMINAL-01)", () => {
+  test("a terminal session offers no answer surface, however healthy the socket looks", () => {
+    expect(answerSurfaceAvailable({ sessionTerminal: false, websocketReady: true })).toBe(true);
+    // A recap can land while the socket is still open and ready; the answer
+    // surface must go with the turn loop, not with the transport.
+    expect(answerSurfaceAvailable({ sessionTerminal: true, websocketReady: true })).toBe(false);
+    expect(answerSurfaceAvailable({ sessionTerminal: false, websocketReady: false })).toBe(false);
+    expect(answerSurfaceAvailable({ sessionTerminal: true, websocketReady: false })).toBe(false);
+  });
+});
+
+describe("microphone gating after a terminal session (WEBSESSION-TERMINAL-01)", () => {
+  const allowed = {
+    captureStarted: false,
+    consentAcknowledged: true,
+    liveProvider: false,
+    textAnswerMode: false,
+  } as const;
+
+  test("a session that said its last word takes no more microphone audio", () => {
+    expect(canStartMicrophoneCapture({ ...allowed })).toBe(true);
+    expect(canStartMicrophoneCapture({ ...allowed, sessionTerminal: false })).toBe(true);
+    // A recap or a terminal reason closes the turn loop: opening the microphone
+    // after it would record audio no turn can ever carry.
+    expect(canStartMicrophoneCapture({ ...allowed, sessionTerminal: true })).toBe(false);
+    // …and it outranks every other affordance, acknowledged consent included.
+    expect(
+      canStartMicrophoneCapture({
+        ...allowed,
+        consentAcknowledged: true,
+        liveProvider: true,
+        sessionTerminal: true,
       }),
     ).toBe(false);
   });
