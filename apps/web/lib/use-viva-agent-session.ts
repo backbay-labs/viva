@@ -17,6 +17,7 @@ import type {
   SessionQuestion,
   SessionRecap,
   SourceReference,
+  VivaClientTurnIntent,
   VivaVoiceTermination,
 } from "@viva/core";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -535,6 +536,13 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     retryPendingAudio: audio.retryPendingAudio,
     sendAudioChunk: audio.sendAudioChunk,
     sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,
+    sendTurnIntent: (input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>) =>
+      controllerRef.current?.sendTurnIntent(input) ?? {
+        error: { code: "socket_closed", message: "Viva agent session is not connected" },
+        retryable: true,
+        status: "socket_closed",
+        turnId: input.turnId,
+      },
     status: agentState.status,
     stop: () => controllerRef.current?.stop(),
   };

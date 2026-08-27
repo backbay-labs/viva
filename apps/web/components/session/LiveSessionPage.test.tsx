@@ -22,9 +22,11 @@ import {
   browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
+  citationChallengeTarget,
   createLiveAudioTurnDriver,
   createOpaqueAudioTurnId,
   derivedStateWithProjectedRecap,
+  disclosureAcknowledgementKey,
   drainAgentAudio,
   enterTextAnswerMode,
   isCurrentBrowserLifecycleAttempt,
@@ -33,6 +35,7 @@ import {
   type LiveAudioTurnSeam,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
+  providerInputAllowed,
   resetPlaybackCancellationStateForGeneration,
   resolveEntrySessionCredential,
   sameBrowserSessionRouteIdentity,
@@ -1234,3 +1237,180 @@ class FakeLiveCaptureSource implements VivaAudioCaptureSource {
     });
   }
 }
+
+/**
+ * `WEBSESSION-DISCLOSURE-01` under the recorded D-08 Branch A
+ * (`all_live_provider_content`) and `WEBSESSION-INTENT-01`'s stale-target guard.
+ */
+describe("live disclosure scope and typed intent targeting", () => {
+  test("D-08 Branch A gates typed answers and citation challenges, not just the mic", () => {
+    const inputs = ["microphone_audio", "typed_answer", "citation_challenge"] as const;
+
+    for (const input of inputs) {
+      expect({
+        allowed: providerInputAllowed({
+          acknowledged: false,
+          input,
+          liveProvider: true,
+          scope: "all_live_provider_content",
+        }),
+        input,
+      }).toEqual({ allowed: false, input });
+
+      expect({
+        allowed: providerInputAllowed({
+          acknowledged: true,
+          input,
+          liveProvider: true,
+          scope: "all_live_provider_content",
+        }),
+        input,
+      }).toEqual({ allowed: true, input });
+    }
+  });
+
+  test("the unselected Branch B remains executable and gates microphone audio only", () => {
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "typed_answer",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "citation_challenge",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "microphone_audio",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(false);
+  });
+
+  test("a non-live provider keeps its labelled behavior, but the mic still needs acknowledgment", () => {
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "typed_answer",
+        liveProvider: false,
+        scope: "all_live_provider_content",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "microphone_audio",
+        liveProvider: false,
+        scope: "all_live_provider_content",
+      }),
+    ).toBe(false);
+  });
+
+  test("the acknowledgment key is scoped to branch, study set, and voice session", () => {
+    expect(
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+    ).toBe("viva:disclosure:v1:all_live_provider_content:thermo-401:voice-session-9");
+    // A different scope, study set, or session is a DIFFERENT key, so none of
+    // them can inherit another's acknowledgment.
+    const keys = new Set([
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "microphone_audio_only",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "other-set",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-10",
+      }),
+    ]);
+    expect(keys.size).toBe(4);
+  });
+
+  test("microphone eligibility is decided by providerInputAllowed and nothing else", () => {
+    // Unacknowledged: refused under BOTH branches, live or not.
+    for (const scope of ["all_live_provider_content", "microphone_audio_only"] as const) {
+      for (const liveProvider of [true, false]) {
+        expect({
+          allowed: canStartMicrophoneCapture({
+            captureStarted: false,
+            consentAcknowledged: false,
+            liveProvider,
+            scope,
+            textAnswerMode: false,
+          }),
+          liveProvider,
+          scope,
+        }).toEqual({ allowed: false, liveProvider, scope });
+      }
+    }
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
+        liveProvider: true,
+        scope: "all_live_provider_content",
+        textAnswerMode: false,
+      }),
+    ).toBe(true);
+    // Lifecycle guards still apply on top of the disclosure gate.
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: true,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
+        textAnswerMode: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("a citation challenge targets only the response and source that are still current", () => {
+    expect(
+      citationChallengeTarget({
+        currentResponseId: "response-2",
+        currentSourceId: "src-lecture-5-slide-18",
+      }),
+    ).toEqual({
+      response_id: "response-2",
+      source_id: "src-lecture-5-slide-18",
+      kind: "citation_challenge",
+    });
+    // The response moved on: there is no honest target left, so the challenge is
+    // disabled rather than re-aimed at a different response.
+    expect(
+      citationChallengeTarget({ currentResponseId: undefined, currentSourceId: "src-1" }),
+    ).toBeNull();
+    expect(
+      citationChallengeTarget({ currentResponseId: "response-2", currentSourceId: undefined }),
+    ).toBeNull();
+  });
+});

@@ -3203,3 +3203,155 @@ describe("bounded voice recovery", () => {
     expect(controller.getRetainedAudioTurn()).toEqual(retainedBefore);
   });
 });
+
+/**
+ * `WEBSESSION-INTENT-01`: a learner intent is a TYPED frame. A citation
+ * challenge is not answer text and can never be graded as one.
+ */
+describe("typed learner turn intents", () => {
+  function openIntentController() {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+      url: "ws://localhost:4318/ws",
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+    return { controller, socket };
+  }
+
+  test("a citation challenge is its own typed intent, never answer text", () => {
+    const { controller, socket } = openIntentController();
+
+    const result = controller.sendTurnIntent({
+      intent: {
+        kind: "citation_challenge",
+        response_id: "response-1",
+        source_id: "src-lecture-5-slide-18",
+      },
+      turnId: "turn-challenge-1",
+    });
+
+    expect(result).toEqual({ status: "sent", turnId: "turn-challenge-1" });
+    const frames = socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)));
+    expect(frames).toHaveLength(1);
+    const intent = frames[0];
+    if (intent?.type !== "turn_intent") throw new Error("Expected a turn intent");
+    expect(intent).toEqual({
+      client_generation_id: "session_bootstrap-1",
+      intent: {
+        kind: "citation_challenge",
+        response_id: "response-1",
+        source_id: "src-lecture-5-slide-18",
+      },
+      turn_id: "turn-challenge-1",
+      type: "turn_intent",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+    const wire = socket.sent.join(" ");
+    expect(wire).not.toContain("(challenge citation)");
+    expect(wire).not.toContain("answer_text");
+    // A challenge produces no local evaluation and no mastery movement.
+    const state = controller.getState();
+    expect(state.evaluation).toBeUndefined();
+    expect(state.conceptStatuses).toEqual({});
+    expect(state.conceptStatusEvents).toEqual([]);
+  });
+
+  test("an occupied pending slot is reported as pending, not as a second frame", () => {
+    const { controller, socket } = openIntentController();
+    expect(
+      controller.sendTurnIntent({
+        intent: { kind: "answer_text", text: "first typed answer" },
+        turnId: "turn-a",
+      }),
+    ).toEqual({ status: "sent", turnId: "turn-a" });
+
+    const second = controller.sendTurnIntent({
+      intent: {
+        kind: "citation_challenge",
+        response_id: "response-1",
+        source_id: "src-lecture-5-slide-18",
+      },
+      turnId: "turn-b",
+    });
+
+    expect(second).toEqual({ status: "pending", turnId: "turn-b" });
+    expect(socket.sent.slice(1)).toHaveLength(1);
+  });
+
+  test("a closed socket is a retryable socket_closed, and typed content never enters the ledger", () => {
+    const { controller, socket } = openIntentController();
+    socket.close({ code: 1006, reason: "", wasClean: false });
+
+    const result = controller.sendTurnIntent({
+      intent: { kind: "answer_text", text: "typed while the socket was gone" },
+      turnId: "turn-closed",
+    });
+
+    expect(result.status).toBe("socket_closed");
+    if (result.status !== "socket_closed") throw new Error("Expected socket_closed");
+    expect(result.turnId).toBe("turn-closed");
+    expect(result.retryable).toBe(true);
+    expect(result.error.code).toBe("socket_closed");
+    // Typed content is NOT audio: it never reaches Plan 03's retained ledger and
+    // is never auto-replayed by the recovery path.
+    expect(controller.getRetainedAudioTurn()).toBeNull();
+    expect(JSON.stringify(controller.getState())).not.toContain("typed while the socket was gone");
+  });
+
+  test("an oversized typed answer is rejected before send, from its typed diagnostic alone", () => {
+    const { controller, socket } = openIntentController();
+    const sentBefore = socket.sent.length;
+
+    const result = controller.sendTurnIntent({
+      intent: { kind: "answer_text", text: "N".repeat(VIVA_VOICE_MAX_TEXT_FRAME_BYTES + 1) },
+      turnId: "turn-oversized",
+    });
+
+    expect(result).toEqual({
+      diagnostic: { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
+      status: "rejected",
+      turnId: "turn-oversized",
+    });
+    expect(socket.sent).toHaveLength(sentBefore);
+    expect(controller.getState().diagnostics.at(-1)).toEqual({
+      code: "VOICE_PROTOCOL_FRAME_TOO_LARGE",
+      path: "$",
+    });
+    expect(controller.getState().pendingSubmission).toBeUndefined();
+    expect(JSON.stringify(controller.getState())).not.toContain("NNNN");
+  });
+
+  test("a malformed challenge target is rejected at its own JSON path", () => {
+    const { controller, socket } = openIntentController();
+    const sentBefore = socket.sent.length;
+
+    const result = controller.sendTurnIntent({
+      intent: { kind: "citation_challenge", response_id: "  ", source_id: "src-1" },
+      turnId: "turn-bad-target",
+    });
+
+    expect(result.status).toBe("rejected");
+    if (result.status !== "rejected") throw new Error("Expected rejected");
+    expect(result.diagnostic.path).toBe("$.intent.response_id");
+    expect(socket.sent).toHaveLength(sentBefore);
+  });
+
+  test("sendText is the answer_text intent and nothing else", () => {
+    const { controller, socket } = openIntentController();
+    expect(controller.sendText("a typed answer")).toBe(true);
+
+    const frame = parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"));
+    if (frame.type !== "turn_intent") throw new Error("Expected a turn intent");
+    expect(frame.intent).toEqual({ kind: "answer_text", text: "a typed answer" });
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "text",
+    });
+  });
+});

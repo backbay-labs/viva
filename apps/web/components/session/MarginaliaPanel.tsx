@@ -43,6 +43,7 @@ export function MarginaliaPanel({
   checkingControl,
   onHint,
   onShowSource,
+  challengeDisabled,
   onChallengeSource,
   onSubmitAnswer,
   onSubmitTextAnswer,
@@ -64,6 +65,7 @@ export function MarginaliaPanel({
   checkingControl?: CheckingControl;
   onHint: () => void;
   onShowSource: () => void;
+  challengeDisabled?: boolean;
   onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
   onSubmitTextAnswer?: (answer: string) => void;
@@ -144,6 +146,7 @@ export function MarginaliaPanel({
         {isRecap ? <RecapFold recap={recap} reviewPlan={reviewPlan} /> : null}
         {isSource ? (
           <SourceFolio
+            challengeDisabled={challengeDisabled}
             onBack={onBackToQuestion}
             onChallenge={onChallengeSource ?? onTryAgain}
             question={question}

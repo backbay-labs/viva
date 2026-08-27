@@ -1155,6 +1155,77 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Acknowledge");
   });
 
+  /**
+   * `WEBSESSION-DISCLOSURE-01` under the recorded D-08 Branch A
+   * (`all_live_provider_content`): the gate covers TYPED content as well as
+   * spoken, so the session copy must say so rather than implying a
+   * microphone-only scope.
+   */
+  test("the D-08A disclosure names typed content as well as spoken content", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        consentDisclosure={{
+          acknowledged: false,
+          onAcknowledge: noop,
+          scope: "all_live_provider_content",
+        }}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={["NADH"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("typed answers");
+    expect(markup).toContain("Before Viva sends anything to the live provider");
+    expect(markup).not.toContain("Before Viva uses the microphone, acknowledge");
+  });
+
+  test("the unselected Branch B copy stays microphone-scoped and claims nothing more", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        consentDisclosure={{
+          acknowledged: false,
+          onAcknowledge: noop,
+          scope: "microphone_audio_only",
+        }}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={["NADH"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("Before Viva uses the microphone");
+    expect(markup).not.toContain("typed answers");
+  });
+
   test("renders source_reference folio as a bounded museum label", () => {
     const markup = renderSourceFolioSurface();
 

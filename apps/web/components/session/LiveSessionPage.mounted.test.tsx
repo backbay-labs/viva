@@ -23,7 +23,11 @@ import {
   type VivaAgentSessionControllerOptions,
   type VivaAgentSessionState,
 } from "../../lib/viva-agent-client";
-import { LiveSessionPage, type LiveSessionPageDependencies } from "./LiveSessionPage";
+import {
+  disclosureAcknowledgementKey,
+  LiveSessionPage,
+  type LiveSessionPageDependencies,
+} from "./LiveSessionPage";
 
 const ROUTE_IDENTITY = {
   sessionId: "voice-session-9",
@@ -92,6 +96,10 @@ function fakeControllerFactory(record: ControllerRecord) {
         status: "socket_closed",
       }),
       sendText: () => true,
+      sendTurnIntent: (input: { turnId: string }) => ({
+        status: "sent" as const,
+        turnId: input.turnId,
+      }),
       stop: () => {},
       subscribe: () => () => {},
     };
@@ -1445,5 +1453,359 @@ describe("LiveSessionPage bounded recovery (WEBSESSION-RECOVERY-01 / WEBSESSION-
       clock.advance(10_000);
     });
     expect(controller.connects).toHaveLength(before);
+  });
+});
+
+describe("LiveSessionPage typed intents and D-08A disclosure (WEBSESSION-INTENT-01 / WEBSESSION-DISCLOSURE-01)", () => {
+  type IntentRecord = {
+    factory: LiveSessionPageDependencies["createAgentController"];
+    intents: Array<{ intent: unknown; turnId: string }>;
+    texts: string[];
+    push: (next: Partial<VivaAgentSessionState>) => void;
+  };
+
+  function intentController(): IntentRecord {
+    const listeners = new Set<(next: VivaAgentSessionState) => void>();
+    let state = initialVivaAgentSessionState();
+    const socket = {} as WebSocket;
+    const closed = {
+      acceptedThroughSequence: null,
+      error: { code: "socket_closed", message: "closed" },
+      retainedFromSequence: 0,
+      retryable: true,
+      status: "socket_closed",
+    } as const;
+    const record: IntentRecord = {
+      factory: (() => ({
+        acknowledgeAudio: () => {},
+        cancel: () => {},
+        cancelAudioTurn: () => {},
+        close: () => {},
+        connect: () => socket,
+        endAudioTurn: () => closed,
+        getRetainedAudioTurn: () => null,
+        getState: () => state,
+        refreshSession: () => socket,
+        reset: () => {},
+        retryPendingAudio: () => closed,
+        sendAudioChunk: () => closed,
+        sendText: (text: string) => {
+          record.texts.push(text);
+          return true;
+        },
+        sendTurnIntent: (input: { intent: unknown; turnId: string }) => {
+          record.intents.push({ intent: input.intent, turnId: input.turnId });
+          return { status: "sent", turnId: input.turnId };
+        },
+        stop: () => {},
+        subscribe: (listener: (next: VivaAgentSessionState) => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      })) as unknown as LiveSessionPageDependencies["createAgentController"],
+      intents: [],
+      push: (next: Partial<VivaAgentSessionState>) => {
+        state = { ...state, ...next };
+        for (const listener of listeners) listener(state);
+      },
+      texts: [],
+    };
+    return record;
+  }
+
+  const LIVE_READY = {
+    brain: { configured: true, live_runtime: true, provider: "cartesia_gemini", selectable: true },
+    input_encoding: "pcm_s16le",
+    protocol: { preferred_version: 5, supported_versions: [5] },
+    sample_rate_hz: 24_000,
+    store: {
+      available: true,
+      backend: "in_memory",
+      durable: false,
+      nonce_replay_protection: true,
+      raw_audio_persistence: false,
+      transcript_persistence: false,
+      uuid_schema_translation: true,
+    },
+    type: "ready",
+    version: 5,
+  } as unknown as VivaAgentSessionState["ready"];
+
+  const SOURCE = {
+    confidence: "high" as const,
+    document_id: "chem-lec-3",
+    excerpt: "Enthalpy is a state function.",
+    retrieval_reason: "server fixture source",
+    source_id: "src-chem-lec-3-slide-11",
+    span: "slide:11",
+  };
+
+  /**
+   * A benign playback sink. The disclosure gesture legitimately unlocks
+   * playback, so the throwing default would mask the behaviour under test.
+   */
+  function inertPlaybackSink(): LiveSessionPageDependencies["createAudioPlaybackSink"] {
+    return (() => ({
+      cancel: () => {},
+      cancelResponse: () => {},
+      close: async () => {},
+      enqueue: () => {},
+      getOutputLevel: () => 0,
+      getState: () => ({
+        cancelledResponseIds: [],
+        nextSequence: 0,
+        queue: [],
+        responding: false,
+        scheduledFrameCount: 0,
+        speaking: false,
+      }),
+      reset: () => {},
+      unlock: async () => {},
+    })) as unknown as LiveSessionPageDependencies["createAudioPlaybackSink"];
+  }
+
+  async function mountIntents(
+    controller: IntentRecord,
+    overrides: Partial<LiveSessionPageDependencies> = {},
+  ) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage
+            dependencies={testDependencies({
+              createAgentController: controller.factory,
+              createAudioPlaybackSink: inertPlaybackSink(),
+              renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+              ...overrides,
+            })}
+          />
+        </StrictMode>,
+      );
+    });
+    await settle();
+    return { container, root };
+  }
+
+  function openSourceFolio(container: HTMLElement) {
+    const buttons = [...container.querySelectorAll("button")];
+    const showSource = buttons.find((button) => button.textContent?.includes("Show source"));
+    if (!showSource) throw new Error("expected a Show source control");
+    showSource.click();
+  }
+
+  test("Challenge citation sends one typed intent bound to the current response and source", async () => {
+    const controller = intentController();
+    const { container } = await mountIntents(controller);
+
+    await act(async () => {
+      controller.push({
+        activeResponseId: "response-1",
+        currentSource: SOURCE,
+        ready: LIVE_READY,
+        sources: [SOURCE],
+        status: "open",
+      });
+    });
+    await settle();
+
+    // Under D-08A nothing live is eligible until the learner acknowledges.
+    const acknowledge = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Acknowledge",
+    );
+    if (!acknowledge) throw new Error("expected the disclosure acknowledgment");
+    await act(async () => {
+      acknowledge.click();
+    });
+    await settle();
+
+    await act(async () => {
+      openSourceFolio(container);
+    });
+    await settle();
+
+    const challenge = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Challenge citation"),
+    );
+    if (!challenge) throw new Error("expected a Challenge citation control");
+    expect(challenge.disabled).toBe(false);
+    await act(async () => {
+      challenge.click();
+    });
+    await settle();
+
+    expect(controller.texts).toEqual([]);
+    expect(controller.intents).toHaveLength(1);
+    expect(controller.intents[0]?.intent).toEqual({
+      kind: "citation_challenge",
+      response_id: "response-1",
+      source_id: "src-chem-lec-3-slide-11",
+    });
+    expect(controller.intents[0]?.turnId.length).toBeGreaterThan(0);
+    expect(JSON.stringify(controller.intents)).not.toContain("(challenge citation)");
+    expect(JSON.stringify(controller.intents)).not.toContain("answer_text");
+  });
+
+  test("a stale challenge target disables the control instead of aiming at another response", async () => {
+    const controller = intentController();
+    const { container } = await mountIntents(controller);
+
+    await act(async () => {
+      controller.push({
+        activeResponseId: "response-1",
+        currentSource: SOURCE,
+        ready: LIVE_READY,
+        sources: [SOURCE],
+        status: "open",
+      });
+    });
+    await settle();
+    const acknowledge = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Acknowledge",
+    );
+    await act(async () => {
+      acknowledge?.click();
+    });
+    await settle();
+    await act(async () => {
+      openSourceFolio(container);
+    });
+    await settle();
+
+    // The current response moves on while the folio is open.
+    await act(async () => {
+      controller.push({ activeResponseId: undefined, currentSource: undefined, sources: [] });
+    });
+    await settle();
+
+    const challenge = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Challenge"),
+    );
+    if (!challenge) throw new Error("expected the challenge control to remain rendered");
+    expect(challenge.disabled).toBe(true);
+    await act(async () => {
+      challenge.click();
+    });
+    await settle();
+    expect(controller.intents).toEqual([]);
+    expect(controller.texts).toEqual([]);
+  });
+
+  test("D-08A blocks microphone capture, typed answers, and challenges before acknowledgment", async () => {
+    const controller = intentController();
+    let captureCalls = 0;
+    const { container } = await mountIntents(controller, {
+      createAudioCaptureSource: (async () => {
+        captureCalls += 1;
+        throw new Error("capture must not be constructed before acknowledgment");
+      }) as LiveSessionPageDependencies["createAudioCaptureSource"],
+    });
+
+    await act(async () => {
+      controller.push({
+        activeResponseId: "response-1",
+        currentSource: SOURCE,
+        ready: LIVE_READY,
+        sources: [SOURCE],
+        status: "open",
+      });
+    });
+    await settle();
+
+    // A pointer gesture anywhere would previously have started capture.
+    await act(async () => {
+      window.dispatchEvent(new Event("pointerdown"));
+    });
+    await settle();
+    expect(captureCalls).toBe(0);
+
+    await act(async () => {
+      openSourceFolio(container);
+    });
+    await settle();
+    const challenge = [...container.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Challenge"),
+    );
+    expect(challenge?.disabled).toBe(true);
+    await act(async () => {
+      challenge?.click();
+    });
+    await settle();
+    expect(controller.intents).toEqual([]);
+    expect(controller.texts).toEqual([]);
+  });
+
+  test("acknowledgment is a boolean scoped to this session, restored on a same-tab refresh", async () => {
+    const key = disclosureAcknowledgementKey({
+      scope: "all_live_provider_content",
+      studySetId: ROUTE_IDENTITY.studySetId,
+      voiceSessionId: ROUTE_IDENTITY.sessionId,
+    });
+    window.sessionStorage.clear();
+
+    const first = intentController();
+    const firstMount = await mountIntents(first);
+    await act(async () => {
+      first.push({ ready: LIVE_READY, status: "open" });
+    });
+    await settle();
+    const acknowledge = [...firstMount.container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Acknowledge",
+    );
+    await act(async () => {
+      acknowledge?.click();
+    });
+    await settle();
+
+    expect(window.sessionStorage.getItem(key)).toBe("1");
+    // Only a boolean: no token, no identity, no transcript, no audio.
+    const stored = Object.entries({ ...window.sessionStorage })
+      .map(([storedKey, value]) => `${storedKey}=${String(value)}`)
+      .join(" ");
+    expect(stored).not.toContain("viva1.");
+    expect(stored).not.toContain(ROUTE_IDENTITY.userId);
+
+    await act(async () => {
+      firstMount.root.unmount();
+    });
+
+    const second = intentController();
+    const secondMount = await mountIntents(second);
+    await act(async () => {
+      second.push({ ready: LIVE_READY, status: "open" });
+    });
+    await settle();
+    expect(
+      [...secondMount.container.querySelectorAll("button")].some(
+        (button) => button.textContent === "Acknowledge",
+      ),
+    ).toBe(false);
+  });
+
+  test("another session's acknowledgment is never inherited", async () => {
+    window.sessionStorage.clear();
+    window.sessionStorage.setItem(
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "some-other-set",
+        voiceSessionId: "some-other-session",
+      }),
+      "1",
+    );
+
+    const controller = intentController();
+    const { container } = await mountIntents(controller);
+    await act(async () => {
+      controller.push({ ready: LIVE_READY, status: "open" });
+    });
+    await settle();
+
+    expect(
+      [...container.querySelectorAll("button")].some(
+        (button) => button.textContent === "Acknowledge",
+      ),
+    ).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ import {
   classifyVivaVoiceTermination,
   type ManuscriptIntent,
   type PasteIngestionResponse,
+  parseVivaClientFrameJson,
   parseVivaServerFrameJson,
   type StudySet,
   sessionConfigFrame,
@@ -179,6 +180,33 @@ export type VivaAudioSendResult =
       retryable: true;
       error: VivaClientSendError;
     }>;
+
+/**
+ * `WEBSESSION-INTENT-01`: the outcome of ONE typed learner intent. `pending`
+ * (the turn slot is already occupied) and `socket_closed` (there is no live
+ * generation to carry it) are different facts, and `rejected` carries only a
+ * typed diagnostic — never the content that was refused.
+ */
+export type VivaTurnIntentSendResult =
+  | Readonly<{ status: "sent"; turnId: string }>
+  | Readonly<{ status: "pending"; turnId: string }>
+  | Readonly<{
+      status: "rejected";
+      turnId: string;
+      diagnostic: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }>;
+    }>
+  | Readonly<{
+      status: "socket_closed";
+      turnId: string;
+      retryable: true;
+      error: VivaClientSendError;
+    }>;
+
+export type VivaAgentSessionControllerTurnIntentAddition = {
+  sendTurnIntent(
+    input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>,
+  ): VivaTurnIntentSendResult;
+};
 
 export type VivaAudioChunkInput = Readonly<{
   turnId: string;
@@ -442,6 +470,9 @@ export type VivaAgentSessionController = {
   }) => WebSocket;
   reset: () => void;
   sendText: (text: string) => boolean;
+  sendTurnIntent: (
+    input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>,
+  ) => VivaTurnIntentSendResult;
   sendAudioChunk: (input: VivaAudioChunkInput) => VivaAudioSendResult;
   endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
   cancelAudioTurn: (turnId: string) => void;
@@ -1458,15 +1489,6 @@ export function createVivaAgentSessionController(
     return true;
   }
 
-  function sendTurnIntentFrame(intent: VivaClientTurnIntent): boolean {
-    return sendSubmissionFrame("text", {
-      intent,
-      turn_id: createTurnIntentId(),
-      type: "turn_intent",
-      version: VIVA_VOICE_PROTOCOL_VERSION,
-    });
-  }
-
   /**
    * A submission is refused once the session has a terminal fact or a recap:
    * after either, the wire turn the answer would belong to no longer exists, and
@@ -1600,7 +1622,51 @@ export function createVivaAgentSessionController(
       // `VOICE-TURN-001`: there is no v5 plain text frame. A typed answer is a
       // typed INTENT, bound to its own wire turn, so a citation challenge can
       // never be smuggled through the same channel as an answer.
-      return sendTurnIntentFrame({ kind: "answer_text", text });
+      return (
+        this.sendTurnIntent({
+          intent: { kind: "answer_text", text },
+          turnId: createTurnIntentId(),
+        }).status === "sent"
+      );
+    },
+    /**
+     * The one typed-intent send. The frame is serialized and then validated by
+     * PLAN 05's OWN parser before it can reach the socket, so an oversized or
+     * malformed intent is refused at the browser boundary with that parser's
+     * `{code, path}` — no second validator, no local size arithmetic, and never
+     * the refused content in a result or in state.
+     */
+    sendTurnIntent(input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>) {
+      const turnId = input.turnId;
+      const generationId = activeGeneration?.id;
+      if (!generationId) {
+        return intentSocketClosedResult(turnId, "Viva voice session has no open generation");
+      }
+      let json: string;
+      try {
+        json = JSON.stringify({
+          client_generation_id: generationId,
+          intent: input.intent,
+          turn_id: turnId,
+          type: "turn_intent",
+          version: VIVA_VOICE_PROTOCOL_VERSION,
+        });
+        parseVivaClientFrameJson(json);
+      } catch (error) {
+        const diagnostic = outboundIntentDiagnostic(error);
+        setState({ ...state, diagnostics: [...state.diagnostics, diagnostic] });
+        return { diagnostic, status: "rejected", turnId } as const;
+      }
+      if (state.pendingSubmission) return { status: "pending", turnId } as const;
+      if (state.recap || state.terminalReason) {
+        return intentSocketClosedResult(turnId, "Viva voice session is closed for submissions");
+      }
+      if (socket?.readyState !== 1) {
+        return intentSocketClosedResult(turnId, "Viva voice WebSocket is not open");
+      }
+      socket.send(json);
+      setState({ ...state, pendingSubmission: { generationId, kind: "text" } });
+      return { status: "sent", turnId } as const;
     },
     sendAudioChunk(input: VivaAudioChunkInput) {
       const bytes = input.pcm16Bytes;
@@ -1836,6 +1902,26 @@ function withClientGeneration(frame: VivaClientFrameDraft, generationId: string)
  * no transcript, and no identity — a turn id is a correlation handle, not a
  * description of what the learner said.
  */
+function intentSocketClosedResult(turnId: string, message: string): VivaTurnIntentSendResult {
+  return {
+    error: { code: "socket_closed", message },
+    retryable: true,
+    status: "socket_closed",
+    turnId,
+  };
+}
+
+/**
+ * Plan 05's typed rejection, or one fixed local field diagnostic. A thrown
+ * serialization failure is a malformed intent, never a message to display.
+ */
+function outboundIntentDiagnostic(
+  error: unknown,
+): Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> {
+  if (error instanceof VivaVoiceProtocolError) return { code: error.code, path: error.path };
+  return { code: "VOICE_PROTOCOL_INVALID_FIELD", path: "$.intent" };
+}
+
 function createTurnIntentId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `intent-${crypto.randomUUID()}`;

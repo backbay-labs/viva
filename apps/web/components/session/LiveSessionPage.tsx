@@ -5,6 +5,7 @@ import {
   type SessionRecap,
   type StudySetIngestionStatus,
   VIVA_AUDIO_MAX_TURN_SAMPLES,
+  type VivaClientTurnIntent,
 } from "@viva/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
@@ -234,6 +235,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const [textRetryOpen, setTextRetryOpen] = useState(false);
   const [submittedTextAnswer, setSubmittedTextAnswer] = useState<string>();
   const [recordingConsentAcknowledged, setRecordingConsentAcknowledged] = useState(false);
+  const acknowledgedIdentityRef = useRef<string | null>(null);
   const [playbackSpeaking, setPlaybackSpeaking] = useState(false);
   const [interruptAcknowledged, setInterruptAcknowledged] = useState(false);
   const routeIdentityRef = useRef(routeIdentity);
@@ -974,6 +976,8 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       !canStartMicrophoneCapture({
         captureStarted: captureStartedRef.current,
         consentAcknowledged: recordingConsentAcknowledgedRef.current,
+        liveProvider: liveProviderRef.current,
+        scope: VIVA_DISCLOSURE_SCOPE,
         textAnswerMode: textAnswerModeRef.current,
       })
     ) {
@@ -1073,11 +1077,54 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     void startMic();
   }, [startMic, unlockPlayback]);
 
+  /**
+   * The disclosure identity: the acknowledgment belongs to THIS study set and
+   * THIS voice session under THIS D-08 scope, and to nothing else.
+   */
+  const disclosureKey =
+    routeIdentity.studySetId && routeIdentity.sessionId
+      ? disclosureAcknowledgementKey({
+          scope: VIVA_DISCLOSURE_SCOPE,
+          studySetId: routeIdentity.studySetId,
+          voiceSessionId: routeIdentity.sessionId,
+        })
+      : null;
+
+  // Hydrate the boolean only once the route identity has resolved, and clear
+  // in-memory consent whenever that identity changes — before any capture for
+  // the new identity could start.
+  useEffect(() => {
+    if (acknowledgedIdentityRef.current === disclosureKey) return;
+    acknowledgedIdentityRef.current = disclosureKey;
+    recordingConsentAcknowledgedRef.current = false;
+    setRecordingConsentAcknowledged(false);
+    if (!disclosureKey) return;
+    let stored: string | null = null;
+    try {
+      stored = window.sessionStorage.getItem(disclosureKey);
+    } catch {
+      // A blocked or unavailable store is simply "not acknowledged".
+      stored = null;
+    }
+    if (stored === "1") {
+      recordingConsentAcknowledgedRef.current = true;
+      setRecordingConsentAcknowledged(true);
+    }
+  }, [disclosureKey]);
+
   const acknowledgeRecordingDisclosure = useCallback(() => {
     recordingConsentAcknowledgedRef.current = true;
     setRecordingConsentAcknowledged(true);
+    if (disclosureKey) {
+      try {
+        // ONLY the boolean: never a token, an identity, a transcript, or audio.
+        window.sessionStorage.setItem(disclosureKey, "1");
+      } catch {
+        // Persistence is a convenience; the in-memory acknowledgment stands.
+      }
+    }
     onUserGesture();
-  }, [onUserGesture]);
+  }, [disclosureKey, onUserGesture]);
 
   // Start listening (mic + playback unlock) on the first interaction anywhere.
   useEffect(() => {
@@ -1125,23 +1172,59 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     (answer: string) => {
       const payload = textAnswerPayload(answer);
       if (!payload) return;
+      if (
+        !providerInputAllowed({
+          acknowledged: recordingConsentAcknowledgedRef.current,
+          input: "typed_answer",
+          liveProvider: liveProviderRef.current,
+          scope: VIVA_DISCLOSURE_SCOPE,
+        })
+      ) {
+        return;
+      }
       unlockPlayback();
       activateTextAnswerMode();
       setSourceOpen(false);
       setHintShown(false);
       setTextRetryOpen(false);
       setTextAnswerEnabled(true);
-      const sent = agentRef.current.sendText(payload);
-      if (sent) setSubmittedTextAnswer(payload);
+      const result = agentRef.current.sendTurnIntent({
+        intent: { kind: "answer_text", text: payload },
+        turnId: createOpaqueIntentTurnId(),
+      });
+      // Typed content stays visible on EVERY outcome — sent, pending, rejected,
+      // or socket_closed — so the learner can retry it deliberately. It is never
+      // auto-resent, and a rejected frame is projected from its typed diagnostic
+      // alone, never from the content that was refused.
+      setSubmittedTextAnswer(payload);
+      void result;
     },
     [activateTextAnswerMode, unlockPlayback],
   );
   const challengeSource = useCallback(() => {
+    const target = citationChallengeTarget({
+      currentResponseId: challengeResponseIdRef.current,
+      currentSourceId: challengeSourceIdRef.current,
+    });
+    if (!target) return;
+    if (
+      !providerInputAllowed({
+        acknowledged: recordingConsentAcknowledgedRef.current,
+        input: "citation_challenge",
+        liveProvider: liveProviderRef.current,
+        scope: VIVA_DISCLOSURE_SCOPE,
+      })
+    ) {
+      return;
+    }
     onUserGesture();
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
-    agentRef.current.sendText("(challenge citation)");
+    // A citation challenge is its OWN typed intent. It is never answer text, it
+    // never reuses the pending answer state, and it never enters the audio
+    // ledger or the replay path.
+    agentRef.current.sendTurnIntent({ intent: target, turnId: createOpaqueIntentTurnId() });
   }, [onUserGesture]);
   const retryAgent = useCallback(() => {
     browserLifecycleAttemptRef.current += 1;
@@ -1374,6 +1457,26 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     ],
   );
   const websocketReady = Boolean(agent.agentState.ready) && agent.status === "open";
+  // The selected provider is LIVE when the server's own ready frame says so.
+  const liveProvider = agent.agentState.ready?.brain.live_runtime === true;
+  const liveProviderRef = useRef(liveProvider);
+  liveProviderRef.current = liveProvider;
+  const challengeResponseIdRef = useRef<string | undefined>(undefined);
+  challengeResponseIdRef.current = agent.agentState.activeResponseId;
+  const challengeSourceIdRef = useRef<string | undefined>(undefined);
+  challengeSourceIdRef.current =
+    agent.derived.currentSource?.sourceId ?? agent.derived.question?.source.sourceId;
+  const challengeDisabled =
+    citationChallengeTarget({
+      currentResponseId: agent.agentState.activeResponseId,
+      currentSourceId: challengeSourceIdRef.current,
+    }) === null ||
+    !providerInputAllowed({
+      acknowledged: recordingConsentAcknowledged,
+      input: "citation_challenge",
+      liveProvider,
+      scope: VIVA_DISCLOSURE_SCOPE,
+    });
   const textAnswerRequired = micState === "denied" || micState === "unsupported";
   const textAnswerAvailable = websocketReady;
   const textAnswerActive = textAnswerAvailable && (textAnswerRequired || textAnswerEnabled);
@@ -1485,9 +1588,11 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     <LiveSessionShell
       clockLabel="Local session clock"
       conceptNodes={conceptNodes}
+      challengeDisabled={challengeDisabled}
       consentDisclosure={{
         acknowledged: recordingConsentAcknowledged,
         onAcknowledge: acknowledgeRecordingDisclosure,
+        scope: VIVA_DISCLOSURE_SCOPE,
       }}
       contextLabel={sessionContextLabel}
       elapsed={elapsed}
@@ -2041,12 +2146,25 @@ export function shouldUseLiveMicAudioTransport(input: {
   );
 }
 
+/**
+ * `WEBSESSION-DISCLOSURE-01`: the microphone eligibility rule has exactly ONE
+ * home — `providerInputAllowed`. A disabled button or a hidden panel is not the
+ * gate; this is, and it runs before the capture source can be constructed.
+ */
 export function canStartMicrophoneCapture(input: {
   captureStarted: boolean;
   consentAcknowledged: boolean;
+  liveProvider?: boolean;
+  scope?: DisclosureScope;
   textAnswerMode: boolean;
 }): boolean {
-  return input.consentAcknowledged && !input.captureStarted && !input.textAnswerMode;
+  if (input.captureStarted || input.textAnswerMode) return false;
+  return providerInputAllowed({
+    acknowledged: input.consentAcknowledged,
+    input: "microphone_audio",
+    liveProvider: input.liveProvider ?? true,
+    scope: input.scope ?? VIVA_DISCLOSURE_SCOPE,
+  });
 }
 
 export function captureLevelForBloom(input: {
@@ -2063,6 +2181,77 @@ export function captureLevelForBloom(input: {
   const rms = input.frame?.rms;
   if (typeof rms === "number" && Number.isFinite(rms)) return input.meter.pushRms(rms);
   return input.meter.push(input.samples);
+}
+
+/* --------------------------------------------------------------------- *
+ * `WEBSESSION-DISCLOSURE-01` — D-08 disclosure scope.
+ * -------------------------------------------------------------------- */
+
+export type DisclosureScope = "all_live_provider_content" | "microphone_audio_only";
+
+/**
+ * The RECORDED program decision is D-08 Branch A: the acknowledgment covers ALL
+ * live provider content, typed as well as spoken. Branch B stays executable in
+ * `providerInputAllowed` so the alternative is testable, but it is not selected
+ * anywhere in this lane.
+ */
+export const VIVA_DISCLOSURE_SCOPE: DisclosureScope = "all_live_provider_content";
+
+/**
+ * The single eligibility rule for anything that could reach a provider.
+ *
+ * Microphone audio is gated before acknowledgment under BOTH branches — the
+ * capture source may not even be constructed. Under Branch A a live provider
+ * additionally gates typed answers and citation challenges, because under that
+ * branch they reach the same provider as the spoken turn. A non-live path keeps
+ * its explicitly labelled behavior for typed content.
+ */
+export function providerInputAllowed(input: {
+  acknowledged: boolean;
+  input: "microphone_audio" | "typed_answer" | "citation_challenge";
+  liveProvider: boolean;
+  scope: DisclosureScope;
+}): boolean {
+  if (input.acknowledged) return true;
+  if (input.input === "microphone_audio") return false;
+  if (!input.liveProvider) return true;
+  return input.scope === "microphone_audio_only";
+}
+
+/**
+ * A BOOLEAN's key, scoped to branch + study set + voice session. A different
+ * scope, study set, or session is a different key, so no acknowledgment can be
+ * inherited across any of them. Nothing but the boolean is ever stored.
+ */
+export function disclosureAcknowledgementKey(input: {
+  scope: DisclosureScope;
+  studySetId: string;
+  voiceSessionId: string;
+}): string {
+  return `viva:disclosure:v1:${input.scope}:${input.studySetId}:${input.voiceSessionId}`;
+}
+
+/**
+ * `WEBSESSION-INTENT-01`: the challenge target, or `null` when the response or
+ * source the learner was looking at is no longer current. A stale challenge is
+ * DISABLED rather than re-aimed at a different response.
+ */
+export function citationChallengeTarget(input: {
+  currentResponseId?: string;
+  currentSourceId?: string;
+}): VivaClientTurnIntent | null {
+  const responseId = input.currentResponseId?.trim();
+  const sourceId = input.currentSourceId?.trim();
+  if (!responseId || !sourceId) return null;
+  return { kind: "citation_challenge", response_id: responseId, source_id: sourceId };
+}
+
+/** An opaque per-intent turn id. It carries no learner or transcript material. */
+export function createOpaqueIntentTurnId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `turn-${crypto.randomUUID()}`;
+  }
+  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /** How many of the three bounded attempts the current state has already used. */

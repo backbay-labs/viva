@@ -27,6 +27,7 @@ export function LiveSessionShell({
   state,
   scene,
   runtime,
+  challengeDisabled,
   consentDisclosure,
   glyphState,
   highlightedTokens,
@@ -61,7 +62,13 @@ export function LiveSessionShell({
   state: SessionState;
   scene?: VivaSceneState;
   runtime: RuntimeCopy;
+  challengeDisabled?: boolean;
   consentDisclosure?: {
+    /**
+     * The selected D-08 branch. Restated structurally rather than imported from
+     * the page, so the shell carries no page dependency.
+     */
+    scope?: "all_live_provider_content" | "microphone_audio_only";
     acknowledged: boolean;
     onAcknowledge: () => void;
   };
@@ -124,11 +131,10 @@ export function LiveSessionShell({
             <div>
               <p className="session-consent__label">Recording disclosure</p>
               <p className="session-consent__copy">
-                Before Viva uses the microphone, acknowledge that this study session may collect
-                microphone audio, derived transcripts, answers, source-linked study events,
-                answer-attempt envelopes, nonces, and session metadata. Live mode sends audio and
-                answers to Cartesia Ink/Sonic and Google Gemini; synthetic mode stays within the
-                configured agent.
+                {(consentDisclosure.scope ?? "all_live_provider_content") ===
+                "microphone_audio_only"
+                  ? "Before Viva uses the microphone, acknowledge that this study session may collect microphone audio, derived transcripts, source-linked study events, answer-attempt envelopes, nonces, and session metadata. Live mode sends that audio to Cartesia Ink/Sonic and Google Gemini; synthetic mode stays within the configured agent."
+                  : "Before Viva sends anything to the live provider, acknowledge that this study session may collect microphone audio, typed answers, citation challenges, derived transcripts, source-linked study events, answer-attempt envelopes, nonces, and session metadata. Live mode sends spoken and typed content to Cartesia Ink/Sonic and Google Gemini; synthetic mode stays within the configured agent."}
               </p>
             </div>
             <button onClick={consentDisclosure.onAcknowledge} type="button">
@@ -164,6 +170,7 @@ export function LiveSessionShell({
             checkingControl={checkingControl}
             onBackToQuestion={onBackToQuestion}
             onHint={onHint}
+            challengeDisabled={challengeDisabled}
             onChallengeSource={onChallengeSource}
             onNextQuestion={onNextQuestion}
             onShowSource={onShowSource}
