@@ -3673,6 +3673,30 @@ describe("Viva paste ingestion request authority", () => {
     expect(body).not.toHaveProperty("course");
   });
 
+  test("a blank exam date reads as absent in the local preview, not as a set date", async () => {
+    const bodies: string[] = [];
+    const studySet = await pasteStudySetToVivaApi(
+      {
+        examDate: "   ",
+        pastedText: "Entropy of mixing is configurational.",
+        title: "Thermodynamics",
+      },
+      { apiBaseUrl: "https://agent.example", fetchImpl: capturingFetch(bodies) },
+    );
+
+    // The preview reads the SAME normalised value the request body is built
+    // from, so the two halves of this call cannot disagree about whether the
+    // learner supplied an exam date. This is a real behaviour change and is
+    // pinned here rather than assumed: `studySetFromPasteIngestionResponse`
+    // guards on `options.examDate ? ... : "Exam date optional"`, and "   " is
+    // truthy in JS, so an unnormalised blank previously reached
+    // `formatExamLabel`, parsed to `NaN`, and surfaced the false claim
+    // "Exam date set" for a box the learner left empty.
+    const body = JSON.parse(bodies[0] ?? "{}") as Record<string, unknown>;
+    expect(body).not.toHaveProperty("exam_date");
+    expect(studySet.examDateLabel).toBe("Exam date optional");
+  });
+
   test("an optional field that is only padded still sends its exact value", async () => {
     const bodies: string[] = [];
     await pasteStudySetToVivaApi(
