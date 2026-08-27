@@ -73,12 +73,27 @@ describe("Viva server-mode security headers", () => {
     expect(scriptSrc).not.toContain("'unsafe-eval'");
   });
 
-  test("allows inline style attributes explicitly and no stylesheet or font host but Google Fonts", () => {
+  test("allows inline style attributes explicitly and limits font hosts to Google Fonts", () => {
     const csp = responseCsp(proxy(serverPageRequest()));
 
     expect(directive(csp, "style-src-attr")).toBe("style-src-attr 'unsafe-inline'");
-    expect(directive(csp, "style-src")).toBe("style-src 'self' https://fonts.googleapis.com");
     expect(directive(csp, "font-src")).toBe("font-src 'self' https://fonts.gstatic.com");
+  });
+
+  /**
+   * `A-32` — lane 12's measurement found the 35 real-run CSP console violations were exclusively
+   * Next's own framework-injected `<style>` elements (framework CSS-in-JS insertion on the
+   * A-30 dynamic routes), never a mounted-UI stylesheet. `style-src-attr 'unsafe-inline'` above
+   * already covers React style attributes, so the fix is to carry this response's EXISTING nonce
+   * onto `style-src` too — never to relax it with `'unsafe-inline'`, which is explicitly rejected.
+   */
+  test("carries this response's nonce on style-src, alongside Google Fonts, never unsafe-inline [A-32]", () => {
+    const csp = responseCsp(proxy(serverPageRequest()));
+    const nonce = nonceFromCsp(directive(csp, "script-src"));
+    const styleSrc = directive(csp, "style-src");
+
+    expect(styleSrc).toBe(`style-src 'self' 'nonce-${nonce}' https://fonts.googleapis.com`);
+    expect(styleSrc).not.toContain("'unsafe-inline'");
   });
 
   test("connect-src admits only self plus the validated direct-agent origins", () => {
