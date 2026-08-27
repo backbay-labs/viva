@@ -665,16 +665,16 @@ export type VivaLibraryControlTokenVerification =
   | { outcome: "missing_secret" };
 
 export function verifyVivaLibraryControlToken(input: {
+  capability: string;
   scope: VivaLibraryControlScope;
   studySetId: string;
-  token: string;
   userId: string;
   voiceSessionId?: string | null;
 }): VivaLibraryControlTokenVerification {
   if (!bootstrapCapabilityVerificationKeys() || !canonicalWebOrigin().ok) {
     return { outcome: "missing_secret" };
   }
-  const claims = verifyLibraryControlTokenClaims(input.token);
+  const claims = verifyLibraryControlTokenClaims(input.capability);
   if (
     !claims ||
     claims.scope !== input.scope ||
@@ -705,9 +705,9 @@ export type VivaLibraryDeleteCapabilityConsumption =
  * into the single `invalid` reason so the route can return one coarse 403 for all of them.
  */
 export async function consumeVivaLibraryDeleteCapability(input: {
+  capability: string;
   scope: VivaLibraryControlScope;
   studySetId: string;
-  token: string;
   userId: string;
   voiceSessionId?: string | null;
 }): Promise<VivaLibraryDeleteCapabilityConsumption> {
@@ -721,7 +721,7 @@ export async function consumeVivaLibraryDeleteCapability(input: {
   const voiceSessionId = claims.voice_session_id;
   const outcome = await selection.store.revokeSession({
     capabilityExpiresAt: claims.expires_at,
-    capabilityHash: capabilityTokenHash(input.token),
+    capabilityHash: capabilityDigest(input.capability),
     nowSeconds: Math.floor(Date.now() / 1000),
     operation: "consume_delete_and_revoke",
     purpose: claims.scope,
@@ -741,9 +741,9 @@ export async function consumeVivaLibraryDeleteCapability(input: {
   return { ok: false, reason: outcome.reason === "unavailable" ? "unavailable" : "invalid" };
 }
 
-/** Capabilities reach the shared store only as a SHA-256 digest, never as the signed token. */
-function capabilityTokenHash(token: string): string {
-  return createHash("sha256").update(token, "utf8").digest("hex");
+/** Capabilities reach the shared store only as a SHA-256 digest, never as the signed value. */
+function capabilityDigest(capability: string): string {
+  return createHash("sha256").update(capability, "utf8").digest("hex");
 }
 
 export function attachVivaSessionBootstrapTokensToLibrarySnapshot(

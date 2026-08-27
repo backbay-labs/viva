@@ -55,6 +55,9 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   upstream.search = request.nextUrl.search;
 
+  const unsupportedControlScope = guardUnsupportedControlScope(request.method, path);
+  if (unsupportedControlScope) return unsupportedControlScope;
+
   // The destructive sequence is fixed and fail-closed: canonical origin, route/query allowlist,
   // a selectable shared store, then (inside the authorization step) constant-time capability
   // verification, one-time consumption, and only then the scoped delete credential.
@@ -70,12 +73,12 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   const ingestionOriginGuard = guardIngestionRequestOrigin(request, ingestion);
   if (ingestionOriginGuard) return ingestionOriginGuard;
 
-  const serverBearer = await serverBearerForBrowserLibraryRequest(request, path, controlTarget);
-  if (!serverBearer.ok) return serverBearer.response;
-  const { snapshotFilter } = serverBearer;
+  const authorized = await authorizeBrowserLibraryRequest(request, path, controlTarget);
+  if (!authorized.ok) return authorized.response;
+  const { snapshotFilter } = authorized;
   const headers = vivaLibraryProxyHeaders(request, {
-    forwardControlToken: !serverBearer.consumedControlToken,
-    serverBearerToken: serverBearer.token,
+    forwardBrowserCapability: !authorized.consumedCapability,
+    scopedCredential: authorized.credential,
   });
   let response: Response;
   let timedOut = false;
@@ -387,17 +390,17 @@ function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<
 
 function vivaLibraryProxyHeaders(
   request: NextRequest,
-  options: { forwardControlToken?: boolean; serverBearerToken?: string } = {},
+  options: { forwardBrowserCapability?: boolean; scopedCredential?: string } = {},
 ): Headers {
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
-  if (options.serverBearerToken) {
-    headers.set("authorization", `Bearer ${options.serverBearerToken}`);
+  if (options.scopedCredential) {
+    headers.set("authorization", `Bearer ${options.scopedCredential}`);
   } else if (authorization) {
     headers.set("authorization", authorization);
   }
   const controlToken = request.headers.get("x-viva-library-control-token");
-  if (controlToken && options.forwardControlToken !== false) {
+  if (controlToken && options.forwardBrowserCapability !== false) {
     headers.set("x-viva-library-control-token", controlToken);
   }
   const contentType = request.headers.get("content-type");
@@ -415,16 +418,16 @@ function vivaLibraryProxyOrigin(): string | null {
   return vivaCanonicalWebOrigin();
 }
 
-async function serverBearerForBrowserLibraryRequest(
+async function authorizeBrowserLibraryRequest(
   request: NextRequest,
   path: string[],
   controlTarget: LibraryControlRouteTarget | null,
 ): Promise<
   | {
-      consumedControlToken?: boolean;
+      consumedCapability?: boolean;
+      credential?: string;
       ok: true;
       snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
-      token?: string;
     }
   | { ok: false; response: NextResponse }
 > {
@@ -453,7 +456,7 @@ async function serverBearerForBrowserLibraryRequest(
     const consumption = await consumeVivaLibraryDeleteCapability({
       scope: controlTarget?.scope ?? "study_set_delete",
       studySetId: controlTarget?.studySetId ?? "",
-      token: controlToken ?? "",
+      capability: controlToken ?? "",
       userId,
       voiceSessionId: controlTarget?.voiceSessionId ?? null,
     });
@@ -466,14 +469,14 @@ async function serverBearerForBrowserLibraryRequest(
             : vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
       };
     }
-    const deleteToken = vivaAgentScopedCredential("library_delete");
-    if (!deleteToken) {
+    const scopedDelete = vivaAgentScopedCredential("library_delete");
+    if (!scopedDelete) {
       return { ok: false, response: libraryConfigUnavailableResponse(request.method, path) };
     }
-    return { consumedControlToken: true, ok: true, token: deleteToken };
+    return { consumedCapability: true, credential: scopedDelete, ok: true };
   }
-  const token = vivaAgentScopedCredential("library_read");
-  if (!token) {
+  const scopedRead = vivaAgentScopedCredential("library_read");
+  if (!scopedRead) {
     return {
       ok: false,
       response: libraryConfigUnavailableResponse(request.method, path),
@@ -509,7 +512,7 @@ async function serverBearerForBrowserLibraryRequest(
       response: libraryAccessDeniedJsonError(403, "viva_library_identity_not_allowed"),
     };
   }
-  return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
+  return { credential: scopedRead, ok: true, snapshotFilter: { allowedStudySetIds, userId } };
 }
 
 type LibraryControlRouteTarget = {
@@ -517,6 +520,21 @@ type LibraryControlRouteTarget = {
   studySetId: string | null;
   voiceSessionId: string | null;
 };
+
+/**
+ * D-04 is recorded as `CONFIRM_DELETE`: this deployment has confirmation plus permanent delete and
+ * no undo. The `POST /{study_set_id}/restore` shape is therefore not a route here, and the catch-all
+ * refuses it explicitly rather than relaying it upstream as an ordinary proxied POST.
+ *
+ * This is a path-shape match only — it mints and consumes nothing — so the D-04 Branch A absence
+ * proof still finds no restore-capability code in this file.
+ */
+function guardUnsupportedControlScope(method: string, path: string[]): NextResponse | null {
+  const restoreShape = method === "POST" && path.length === 2 && path[1] === "restore";
+  return restoreShape
+    ? libraryAccessDeniedJsonError(403, "viva_library_control_scope_not_allowed")
+    : null;
+}
 
 function guardAllowedLibraryControlRoute(
   request: NextRequest,
@@ -552,7 +570,7 @@ function guardAllowedLibraryControlRoute(
  * Step 4 makes it "separately authorized by its ingestion contract", the plan's public error
  * table defines a 403 shape only for start/refresh and destructive DELETE, and this lane may not
  * invent new public error vocabulary. Those POSTs are also handed no read, mint, or delete
- * authority by serverBearerForBrowserLibraryRequest, so nothing is silently widened.
+ * authority by authorizeBrowserLibraryRequest, so nothing is silently widened.
  *
  * The POST path is therefore an OWNED follow-up, not an unowned gap. Task 5 is the next task in
  * this plan that reworks these routes, and it must either apply the same same-origin primitive
