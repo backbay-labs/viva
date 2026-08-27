@@ -72,6 +72,7 @@ const runtime: RuntimeCopy = {
   primaryActionDisabled: false,
   primaryActionIntent: "submit_turn",
   primaryActionLabel: "I'm ready — check it",
+  readinessBoundedFailures: null,
   readinessNotes: [{ label: "Provider", state: "ready", text: "Synthetic brain ready." }],
   statusLabel: "synthetic",
   cause: "synthetic",
@@ -1448,5 +1449,40 @@ describe("local review dates and schedule authority (WEBSESSION-TASK10-LOCAL-DAT
     expect(markup).toContain("server_persisted_fsrs");
     expect(markup).not.toContain("core FSRS");
     expect(markup).not.toContain("core_fsrs_read_time");
+  });
+});
+
+/**
+ * `WEBSESSION-READY-01` Step 3 — the bounded readiness count is rendered on the
+ * READINESS STATUS ELEMENT: the ladder that already states each readiness fact,
+ * inside the session landmark, beside the sanitized unavailable copy.
+ */
+describe("bounded readiness count on the readiness ladder (WEBSESSION-READY-01)", () => {
+  const offlineRuntime: RuntimeCopy = {
+    ...runtime,
+    capsuleLabel: "Agent offline",
+    cause: "agent_offline",
+    marginaliaText: "The manuscript could not reach `/ready` or `/health/brain`.",
+    marginaliaTitle: "Agent unavailable: service offline.",
+    readinessNotes: [
+      { label: "Agent", state: "unavailable", text: "Could not reach /ready or /health/brain." },
+    ],
+    statusLabel: "agent offline",
+  };
+
+  test("an unbounded readiness poll leaves no count attribute on the ladder", () => {
+    const markup = renderRuntimeSurfaces({ ...offlineRuntime, readinessBoundedFailures: null });
+
+    expect(markup).toContain('class="readiness-ladder"');
+    expect(markup).not.toContain("data-consecutive-failures");
+  });
+
+  test("the bounded count rides the readiness ladder itself", () => {
+    const markup = renderRuntimeSurfaces({ ...offlineRuntime, readinessBoundedFailures: 3 });
+
+    const ladder = /<ul[^>]*class="readiness-ladder"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(ladder).toContain('data-consecutive-failures="3"');
+    expect(ladder).toContain('aria-label="Connected session readiness"');
+    expect(markup).toContain("Could not reach /ready or /health/brain.");
   });
 });

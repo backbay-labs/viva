@@ -223,7 +223,19 @@ function ListeningNote({
       {textAnswer?.lastAnswer ? (
         <StudentHand answer={textAnswer.lastAnswer} uncertain={textAnswer.lastAnswerUncertain} />
       ) : null}
-      <ul className="readiness-ladder" aria-label="Connected session readiness">
+      {/*
+        `WEBSESSION-READY-01` Step 3: the readiness ladder IS the readiness status
+        element, so a bounded run's count belongs here — on the element that
+        already states each readiness fact, inside the session landmark, beside
+        the ladder's own sanitized unavailable copy. `undefined` (not `null`)
+        keeps the attribute off the element entirely while the bound has not been
+        reached, so "no count" is absence rather than a rendered zero.
+      */}
+      <ul
+        className="readiness-ladder"
+        aria-label="Connected session readiness"
+        data-consecutive-failures={runtime.readinessBoundedFailures ?? undefined}
+      >
         {runtime.readinessNotes.map((note) => (
           <li className="readiness-ladder__item" data-state={note.state} key={note.label}>
             <span className="readiness-ladder__dot" />

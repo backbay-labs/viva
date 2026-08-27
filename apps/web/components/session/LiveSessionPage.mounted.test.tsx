@@ -1968,8 +1968,9 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
     const container = mountContainer();
     const root = trackRoot(createRoot(container));
     replaceBrowserSessionCredential(branchACredential());
+    const controller = programmableController();
     const dependencies = testDependencies({
-      createAgentController: programmableController().factory,
+      createAgentController: controller.factory,
       reconnectClock: clock,
       renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
       ...overrides,
@@ -1982,7 +1983,12 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
       );
     });
     await step(clock);
-    return { container, root };
+    return { container, controller, root };
+  }
+
+  /** The one element the bounded readiness count is allowed to live on. */
+  function boundedReadinessElement(container: HTMLElement): Element | null {
+    return container.querySelector("[data-consecutive-failures]");
   }
 
   test("never starts a second poll while the previous one is still settling", async () => {
@@ -2053,9 +2059,7 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
     });
 
     const failures = () =>
-      container
-        .querySelector("[data-consecutive-failures]")
-        ?.getAttribute("data-consecutive-failures") ?? null;
+      boundedReadinessElement(container)?.getAttribute("data-consecutive-failures") ?? null;
 
     // Poll 1 hits its own 4,000 ms deadline; the cadence stays 5,000 ms AFTER
     // that settlement, so each failed cycle costs 9,000 ms.
@@ -2072,15 +2076,56 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
     expect(readiness.starts()).toBe(started + 2);
     await step(clock, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
     expect(failures()).toBe("3");
-    // The bounded state is a count on the readiness status element, not a new
-    // cadence and not a stopped loop.
-    expect(container.textContent).toContain("Agent unavailable");
+    // The bounded state is a count on the READINESS STATUS ELEMENT — the ladder
+    // that already states each readiness fact — not a page-owned paragraph
+    // parked outside the landmark carrying whatever copy the ladder produced.
+    const bounded = boundedReadinessElement(container);
+    expect(bounded?.classList.contains("readiness-ladder")).toBe(true);
+    expect(bounded?.getAttribute("aria-label")).toBe("Connected session readiness");
+    expect(bounded?.closest("main")?.id).toBe("live-session-main");
+    expect(container.querySelectorAll("main")).toHaveLength(1);
+
+    // …and the copy beside it is the EXISTING sanitized readiness-unavailable
+    // copy, stated in full rather than a generic "Agent unavailable" fragment.
+    expect(container.textContent).toContain("Agent unavailable: service offline.");
+    expect(bounded?.textContent).toContain("Could not reach /ready or /health/brain");
+    // Not a new cadence and not a stopped loop.
     expect(readiness.live()).toBe(0);
 
     probe = OBSERVED_PROBE;
     await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
     expect(readiness.starts()).toBe(started + 3);
     expect(failures()).toBe(null);
+  });
+
+  test("a live ready frame clears the bounded state instead of freezing a stale count", async () => {
+    const clock = createFakeReconnectClock(0);
+    const readiness = deadlineReadiness(clock, () => OFFLINE_PROBE);
+    const { container, controller } = await mountReadiness(clock, {
+      fetchReadiness: readiness.fetchReadiness,
+    });
+
+    const failures = () =>
+      boundedReadinessElement(container)?.getAttribute("data-consecutive-failures") ?? null;
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      await step(clock, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+      if (cycle < 2) await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    }
+    expect(failures()).toBe("3");
+
+    // The socket's own ready frame is authoritative, so the poll owner stops —
+    // and a torn-down loop must not leave its last failure count frozen on a
+    // healthy session, describing an agent that is demonstrably answering.
+    const startedBeforeReady = readiness.starts();
+    await act(async () => {
+      controller.push({ ready: READY_FRAME, status: "open" });
+    });
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS * 3);
+
+    expect(failures()).toBe(null);
+    expect(readiness.starts()).toBe(startedBeforeReady);
+    expect(container.textContent).not.toContain("Agent unavailable");
   });
 
   test("a failed projection stops the readiness loop instead of polling a dead page", async () => {

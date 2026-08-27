@@ -959,6 +959,13 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const readinessRouteKey = `${routeIdentity.studySetId ?? ""}:${routeIdentity.sessionId ?? ""}`;
   // biome-ignore lint/correctness/useExhaustiveDependencies: readinessRouteKey is the supersession key — a route replacement must tear this loop down, not keep polling for the previous session.
   useEffect(() => {
+    // Every entry into this effect is a NEW poll lifecycle — the loop stopping,
+    // the loop resuming, or a superseding route replacing it — so the bound is
+    // reset here rather than only on a successful probe. Without this a run that
+    // ended bounded (three unobservable polls, then a live `ready` frame, a
+    // failed projection, or a terminal recap) would freeze its last count on the
+    // readiness element and go on describing an agent that is answering.
+    setReadinessFailures(0);
     if (stopReadinessPolling) return;
     const clock = depsRef.current.reconnectClock;
     const controller = new AbortController();
@@ -1479,10 +1486,16 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // close that lands after the recap.
   const sessionCompletion: { recapPersisted: true } | undefined =
     agent.derived.recapState?.kind === "complete" ? { recapPersisted: true } : undefined;
+  // `WEBSESSION-READY-01` Step 3: the poll owner counts and bounds; the
+  // projection decides what a bounded run may say and where the count renders.
+  const boundedReadinessFailures = readinessPollBounded(readinessFailures)
+    ? readinessFailures
+    : null;
   const runtime = useMemo(
     () =>
       projectionReadiness
         ? projectRuntimeCopy({
+            boundedReadinessFailures,
             close: agent.agentState.close,
             completion: sessionCompletion,
             deferredTurn: agent.derived.deferredTurn,
@@ -1509,6 +1522,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     [
       agent.agentState.close,
       agent.agentState.ready,
+      boundedReadinessFailures,
       agent.derived.deferredTurn,
       agent.derived.diagnostics,
       agent.derived.lastServerError,
@@ -1657,82 +1671,75 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   }
 
   return (
-    <>
-      {readinessPollBounded(readinessFailures) ? (
-        <p className="session-readiness-status" data-consecutive-failures={readinessFailures}>
-          {runtime.marginaliaTitle} {runtime.marginaliaText}
-        </p>
-      ) : null}
-      <LiveSessionShell
-        clockLabel="Local session clock"
-        conceptNodes={conceptNodes}
-        challengeDisabled={challengeDisabled}
-        consentDisclosure={{
-          acknowledged: recordingConsentAcknowledged,
-          onAcknowledge: acknowledgeRecordingDisclosure,
-          scope: VIVA_DISCLOSURE_SCOPE,
-        }}
-        contextLabel={sessionContextLabel}
-        elapsed={elapsed}
-        glyphState={glyphStateFor(effectiveState)}
-        generationId={agent.derived.generationId}
-        highlightedTokens={highlightedTokens}
-        hintShown={hintShown}
-        checkingControl={
-          effectiveState === "thinking" && websocketReady
-            ? { onCancelTurn: cancelCheckingTurn }
-            : undefined
-        }
-        levelRef={levelRef}
-        onBackToQuestion={() => setSourceOpen(false)}
-        onChallengeSource={challengeSource}
-        onEndSession={endSession}
-        onHint={() => setHintShown((shown) => !shown)}
-        onNextQuestion={submitSpokenTurn}
-        onShowSource={() => setSourceOpen(true)}
-        onSubmitAnswer={submitRuntimePrimaryAction}
-        onSubmitTextAnswer={submitTextTurn}
-        onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
-        onUseTextAnswer={() => {
-          setTextAnswerEnabled(true);
-          activateTextAnswerMode();
-        }}
-        onUseVoiceAnswer={() => {
-          textAnswerModeRef.current = false;
-          cancelActiveAudioTurn();
-          setTextAnswerEnabled(false);
-          onUserGesture();
-        }}
-        question={trace.question}
-        recap={agent.derived.recap}
-        reviewPlan={reviewPlan}
-        runtime={runtime}
-        scene={scene}
-        sourceFolio={sourceFolio}
-        state={effectiveState}
-        studyContext={{
-          activeQuestionPrompt: studyProjection.activeQuestion?.prompt ?? null,
-          concepts: studyProjection.concepts.map(({ id, label, status }) => ({
-            id,
-            label,
-            status,
-          })),
-          course: studyProjection.studySet.course,
-          examLabel: studyProjection.studySet.examLabel,
-          ingestionStatus: studyProjection.studySet.ingestionStatus,
-          progress: studyProjection.questionProgress,
-          sessionGoal: studyProjection.session.goal,
-          sessionMode: studyProjection.session.mode,
-          title: studyProjection.studySet.title,
-        }}
-        onTranscriptOpenChange={setTranscriptOpen}
-        transcript={agent.derived.transcript}
-        transcriptId={VIVA_SESSION_TRANSCRIPT_REGION_ID}
-        transcriptOpen={transcriptOpen}
-        textAnswer={textAnswerState}
-        turnTaking={turnTaking}
-      />
-    </>
+    <LiveSessionShell
+      clockLabel="Local session clock"
+      conceptNodes={conceptNodes}
+      challengeDisabled={challengeDisabled}
+      consentDisclosure={{
+        acknowledged: recordingConsentAcknowledged,
+        onAcknowledge: acknowledgeRecordingDisclosure,
+        scope: VIVA_DISCLOSURE_SCOPE,
+      }}
+      contextLabel={sessionContextLabel}
+      elapsed={elapsed}
+      glyphState={glyphStateFor(effectiveState)}
+      generationId={agent.derived.generationId}
+      highlightedTokens={highlightedTokens}
+      hintShown={hintShown}
+      checkingControl={
+        effectiveState === "thinking" && websocketReady
+          ? { onCancelTurn: cancelCheckingTurn }
+          : undefined
+      }
+      levelRef={levelRef}
+      onBackToQuestion={() => setSourceOpen(false)}
+      onChallengeSource={challengeSource}
+      onEndSession={endSession}
+      onHint={() => setHintShown((shown) => !shown)}
+      onNextQuestion={submitSpokenTurn}
+      onShowSource={() => setSourceOpen(true)}
+      onSubmitAnswer={submitRuntimePrimaryAction}
+      onSubmitTextAnswer={submitTextTurn}
+      onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
+      onUseTextAnswer={() => {
+        setTextAnswerEnabled(true);
+        activateTextAnswerMode();
+      }}
+      onUseVoiceAnswer={() => {
+        textAnswerModeRef.current = false;
+        cancelActiveAudioTurn();
+        setTextAnswerEnabled(false);
+        onUserGesture();
+      }}
+      question={trace.question}
+      recap={agent.derived.recap}
+      reviewPlan={reviewPlan}
+      runtime={runtime}
+      scene={scene}
+      sourceFolio={sourceFolio}
+      state={effectiveState}
+      studyContext={{
+        activeQuestionPrompt: studyProjection.activeQuestion?.prompt ?? null,
+        concepts: studyProjection.concepts.map(({ id, label, status }) => ({
+          id,
+          label,
+          status,
+        })),
+        course: studyProjection.studySet.course,
+        examLabel: studyProjection.studySet.examLabel,
+        ingestionStatus: studyProjection.studySet.ingestionStatus,
+        progress: studyProjection.questionProgress,
+        sessionGoal: studyProjection.session.goal,
+        sessionMode: studyProjection.session.mode,
+        title: studyProjection.studySet.title,
+      }}
+      onTranscriptOpenChange={setTranscriptOpen}
+      transcript={agent.derived.transcript}
+      transcriptId={VIVA_SESSION_TRANSCRIPT_REGION_ID}
+      transcriptOpen={transcriptOpen}
+      textAnswer={textAnswerState}
+      turnTaking={turnTaking}
+    />
   );
 }
 

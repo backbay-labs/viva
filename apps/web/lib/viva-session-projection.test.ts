@@ -467,6 +467,89 @@ describe("projectRuntimeCopy", () => {
     ).toBe(true);
   });
 
+  /**
+   * `WEBSESSION-READY-01` Step 3 — the BOUNDED readiness state.
+   *
+   * The poll owner counts consecutive polls that could not observe the agent and
+   * hands the bound down as one number. What the projection owes back is a
+   * readiness element the count can live on, and a guarantee that the copy beside
+   * that count is the readiness ladder's OWN sanitized unavailable copy — never
+   * whatever unrelated branch happened to win the ladder.
+   */
+  const OFFLINE_PROBE = {
+    apiBaseUrl: "http://127.0.0.1:4318",
+    error: "readiness endpoints did not answer within 4000 ms",
+    status: "offline",
+  } as const;
+
+  test("an unbounded readiness poll puts no count on the readiness element", () => {
+    const copy = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: OFFLINE_PROBE,
+      status: "connecting",
+    });
+
+    expect(copy.readinessBoundedFailures).toBe(null);
+  });
+
+  test("the bounded count reaches the readiness element as the poll owner counted it", () => {
+    const copy = projectRuntimeCopy({
+      boundedReadinessFailures: 3,
+      readiness: trustedReadiness,
+      readinessProbe: OFFLINE_PROBE,
+      status: "connecting",
+    });
+
+    expect(copy.readinessBoundedFailures).toBe(3);
+    // The EXISTING sanitized unavailable copy, unchanged: the bound states how
+    // long the agent has been unobservable, it does not invent new copy.
+    expect(copy.cause).toBe("agent_offline");
+    expect(copy.marginaliaTitle).toBe("Agent unavailable: service offline.");
+    expect(
+      copy.readinessNotes.some((note) => note.label === "Agent" && note.state === "unavailable"),
+    ).toBe(true);
+  });
+
+  test("a bounded readiness poll outranks reconnect copy that would hide it", () => {
+    const reconnecting = { attempt: 2, kind: "connecting" } as const;
+
+    // Unbounded, the recovery copy still owns the capsule — Task 5's contract.
+    const recovering = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      readinessProbe: OFFLINE_PROBE,
+      reconnect: reconnecting,
+      status: "connecting",
+    });
+    expect(recovering.marginaliaTitle).toBe("Reopening the session.");
+
+    // Bounded, "Reopening the session." would be a reassuring sentence about a
+    // socket with nothing to reopen, so the readiness truth wins instead.
+    const bounded = projectRuntimeCopy({
+      boundedReadinessFailures: 4,
+      readiness: trustedReadiness,
+      readinessProbe: OFFLINE_PROBE,
+      reconnect: reconnecting,
+      status: "connecting",
+    });
+    expect(bounded.marginaliaTitle).toBe("Agent unavailable: service offline.");
+    expect(bounded.readinessBoundedFailures).toBe(4);
+    expect(bounded.marginaliaTitle).not.toBe("Reopening the session.");
+  });
+
+  test("a completed session still outranks a bounded readiness poll", () => {
+    const copy = projectRuntimeCopy({
+      boundedReadinessFailures: 5,
+      completion: { recapPersisted: true },
+      readiness: trustedReadiness,
+      readinessProbe: OFFLINE_PROBE,
+      recap: { kind: "complete", recap: recapPayload() },
+      status: "closed",
+    });
+
+    expect(copy.capsuleLabel).toBe("Session complete");
+    expect(copy.marginaliaTitle).toBe("Session recap ready.");
+  });
+
   test("surfaces REST readiness as quiet marginalia for gated providers", () => {
     const copy = projectRuntimeCopy({
       readiness: trustedReadiness,

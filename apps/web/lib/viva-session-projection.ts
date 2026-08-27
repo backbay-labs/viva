@@ -109,6 +109,13 @@ export type RuntimeCopy = {
   primaryActionIntent: RuntimePrimaryActionIntent;
   primaryActionDisabled: boolean;
   primaryActionLabel: string;
+  /**
+   * `WEBSESSION-READY-01` Step 3: how many CONSECUTIVE readiness polls have
+   * failed to observe the agent, once that run has passed the poll owner's own
+   * bound — `null` while it has not. The poll owner counts and bounds; this is
+   * the number the readiness status element renders beside the readiness copy.
+   */
+  readinessBoundedFailures: number | null;
   readinessNotes: RuntimeReadinessNote[];
   statusLabel: string;
   cause: RuntimeCopyCause;
@@ -148,6 +155,13 @@ export type RuntimeCompletionProjectionInputs = {
 };
 
 type RuntimeProjectionContext = RuntimeCompletionProjectionInputs & {
+  /**
+   * The poll owner's bound, already applied: a count once three consecutive
+   * polls have failed to observe the agent, `null` before that. The projection
+   * does not own the threshold — the single poll lifecycle does — it owns what
+   * a bounded run is allowed to say and where the count is rendered.
+   */
+  boundedReadinessFailures: number | null;
   readiness: AgentStudySetReadiness;
   readinessProbe?: VivaAgentReadinessProbe;
   ready?: VivaReadyFrame | VivaAgentReadyEndpoint;
@@ -220,6 +234,7 @@ export function conceptStatusColor(status: ConceptStatus): { r: number; g: numbe
 }
 
 export function projectRuntimeCopy({
+  boundedReadinessFailures = null,
   readiness,
   ready,
   status,
@@ -238,6 +253,7 @@ export function projectRuntimeCopy({
   termination,
   terminalReason,
 }: {
+  boundedReadinessFailures?: number | null;
   readiness: AgentStudySetReadiness;
   ready?: VivaReadyFrame;
   readinessProbe?: VivaAgentReadinessProbe;
@@ -259,6 +275,7 @@ export function projectRuntimeCopy({
   const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
   const readinessFacts = ready ?? endpointReady;
   const context: RuntimeProjectionContext = {
+    boundedReadinessFailures,
     mic,
     close,
     completion,
@@ -299,8 +316,22 @@ export function projectRuntimeCopy({
     if (recapOutcome) return runtimeCopyFromOutcome(recapOutcome, context);
   }
 
-  const recovery = projectRecoveryCopy({ pendingTypedAnswer, reconnect, retainedAudioTurn });
-  if (recovery) return runtimeCopyFromOutcome(recovery, context);
+  // `WEBSESSION-READY-01` Step 3: a readiness run that has passed its bound is
+  // stated, not smoothed over. Recovery copy would otherwise answer three
+  // straight unobservable polls with "Reopening the session." — a reassuring
+  // sentence about a socket that has nothing to reopen — so while the bound
+  // holds and no readiness facts exist, the readiness-unavailable copy below is
+  // what the learner reads. Nothing above this line yields: a recap, a terminal
+  // phase, and a completed session are all still the session's last word.
+  //
+  // `!readinessFacts` is also what guarantees the ladder keeps the sanitized
+  // unavailable NOTE: no readiness facts means no live ready frame, so
+  // `probeContradictsLiveReady` cannot suppress the offline probe's own note.
+  const boundedReadinessUnavailable = boundedReadinessFailures !== null && !readinessFacts;
+  if (!boundedReadinessUnavailable) {
+    const recovery = projectRecoveryCopy({ pendingTypedAnswer, reconnect, retainedAudioTurn });
+    if (recovery) return runtimeCopyFromOutcome(recovery, context);
+  }
 
   // The ONE typed outcome switch. Auth, protocol, service, and transport copy is
   // derived from Plan 05's codes — never from a regex over diagnostic text, and
@@ -914,6 +945,7 @@ function runtimeCopy(
     | "primaryActionDisabled"
     | "primaryActionIntent"
     | "primaryActionLabel"
+    | "readinessBoundedFailures"
     | "readinessNotes"
   >,
   context: RuntimeProjectionContext,
@@ -930,6 +962,9 @@ function runtimeCopy(
     primaryActionDisabled: action.disabled,
     primaryActionIntent: action.intent ?? (action.disabled ? "disabled" : "submit_turn"),
     primaryActionLabel: action.primaryActionLabel ?? action.nextActionLabel,
+    // The bound describes the READINESS RUN, not the branch that won the copy,
+    // so it travels with every projection rather than only the offline one.
+    readinessBoundedFailures: context.boundedReadinessFailures,
     readinessNotes: runtimeReadinessNotes(context, copy.cause),
   };
 }
