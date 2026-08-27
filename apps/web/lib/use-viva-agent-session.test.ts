@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   type AgentStudySourceReference,
+  type AuthenticatedStudyProjectionV1,
   parseVivaServerFrame,
-  type StudySet,
-  seedStudySets,
+  validateAuthenticatedStudyProjectionV1,
 } from "@viva/core";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
@@ -17,7 +17,7 @@ import {
   refreshBrowserSessionToken,
   renewBrowserSessionCredential,
   replaceBrowserSessionCredential,
-  studySetToAgentSessionConfig,
+  studyProjectionToAgentSessionConfig,
   VIVA_SESSION_ENTRY_REFRESH_TIMEOUT_MS,
 } from "./use-viva-agent-session";
 import {
@@ -27,69 +27,125 @@ import {
   vivaAgentReducer,
 } from "./viva-agent-client";
 
+const THERMO_PROJECTION: AuthenticatedStudyProjectionV1 = {
+  activeQuestion: {
+    conceptId: "enthalpy",
+    id: "q-enthalpy-1",
+    prompt: "Why is enthalpy a state function?",
+    sourceCitations: [
+      {
+        confidence: "high",
+        documentId: "chem-lec-3",
+        label: "Lecture 3 · slide 11",
+        sourceId: "src-chem-lec-3-slide-11",
+        span: "slide:11",
+      },
+    ],
+  },
+  concepts: [
+    {
+      dueAt: "2026-08-27T09:00:00.000Z",
+      id: "enthalpy",
+      label: "Enthalpy",
+      lastReviewedAt: "2026-08-20T09:00:00.000Z",
+      status: "shaky",
+    },
+    {
+      dueAt: "2026-08-26T09:00:00.000Z",
+      id: "gibbs-free-energy",
+      label: "Gibbs free energy",
+      lastReviewedAt: null,
+      status: "missed",
+    },
+  ],
+  questionProgress: { completed: 2, total: 5 },
+  reviewSchedule: [
+    {
+      authority: "server_persisted_fsrs",
+      conceptId: "enthalpy",
+      dueAt: "2026-08-27T09:00:00.000Z",
+    },
+    {
+      authority: "server_persisted_fsrs",
+      conceptId: "gibbs-free-energy",
+      dueAt: "2026-08-26T09:00:00.000Z",
+    },
+  ],
+  session: { goal: null, id: "voice-session-9", mode: "quiz" },
+  studySet: {
+    course: "CHEM-401",
+    examLabel: "Oral final",
+    id: "thermo-401",
+    ingestionStatus: "ready",
+    title: "Thermodynamic State Functions",
+  },
+  version: 1,
+};
+
 describe("useVivaAgentSession adapter", () => {
-  test("maps study set to agent session config without browser source tuples", () => {
-    const studySet: StudySet = {
-      ...seedStudySets[0],
-      concepts: [
-        {
-          ...seedStudySets[0].concepts[0],
-          source: {
-            confidence: "high",
-            documentId: "lec-5",
-            excerpt: "Short trusted excerpt.",
-            label: "Lecture 5",
-            retrievalReason: "server fixture source",
-            sourceId: "src-lecture-5-slide-18",
-            span: "slide:18",
-          },
-        },
-      ],
-    };
+  test("maps the authenticated projection straight into the signed session config", () => {
+    const session = studyProjectionToAgentSessionConfig(THERMO_PROJECTION, "user-9");
 
-    const session = studySetToAgentSessionConfig(studySet, { mode: "quiz", userId: "user-1" });
-
-    expect(session.session_id).toBe("voice-session-1");
-    expect(session.user_id).toBe("user-1");
-    expect(session.study_set_id).toBe(studySet.id);
-    expect(session.active_concepts).toEqual([studySet.concepts[0].id]);
-    expect(session.source_context).toEqual([]);
-  });
-
-  test("allows explicit trusted session override for non-default local fixtures", () => {
-    const session = studySetToAgentSessionConfig(seedStudySets[0], {
-      mode: "mock",
-      sessionId: "voice-session-local-fixture",
-      userId: "user-local",
-    });
-
-    expect(session.session_id).toBe("voice-session-local-fixture");
-    expect(session.user_id).toBe("user-local");
-    expect(session.mode).toBe("mock");
-  });
-
-  test("uses server-generated study set ids before local fixture overrides", () => {
-    const studySet: StudySet = {
-      ...seedStudySets[0],
-      id: "server-study-set-1",
-      userId: "server-user-1",
-      sessionId: "server-session-1",
-      sessionToken: "signed-session-token",
-      serverOwned: true,
-      ingestionStatus: "ready",
-    };
-
-    const session = studySetToAgentSessionConfig(studySet, {
+    expect(session).toEqual({
+      active_concepts: ["enthalpy", "gibbs-free-energy"],
       mode: "quiz",
-      sessionId: "local-session-override",
-      userId: "local-user-override",
+      session_id: "voice-session-9",
+      source_context: [],
+      study_set_id: "thermo-401",
+      user_id: "user-9",
     });
-
-    expect(session.session_id).toBe("server-session-1");
-    expect(session.user_id).toBe("server-user-1");
-    expect(session.study_set_id).toBe("server-study-set-1");
-    expect(session.source_context).toEqual([]);
+    // A-25's node-10 obligation: `initial_goal` is not a v5 `session_config`
+    // member, so the session goal stays display state and never wire authority.
+    expect("initial_goal" in session).toBe(false);
     expect("session_token" in session).toBe(false);
+  });
+
+  test("takes every session fact from the projection, never from a route id or a seed", () => {
+    const session = studyProjectionToAgentSessionConfig(THERMO_PROJECTION, "user-9");
+    const serialized = JSON.stringify(session);
+
+    expect(serialized).not.toContain("biology");
+    expect(serialized).not.toContain("oxidative-phosphorylation");
+    expect(session.session_id).toBe(THERMO_PROJECTION.session.id);
+    expect(session.study_set_id).toBe(THERMO_PROJECTION.studySet.id);
+  });
+
+  test("D-03 Branch B: mode comes from the projection and no default is injected", () => {
+    const session = studyProjectionToAgentSessionConfig(THERMO_PROJECTION, "user-9");
+
+    // Branch B is one honest oral exam: the projection carries the single
+    // server-owned mode and a null goal, and the validator refuses anything
+    // else. Nothing here supplies a client-side default for either.
+    expect(session.mode).toBe(THERMO_PROJECTION.session.mode);
+    expect(THERMO_PROJECTION.session.goal).toBe(null);
+    expect(() =>
+      validateAuthenticatedStudyProjectionV1({
+        ...THERMO_PROJECTION,
+        session: { ...THERMO_PROJECTION.session, goal: "cram the whole unit" },
+      }),
+    ).toThrow();
+    expect(() =>
+      validateAuthenticatedStudyProjectionV1({
+        ...THERMO_PROJECTION,
+        session: { ...THERMO_PROJECTION.session, mode: "teach" },
+      }),
+    ).toThrow();
+  });
+
+  test("two successive projections drive active concepts without a client-side transition", () => {
+    const first = studyProjectionToAgentSessionConfig(THERMO_PROJECTION, "user-9");
+    const second = studyProjectionToAgentSessionConfig(
+      {
+        ...THERMO_PROJECTION,
+        concepts: [THERMO_PROJECTION.concepts[0]],
+        reviewSchedule: [THERMO_PROJECTION.reviewSchedule[0]],
+      } as AuthenticatedStudyProjectionV1,
+      "user-9",
+    );
+
+    expect(first.active_concepts).toEqual(["enthalpy", "gibbs-free-energy"]);
+    expect(second.active_concepts).toEqual(["enthalpy"]);
+    expect({ ...first, active_concepts: [] }).toEqual({ ...second, active_concepts: [] });
   });
 
   test("preserves full source tuple when mapping agent source to UI source", () => {
@@ -125,9 +181,43 @@ describe("useVivaAgentSession adapter", () => {
     expect(derived.question?.prompt).toBe("Explain the role of NADH in oxidative phosphorylation.");
     expect(derived.evaluation?.source.sourceId).toBe("src-lecture-5-slide-18");
     expect(derived.currentSource?.sourceId).toBe("src-lecture-5-slide-18");
-    expect(derived.currentConceptStatus).toBe("shaky");
+    expect(derived.currentConceptStatus).toBe("strong");
     expect(derived.recap?.sourceMoments[0]?.source.documentId).toBe("lec-5");
     expect(derived.canSubmitAnswer).toBe(true);
+  });
+
+  test("renders the v2 recap as emitted and fabricates no study plan", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+
+    const recap = deriveVivaAgentUiState(state).recap;
+
+    if (!recap) throw new Error("expected a recap");
+    expect(recap.headline).toBe("Strong concepts: 1 of 1.");
+    expect(recap.strongConcepts).toEqual(["Oxidative phosphorylation"]);
+    expect(recap.shakyConcepts).toEqual([]);
+    expect(recap.missedConcepts).toEqual([]);
+    expect(recap.reviewLater).toEqual([]);
+    expect(recap.nextAction).toBe("Review the scheduled concepts on their due dates.");
+    // v1's three-row "Now / Tomorrow / Next" timeline was a browser invention.
+    // The v2 recap publishes a real review schedule instead, so nothing is
+    // fabricated here.
+    expect(recap.plan).toEqual([]);
+  });
+
+  test("a source moment whose response was never graded is dropped, never guessed", () => {
+    let state = initialVivaAgentSessionState();
+    for (const frame of fullSessionFixture.server.map(parseVivaServerFrame)) {
+      state = vivaAgentReducer(state, frame);
+    }
+    const graded = deriveVivaAgentUiState(state).recap;
+    const ungraded = deriveVivaAgentUiState({ ...state, conceptStatusEvents: [] }).recap;
+
+    expect(graded?.sourceMoments).toHaveLength(1);
+    expect(graded?.sourceMoments[0]?.status).toBe("strong");
+    expect(ungraded?.sourceMoments).toEqual([]);
   });
 
   test("derives validated manuscript intents for the scene reducer", () => {

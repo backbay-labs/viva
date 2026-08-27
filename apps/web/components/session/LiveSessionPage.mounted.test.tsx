@@ -2,6 +2,7 @@
 // time) is loaded, so this stays the FIRST import in the file.
 import "../../test/setup-dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { AuthenticatedStudyProjectionV1 } from "@viva/core";
 import { act, StrictMode } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
@@ -13,6 +14,8 @@ import {
   replaceBrowserSessionCredential,
 } from "../../lib/use-viva-agent-session";
 import {
+  type AuthenticatedStudyProjectionRequest,
+  type AuthenticatedStudyProjectionResult,
   initialVivaAgentSessionState,
   type VivaAgentReadinessProbe,
   type VivaAgentSessionController,
@@ -134,6 +137,82 @@ function branchACredential(
 
 const IDLE_PROBE: VivaAgentReadinessProbe = { status: "api_missing" };
 
+/**
+ * A deliberately NON-Biology projection: nothing in it can be produced by
+ * `seedStudySets`, so any Biology string on screen would be a fabrication.
+ */
+function thermoProjection(
+  overrides: Partial<AuthenticatedStudyProjectionV1> = {},
+): AuthenticatedStudyProjectionV1 {
+  return {
+    activeQuestion: {
+      conceptId: "enthalpy",
+      id: "q-enthalpy-1",
+      prompt: "Why is enthalpy a state function?",
+      sourceCitations: [
+        {
+          confidence: "high",
+          documentId: "chem-lec-3",
+          label: "Lecture 3 · slide 11",
+          sourceId: "src-chem-lec-3-slide-11",
+          span: "slide:11",
+        },
+      ],
+    },
+    concepts: [
+      {
+        dueAt: "2026-08-29T09:00:00.000Z",
+        id: "enthalpy",
+        label: "Enthalpy",
+        lastReviewedAt: "2026-08-20T09:00:00.000Z",
+        status: "shaky",
+      },
+      {
+        dueAt: "2026-08-27T09:00:00.000Z",
+        id: "gibbs-free-energy",
+        label: "Gibbs free energy",
+        lastReviewedAt: null,
+        status: "missed",
+      },
+    ],
+    questionProgress: { completed: 2, total: 5 },
+    reviewSchedule: [
+      {
+        authority: "server_persisted_fsrs",
+        conceptId: "enthalpy",
+        dueAt: "2026-08-29T09:00:00.000Z",
+      },
+      {
+        authority: "server_persisted_fsrs",
+        conceptId: "gibbs-free-energy",
+        dueAt: "2026-08-27T09:00:00.000Z",
+      },
+    ],
+    session: { goal: null, id: ROUTE_IDENTITY.sessionId, mode: "quiz" },
+    studySet: {
+      course: "CHEM-401",
+      examLabel: "Oral final",
+      id: ROUTE_IDENTITY.studySetId,
+      ingestionStatus: "ready",
+      title: "Thermodynamic State Functions",
+    },
+    version: 1,
+    ...overrides,
+  };
+}
+
+type ProjectionRecord = { calls: Array<{ accessToken: string; studySetId: string }> };
+
+function recordingProjection(
+  record: ProjectionRecord,
+  next: (call: number) => AuthenticatedStudyProjectionResult,
+): LiveSessionPageDependencies["fetchStudyProjection"] {
+  return (async (input: AuthenticatedStudyProjectionRequest) => {
+    record.calls.push({ accessToken: input.accessToken, studySetId: input.studySetId });
+    return next(record.calls.length);
+  }) as LiveSessionPageDependencies["fetchStudyProjection"];
+}
+
 function testDependencies(
   overrides: Partial<LiveSessionPageDependencies> = {},
 ): Partial<LiveSessionPageDependencies> {
@@ -145,6 +224,10 @@ function testDependencies(
       throw new Error("playback must not start without a gesture");
     }) as LiveSessionPageDependencies["createAudioPlaybackSink"],
     fetchReadiness: (async () => IDLE_PROBE) as LiveSessionPageDependencies["fetchReadiness"],
+    fetchStudyProjection: (async () => ({
+      projection: thermoProjection(),
+      status: "ready",
+    })) as LiveSessionPageDependencies["fetchStudyProjection"],
     ...overrides,
   };
 }
@@ -579,5 +662,237 @@ describe("LiveSessionPage credential renewal (WEBSESSION-AUTH-01/02)", () => {
     });
     await settle();
     expect(controllers.connects).toEqual([]);
+  });
+});
+
+describe("LiveSessionPage authenticated projection (WEBSESSION-DATA-01/PROGRESSION-01/MODE-01)", () => {
+  async function mountWith(dependencies: Partial<LiveSessionPageDependencies>) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage dependencies={dependencies} />
+        </StrictMode>,
+      );
+    });
+    await settle();
+    return { container, root };
+  }
+
+  test("renders the server projection's own study set, concepts, progress, and schedule", async () => {
+    const controllers = newControllerRecord();
+    const projections: ProjectionRecord = { calls: [] };
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        fetchStudyProjection: recordingProjection(projections, () => ({
+          projection: thermoProjection(),
+          status: "ready",
+        })),
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    const markup = container.innerHTML;
+    expect(markup).toContain("Thermodynamic State Functions");
+    expect(markup).toContain("CHEM-401");
+    expect(markup).toContain("Oral final");
+    expect(markup).toContain("Enthalpy");
+    expect(markup).toContain("Gibbs free energy");
+    expect(markup).toContain("2 of 5 questions");
+    // No Biology seed can reach this page any more: the projection is the only
+    // read model, so there is nothing to overlay a fixture onto.
+    expect(markup).not.toContain("Biology");
+    expect(markup).not.toContain("biology-midterm");
+    expect(markup).not.toContain("oxidative phosphorylation");
+    expect(markup).not.toContain("Oxidative phosphorylation");
+
+    expect(projections.calls).toHaveLength(1);
+    expect(projections.calls[0]?.accessToken).toBe("viva1.access-a");
+    expect(projections.calls[0]?.studySetId).toBe(ROUTE_IDENTITY.studySetId);
+    expect(controllers.connects).toEqual(["session_bootstrap"]);
+  });
+
+  test("no socket opens until the projection validates", async () => {
+    const controllers = newControllerRecord();
+    let release: ((result: AuthenticatedStudyProjectionResult) => void) | undefined;
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        fetchStudyProjection: (() =>
+          new Promise<AuthenticatedStudyProjectionResult>((resolve) => {
+            release = resolve;
+          })) as LiveSessionPageDependencies["fetchStudyProjection"],
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    expect(controllers.connects).toEqual([]);
+    expect(container.innerHTML).toContain("Preparing your session");
+
+    await act(async () => {
+      release?.({ projection: thermoProjection(), status: "ready" });
+    });
+    await settle();
+    expect(controllers.connects).toEqual(["session_bootstrap"]);
+  });
+
+  test("a projection for another session is a sanitized pre-loop failure with zero sockets", async () => {
+    const controllers = newControllerRecord();
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        fetchStudyProjection: (async () => ({
+          projection: thermoProjection({
+            session: {
+              goal: null,
+              id: "voice-session-other",
+              mode: "quiz",
+            },
+          }),
+          status: "ready",
+        })) as LiveSessionPageDependencies["fetchStudyProjection"],
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    expect(controllers.connects).toEqual([]);
+    expect(container.innerHTML).toContain("invalid projection");
+    expect(container.innerHTML).not.toContain("Thermodynamic State Functions");
+    expect(container.innerHTML).not.toContain("Biology");
+  });
+
+  test("each sanitized failure cause renders its own pre-loop state and never connects", async () => {
+    const cases: Array<[AuthenticatedStudyProjectionResult, string]> = [
+      [{ cause: "unauthorized", status: "failed" }, "session auth terminal"],
+      [{ cause: "not_found", status: "failed" }, "projection not found"],
+      [{ cause: "rate_limited", retryAfterSeconds: 12, status: "failed" }, "rate limited"],
+      [{ cause: "timeout", status: "failed" }, "projection timeout"],
+      [{ cause: "invalid_projection", status: "failed" }, "invalid projection"],
+      [{ cause: "unavailable", status: "failed" }, "projection unavailable"],
+    ];
+    for (const [result, statusLabel] of cases) {
+      const controllers = newControllerRecord();
+      const { container, root } = await mountWith(
+        testDependencies({
+          createAgentController: fakeControllerFactory(controllers),
+          fetchStudyProjection: (async () =>
+            result) as LiveSessionPageDependencies["fetchStudyProjection"],
+          renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+        }),
+      );
+
+      expect(container.innerHTML).toContain(statusLabel);
+      expect(controllers.connects).toEqual([]);
+      await act(async () => {
+        root.unmount();
+      });
+    }
+  });
+
+  test("a projection the server has not finished ingesting renders that status and stays closed", async () => {
+    const controllers = newControllerRecord();
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        fetchStudyProjection: (async () => ({
+          projection: thermoProjection({
+            activeQuestion: null,
+            studySet: {
+              course: "CHEM-401",
+              examLabel: "Oral final",
+              id: ROUTE_IDENTITY.studySetId,
+              ingestionStatus: "processing",
+              title: "Thermodynamic State Functions",
+            },
+          }),
+          status: "ready",
+        })) as LiveSessionPageDependencies["fetchStudyProjection"],
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    expect(controllers.connects).toEqual([]);
+    expect(container.innerHTML).toContain("processing");
+  });
+
+  test("two successive server projections drive the question and progress with no client transition", async () => {
+    const controllers = newControllerRecord();
+    const projections: ProjectionRecord = { calls: [] };
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        fetchStudyProjection: recordingProjection(projections, (call) => ({
+          projection:
+            call === 1
+              ? thermoProjection({
+                  activeQuestion: null,
+                  studySet: {
+                    course: "CHEM-401",
+                    examLabel: "Oral final",
+                    id: ROUTE_IDENTITY.studySetId,
+                    ingestionStatus: "processing",
+                    title: "Thermodynamic State Functions",
+                  },
+                })
+              : thermoProjection({
+                  activeQuestion: {
+                    conceptId: "gibbs-free-energy",
+                    id: "q-gibbs-1",
+                    prompt: "When is Gibbs free energy negative?",
+                    sourceCitations: [],
+                  },
+                  questionProgress: { completed: 3, total: 5 },
+                }),
+          status: "ready",
+        })),
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    // The server's own ingestion status is stated, and no local `ready` is
+    // written over it: one projection, no socket, no question.
+    expect(projections.calls).toHaveLength(1);
+    expect(controllers.connects).toEqual([]);
+    expect(container.innerHTML).toContain("ingestion processing");
+    expect(container.innerHTML).not.toContain("When is Gibbs free energy negative?");
+
+    const retry = container.querySelector<HTMLButtonElement>(".session-preloop__action");
+    if (!retry) throw new Error("expected an explicit projection refetch control");
+    await act(async () => {
+      retry.click();
+    });
+    await settle();
+
+    // D-02: only a NEW server projection advances the question and the progress
+    // counter. Between the two fetches the browser selected nothing, reordered
+    // nothing, and inferred no exhaustion.
+    expect(projections.calls).toHaveLength(2);
+    expect(container.innerHTML).toContain("When is Gibbs free energy negative?");
+    expect(container.innerHTML).toContain("3 of 5 questions");
+    expect(container.innerHTML).not.toContain("2 of 5 questions");
+    expect(controllers.connects).toEqual(["session_bootstrap"]);
+  });
+
+  test("D-03 Branch B: the page shows the server's one mode and offers no selector", async () => {
+    const controllers = newControllerRecord();
+    const { container } = await mountWith(
+      testDependencies({
+        createAgentController: fakeControllerFactory(controllers),
+        renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      }),
+    );
+
+    // Branch B is one honest oral exam: the server's single mode is displayed as
+    // stated and the null goal is reported as absent rather than filled in. The
+    // page offers no mode selector and no free-text goal field, so there is no
+    // learner intent left to discard.
+    expect(container.innerHTML).toContain("quiz");
+    expect(container.innerHTML).toContain("No goal recorded");
+    expect(container.querySelector("select")).toBe(null);
+    expect(container.querySelectorAll("input[type='text']")).toHaveLength(0);
+    expect(controllers.connects).toEqual(["session_bootstrap"]);
   });
 });

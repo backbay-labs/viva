@@ -11,6 +11,7 @@ import {
   type AgentStudySessionRecap,
   type AgentStudySourceReference,
   type AgentTerminalSessionReason,
+  type AuthenticatedStudyProjectionV1,
   audioChunkClientFrame,
   audioEndClientFrame,
   type ManuscriptIntent,
@@ -23,10 +24,13 @@ import {
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
+  type VivaCancelClientFrame,
   type VivaClientFrame,
   type VivaReadyFrame,
   type VivaServerEvent,
   type VivaServerFrame,
+  type VivaStopClientFrame,
+  validateAuthenticatedStudyProjectionV1,
 } from "@viva/core";
 import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
 import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
@@ -57,29 +61,6 @@ export type VivaPasteStudySetInput = {
 export type VivaPasteStudySetOptions = {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
-};
-
-export type VivaSessionRefreshInput = {
-  sessionId: string;
-  sessionToken: string;
-  studySetId: string;
-  userId: string;
-};
-
-export type VivaSessionRefreshOptions = {
-  apiBaseUrl?: string;
-  fetchImpl?: typeof fetch;
-};
-
-export type VivaSessionRefreshResult = {
-  failure_class: null;
-  session: {
-    session_id: string;
-    study_set_id: string;
-    user_id: string;
-  };
-  session_token: string;
-  token_refresh_outcome: string;
 };
 
 export type VivaLibrarySnapshotOptions = {
@@ -223,6 +204,12 @@ export type VivaAgentManuscriptIntent = {
   intent: ManuscriptIntent;
 };
 
+export type VivaAgentConceptStatusEvent = {
+  responseId: string;
+  conceptId: string;
+  status: AgentConceptStatus;
+};
+
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
   close?: VivaAgentCloseDiagnostics;
@@ -247,6 +234,14 @@ export type VivaAgentSessionState = {
   sources: AgentStudySourceReference[];
   currentConceptStatus?: AgentConceptStatus;
   conceptStatuses: Record<string, AgentConceptStatus>;
+  /**
+   * Every graded concept status in arrival order, keyed by the response that
+   * produced it. The v2 recap's `source_moments` name only a `response_id` and a
+   * `source_id`, so this is the server's OWN link between a cited source and the
+   * status the same turn was graded at — without it, a recap source moment could
+   * only be labelled by guessing.
+   */
+  conceptStatusEvents: VivaAgentConceptStatusEvent[];
   manuscriptIntents: VivaAgentManuscriptIntent[];
   recap?: AgentStudySessionRecap;
   audio: VivaAgentAudioOutput[];
@@ -577,27 +572,169 @@ export async function deleteVivaSessionHistory(
   return response.json();
 }
 
-export async function refreshVivaSessionToken(
-  input: VivaSessionRefreshInput,
-  options: VivaSessionRefreshOptions = {},
-): Promise<VivaSessionRefreshResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const base = options.apiBaseUrl ? trimTrailingSlash(options.apiBaseUrl) : "";
-  const response = await fetchImpl(`${base}/api/viva-session/refresh`, {
-    body: JSON.stringify({
-      session_id: input.sessionId,
-      session_token: input.sessionToken,
-      study_set_id: input.studySetId,
-      user_id: input.userId,
-    }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
-  const body = (await response.json().catch(() => null)) as unknown;
-  if (!response.ok || !isVivaSessionRefreshResult(body)) {
-    throw new Error("Viva session refresh failed");
+/* --------------------------------------------------------------------- *
+ * `WEBSESSION-DATA-01` — the authenticated study projection client.
+ *
+ * This is the ONLY study/session read model the live session renders. There is
+ * no library-metadata fallback and no seed overlay: a missing, invalid,
+ * mismatched, or unavailable projection is a sanitized pre-loop failure.
+ * -------------------------------------------------------------------- */
+
+export type AuthenticatedStudyProjectionRequest = Readonly<{
+  studySetId: string;
+  voiceSessionId: string;
+  accessToken: string;
+  signal: AbortSignal;
+}>;
+
+export type AuthenticatedStudyProjectionFailureCause =
+  | "invalid_request"
+  | "unauthorized"
+  | "not_found"
+  | "rate_limited"
+  | "timeout"
+  | "invalid_projection"
+  | "unavailable";
+
+export type AuthenticatedStudyProjectionResult =
+  | { status: "ready"; projection: AuthenticatedStudyProjectionV1 }
+  | {
+      status: "failed";
+      cause: AuthenticatedStudyProjectionFailureCause;
+      retryAfterSeconds?: number;
+    };
+
+/** The browser's own per-attempt deadline, matching Plan 11's BFF deadline. */
+export const VIVA_STUDY_PROJECTION_TIMEOUT_MS = 8_000;
+
+type ProjectionAttemptOutcome = {
+  result: AuthenticatedStudyProjectionResult;
+  retryable: boolean;
+};
+
+/**
+ * Fetches and validates the authenticated study projection.
+ *
+ * The request carries the signed access token in `authorization` and NOTHING in
+ * the URL: a credential in a query string is a credential in every proxy log and
+ * `Referer` header. `Sec-Fetch-Site` is deliberately NOT set — it is a forbidden
+ * header name, so a script that tried would have it dropped; the browser's own
+ * same-origin fetch metadata is what satisfies Plan 11's `same-origin` guard, and
+ * that is exactly why this must stay a same-origin relative URL.
+ *
+ * Exactly one retry, and only after a 502 or a 504, each with its own fresh
+ * 8,000 ms deadline. 400/401/404/429 are answers, not outages, and the 503 the
+ * BFF emits when the shared `SessionSecurityStore` is unavailable is a stop —
+ * retrying it would only spend more admission budget, and there is no agent
+ * fallback to fall through to.
+ */
+export async function fetchAuthenticatedStudyProjection(
+  input: AuthenticatedStudyProjectionRequest,
+  fetchImpl: typeof fetch = fetch,
+): Promise<AuthenticatedStudyProjectionResult> {
+  let attempt = await attemptAuthenticatedStudyProjection(input, fetchImpl);
+  if (attempt.retryable && !input.signal.aborted) {
+    attempt = await attemptAuthenticatedStudyProjection(input, fetchImpl);
   }
-  return body;
+  return attempt.result;
+}
+
+async function attemptAuthenticatedStudyProjection(
+  input: AuthenticatedStudyProjectionRequest,
+  fetchImpl: typeof fetch,
+): Promise<ProjectionAttemptOutcome> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, VIVA_STUDY_PROJECTION_TIMEOUT_MS);
+  const forwardAbort = () => controller.abort();
+  if (input.signal.aborted) forwardAbort();
+  input.signal.addEventListener("abort", forwardAbort, { once: true });
+
+  try {
+    const response = await fetchImpl(
+      `/api/viva-session/projection?${new URLSearchParams({
+        study_set_id: input.studySetId,
+        voice_session_id: input.voiceSessionId,
+      })}`,
+      {
+        cache: "no-store",
+        headers: { authorization: `Bearer ${input.accessToken}` },
+        method: "GET",
+        signal: controller.signal,
+      },
+    );
+    if (timedOut) return projectionFailure("timeout");
+    if (response.status === 200) {
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        return projectionFailure("invalid_projection");
+      }
+      try {
+        return {
+          result: { projection: validateAuthenticatedStudyProjectionV1(body), status: "ready" },
+          retryable: false,
+        };
+      } catch {
+        // The validator's message names fields and values from an untrusted
+        // upstream body; only the coarse cause is allowed out of this function.
+        return projectionFailure("invalid_projection");
+      }
+    }
+    return projectionStatusFailure(response);
+  } catch {
+    return projectionFailure(timedOut ? "timeout" : "unavailable");
+  } finally {
+    clearTimeout(timer);
+    input.signal.removeEventListener("abort", forwardAbort);
+  }
+}
+
+function projectionFailure(
+  cause: AuthenticatedStudyProjectionFailureCause,
+  options: { retryable?: boolean; retryAfterSeconds?: number } = {},
+): ProjectionAttemptOutcome {
+  return {
+    result:
+      options.retryAfterSeconds === undefined
+        ? { cause, status: "failed" }
+        : { cause, retryAfterSeconds: options.retryAfterSeconds, status: "failed" },
+    retryable: options.retryable === true,
+  };
+}
+
+function projectionStatusFailure(response: Response): ProjectionAttemptOutcome {
+  switch (response.status) {
+    case 400:
+      return projectionFailure("invalid_request");
+    case 401:
+    case 403:
+      return projectionFailure("unauthorized");
+    case 404:
+      return projectionFailure("not_found");
+    case 429:
+      return projectionFailure("rate_limited", {
+        retryAfterSeconds: projectionRetryAfterSeconds(response.headers.get("retry-after")),
+      });
+    case 502:
+      return projectionFailure("unavailable", { retryable: true });
+    case 504:
+      return projectionFailure("timeout", { retryable: true });
+    default:
+      return projectionFailure("unavailable");
+  }
+}
+
+/** Whole delta-seconds only; a date-form or non-numeric hint is no hint at all. */
+function projectionRetryAfterSeconds(value: string | null): number | undefined {
+  const raw = value?.trim();
+  if (!raw || !/^[0-9]+$/.test(raw)) return undefined;
+  const seconds = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined;
 }
 
 function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
@@ -611,20 +748,6 @@ function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
     throw new Error("Viva API URL is unavailable");
   }
   return apiBaseUrl;
-}
-
-function isVivaSessionRefreshResult(value: unknown): value is VivaSessionRefreshResult {
-  return (
-    isRecord(value) &&
-    value.failure_class === null &&
-    isRecord(value.session) &&
-    typeof value.session.session_id === "string" &&
-    typeof value.session.study_set_id === "string" &&
-    typeof value.session.user_id === "string" &&
-    typeof value.session_token === "string" &&
-    value.session_token.trim().length > 0 &&
-    typeof value.token_refresh_outcome === "string"
-  );
 }
 
 function configuredVivaAgentHttpBaseUrl(): string | undefined {
@@ -672,6 +795,7 @@ export function initialVivaAgentSessionState(): VivaAgentSessionState {
     transcript: "",
     sources: [],
     conceptStatuses: {},
+    conceptStatusEvents: [],
     manuscriptIntents: [],
     audio: [],
     cancelledResponseIds: [],
@@ -777,6 +901,14 @@ export function vivaAgentReducer(
         ...state,
         currentConceptStatus: event.status,
         conceptStatuses: { ...state.conceptStatuses, [event.concept_id]: event.status },
+        conceptStatusEvents: [
+          ...state.conceptStatusEvents,
+          {
+            conceptId: event.concept_id,
+            responseId: event.response_id,
+            status: event.status,
+          },
+        ],
       };
     case "manuscript_intent":
       return {
@@ -1022,7 +1154,7 @@ export function createVivaAgentSessionController(
     return socket === nextSocket && activeGeneration?.id === generation.id;
   }
 
-  function sendFrame(frame: VivaClientFrame): boolean {
+  function sendFrame(frame: VivaClientFrameDraft): boolean {
     const generationId = activeGeneration?.id;
     if (socket?.readyState !== 1 || !generationId) {
       setState({
@@ -1039,7 +1171,7 @@ export function createVivaAgentSessionController(
 
   function sendSubmissionFrame(
     kind: VivaAgentPendingSubmission["kind"],
-    frame: VivaClientFrame,
+    frame: VivaClientFrameDraft,
   ): boolean {
     const generationId = activeGeneration?.id;
     if (!generationId || state.pendingSubmission) return false;
@@ -1066,7 +1198,21 @@ export function createVivaAgentSessionController(
     setState({ ...initialVivaAgentSessionState(), generation, status: "connecting" });
     setSocketHandler(nextSocket, "open", () => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
-      sendFrame(sessionConfigFrame(currentSession, currentSessionToken, generation.id));
+      const signedCredential = currentSessionToken;
+      if (!signedCredential) {
+        // `VOICE-AUTH-001`: the signed credential is a REQUIRED member of the
+        // canonical first frame. An unauthenticated generation is refused here
+        // rather than serialized as `session_token: null` for the server to
+        // reject — the browser already knows it has no authority.
+        setState({
+          ...state,
+          errors: [...state.errors, "Viva voice session has no signed credential"],
+          pendingSubmission: undefined,
+          status: "error",
+        });
+        return;
+      }
+      sendFrame(sessionConfigFrame(currentSession, signedCredential, generation.id));
     });
     setSocketHandler(nextSocket, "message", (event) => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
@@ -1332,7 +1478,18 @@ function requireAudioTurnId(turnId: string): string {
   return turnId;
 }
 
-function withClientGeneration(frame: VivaClientFrame, generationId: string): VivaClientFrame {
+/**
+ * A frame as its call site writes it, before the controller stamps the active
+ * generation onto it. `client_generation_id` is never the caller's to choose:
+ * only the controller knows which generation is live, and a caller-chosen one
+ * could address a generation that has already been replaced.
+ */
+type VivaClientFrameDraft =
+  | VivaClientFrame
+  | Omit<VivaCancelClientFrame, "client_generation_id">
+  | Omit<VivaStopClientFrame, "client_generation_id">;
+
+function withClientGeneration(frame: VivaClientFrameDraft, generationId: string): VivaClientFrame {
   return { ...frame, client_generation_id: generationId } as VivaClientFrame;
 }
 

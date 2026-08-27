@@ -1,4 +1,5 @@
-import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
+import type { ConceptStatus, SessionRecap, StudyMode, StudySetIngestionStatus } from "@viva/core";
+import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import {
   projectTurnTakingState,
@@ -34,6 +35,7 @@ export function LiveSessionShell({
   sourceFolio,
   recap,
   reviewPlan,
+  studyContext,
   turnTaking,
   transcript,
   contextLabel,
@@ -69,7 +71,8 @@ export function LiveSessionShell({
   question: Question;
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
-  reviewPlan?: ReviewScheduleItem[];
+  reviewPlan?: SessionReviewPlanItem[];
+  studyContext?: StudyContextSummary;
   turnTaking?: VoiceTurnTakingState;
   transcript?: string;
   contextLabel: string;
@@ -112,6 +115,8 @@ export function LiveSessionShell({
         elapsed={elapsed}
         runtime={runtime}
       />
+
+      {studyContext ? <StudyContextBar studyContext={studyContext} /> : null}
 
       <div className="live-session__stage-wrap">
         {consentDisclosure && !consentDisclosure.acknowledged ? (
@@ -178,6 +183,72 @@ export function LiveSessionShell({
           />
         </div>
       </div>
+    </section>
+  );
+}
+
+/**
+ * The study facts the AUTHENTICATED projection states, rendered as it states
+ * them. `examLabel` is the server's own label; the browser never derives an exam
+ * date from prose, and progress is the server's counter, never a local tally.
+ */
+export type StudyContextSummary = Readonly<{
+  title: string;
+  course: string | null;
+  examLabel: string | null;
+  ingestionStatus: StudySetIngestionStatus;
+  progress: { completed: number; total: number };
+  sessionMode: StudyMode;
+  sessionGoal: string | null;
+  activeQuestionPrompt: string | null;
+  concepts: ReadonlyArray<{ id: string; label: string; status: ConceptStatus }>;
+}>;
+
+function StudyContextBar({ studyContext }: { studyContext: StudyContextSummary }) {
+  return (
+    <section aria-label="Study set" className="session-study-context">
+      <p className="session-study-context__title">{studyContext.title}</p>
+      <dl className="session-study-context__facts">
+        <div>
+          <dt>Course</dt>
+          <dd>{studyContext.course ?? "No course recorded"}</dd>
+        </div>
+        <div>
+          <dt>Exam</dt>
+          <dd>{studyContext.examLabel ?? "No exam recorded"}</dd>
+        </div>
+        <div>
+          <dt>Mode</dt>
+          <dd>{studyContext.sessionMode}</dd>
+        </div>
+        <div>
+          <dt>Goal</dt>
+          <dd>{studyContext.sessionGoal ?? "No goal recorded"}</dd>
+        </div>
+        <div>
+          <dt>Progress</dt>
+          <dd>
+            {studyContext.progress.completed} of {studyContext.progress.total} questions
+          </dd>
+        </div>
+        <div>
+          <dt>Ingestion</dt>
+          <dd>{studyContext.ingestionStatus}</dd>
+        </div>
+      </dl>
+      <p className="session-study-context__question">
+        {studyContext.activeQuestionPrompt ?? "No active question"}
+      </p>
+      {studyContext.concepts.length > 0 ? (
+        <ul aria-label="Study set concepts" className="session-study-context__concepts">
+          {studyContext.concepts.map((concept) => (
+            <li data-status={concept.status} key={concept.id}>
+              <span>{concept.label}</span>
+              <span>{concept.status}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </section>
   );
 }

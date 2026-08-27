@@ -1,6 +1,7 @@
-import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
+import type { SessionRecap } from "@viva/core";
 import { Icon, MasteryRing, Spark, TimelineItem } from "@viva/ui-web";
 import { type CSSProperties, type FormEvent, useEffect, useId, useRef, useState } from "react";
+import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
@@ -57,7 +58,7 @@ export function MarginaliaPanel({
   question: Question;
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
-  reviewPlan?: ReviewScheduleItem[];
+  reviewPlan?: SessionReviewPlanItem[];
   hintShown: boolean;
   textAnswer?: TextAnswerState;
   checkingControl?: CheckingControl;
@@ -320,7 +321,7 @@ function RecapFold({
   reviewPlan,
 }: {
   recap: SessionRecap;
-  reviewPlan: ReviewScheduleItem[];
+  reviewPlan: SessionReviewPlanItem[];
 }) {
   const masteryTiers = recapMasteryTiers(recap);
 
@@ -387,8 +388,7 @@ function RecapFold({
               <li key={item.conceptId}>
                 <span>{item.label}</span>
                 <span>
-                  {item.intervalLabel} · core FSRS · {formatRecapDueDate(item.dueAt)} ·{" "}
-                  {item.explanation[0]}
+                  {item.intervalLabel} · {formatRecapDueDate(item.dueAt)}
                 </span>
               </li>
             ))}
@@ -510,23 +510,23 @@ function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["s
   }
 }
 
-const DUE_MONTHS = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-] as const;
-
-function formatRecapDueDate(dueAt: Date) {
-  return `Due ${DUE_MONTHS[dueAt.getUTCMonth()]} ${dueAt.getUTCDate()}, ${dueAt.getUTCFullYear()}`;
+/**
+ * Renders the projection's persisted due instant on the runtime-local calendar.
+ *
+ * The instant itself is the server's; only its presentation is local, and an
+ * instant that cannot be parsed renders safe copy rather than an invented date.
+ * The old hard-coded "core FSRS" label is gone with the client-side scheduler
+ * that produced it — the authority is the projection's own, and claiming a
+ * different one on screen was a false statement about where the date came from.
+ */
+function formatRecapDueDate(dueAt: string): string {
+  const parsed = new Date(dueAt);
+  if (Number.isNaN(parsed.getTime())) return "Due date unavailable";
+  return `Due ${new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(parsed)}`;
 }
 
 function ThinkingNote({

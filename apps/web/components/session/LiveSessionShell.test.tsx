@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentStudySetReadiness,
-  type ReviewScheduleItem,
   type SessionRecap,
   VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaReadyFrame,
 } from "@viva/core";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import {
   projectRuntimeCopy,
@@ -109,30 +109,22 @@ const trustedRecap: SessionRecap = {
   summary: "The Conductor recap stayed grounded to the server-owned source span.",
 };
 
-const trustedReviewPlan: ReviewScheduleItem[] = [
+const trustedReviewPlan: SessionReviewPlanItem[] = [
   {
-    authoritativeDueAt: new Date("2026-06-18T12:00:00.000Z"),
-    authority: "core_fsrs",
-    capReason: null,
-    card: {
-      difficulty: 6.5,
-      due_at: "2026-06-18T12:00:00.000Z",
-      elapsed_days: 0,
-      lapses: 1,
-      last_review_at: "2026-06-17T12:00:00.000Z",
-      reps: 1,
-      scheduled_days: 1,
-      schema_version: 1,
-      stability: 0.6,
-      state: "relearning",
-    },
+    authority: "server_persisted_fsrs",
     conceptId: "atp-synthase",
-    dueAt: new Date("2026-06-18T12:00:00.000Z"),
-    explanation: ["FSRS rating: Hard", "hint-assisted answer lowered the rating"],
+    dueAt: "2026-06-18T12:00:00.000Z",
     intervalLabel: "tomorrow",
     label: "ATP synthase",
-    priority: "urgent",
     status: "missed",
+  },
+  {
+    authority: "server_persisted_fsrs",
+    conceptId: "oxidative-phosphorylation",
+    dueAt: "2026-06-21T12:00:00.000Z",
+    intervalLabel: "in 4 days",
+    label: "Oxidative phosphorylation",
+    status: "shaky",
   },
 ];
 
@@ -776,7 +768,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("proton gradient");
     expect(markup).toContain("Next session");
     expect(markup).toContain("ATP synthase");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
     expect(markup).toContain("Review the ATP synthase source span");
     expect(markup).not.toContain("Share");
     expect(markup).not.toContain("Add to calendar");
@@ -1027,7 +1026,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("slide:18");
     expect(markup).toContain("Electron flow pumps protons");
     expect(markup).toContain("Due Jun 18, 2026");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
     expect(markup).toContain('class="voice-trace"');
     expect(markup).not.toContain("Use this to answer again.");
     expect(markup).not.toContain("dashboard");
@@ -1080,7 +1086,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Pre-exam");
     // The precise FSRS-dated next session is preserved alongside the timeline.
     expect(markup).toContain("Next session");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
   });
 
   test("recap closing fold omits the mastery rings when no concepts were graded", () => {

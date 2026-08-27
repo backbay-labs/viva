@@ -6,10 +6,10 @@ import type {
   AgentSessionConfig,
   AgentStudyQuestion,
   AgentStudySessionRecap,
-  AgentStudySetReadiness,
   AgentStudySourceReference,
   AgentTerminalSessionReason,
   AnswerEvaluation,
+  AuthenticatedStudyProjectionV1,
   ConceptStatus,
   CorrectionKind,
   EvaluationLabel,
@@ -17,10 +17,7 @@ import type {
   SessionQuestion,
   SessionRecap,
   SourceReference,
-  StudyMode,
-  StudySet,
 } from "@viva/core";
-import { agentStudySetReadiness } from "@viva/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createVivaAgentSessionController,
@@ -28,6 +25,7 @@ import {
   type VivaAgentAudioOutput,
   type VivaAgentClientOptions,
   type VivaAgentCloseDiagnostics,
+  type VivaAgentConceptStatusEvent,
   type VivaAgentGenerationReason,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
@@ -442,26 +440,25 @@ export type VivaAgentDerivedState = {
   canSubmitAnswer: boolean;
 };
 
+/**
+ * `WEBSESSION-DATA-01`: the hook is handed the ALREADY-signed session config the
+ * authenticated projection produced. It takes no `StudySet`, no `mode`, and no
+ * route ids, because none of those may be reassembled in the browser into
+ * something the server did not state.
+ */
 export type UseVivaAgentSessionOptions = VivaAgentClientOptions & {
   controllerFactory?: typeof createVivaAgentSessionController;
-  studySet: StudySet;
-  mode: StudyMode;
-  sessionId?: string;
+  /**
+   * `null` until the authenticated projection has produced one. No controller
+   * exists before then: a controller built from a placeholder config could open
+   * a socket describing a study set the server never authorized.
+   */
+  session: AgentSessionConfig | null;
   sessionToken?: string | null;
-  trustedStudySetId?: string;
-  userId?: string;
 };
 
 export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
-  const session = useMemo(
-    () =>
-      studySetToAgentSessionConfig(options.studySet, {
-        mode: options.mode,
-        sessionId: options.sessionId,
-        userId: options.userId,
-      }),
-    [options.studySet, options.mode, options.sessionId, options.userId],
-  );
+  const session = options.session;
   const controllerRef = useRef<VivaAgentSessionController | null>(null);
   // The factory lives in a ref, not in the connect effect's dependency list: a
   // StrictMode double-mount would otherwise re-run the effect for a factory
@@ -474,10 +471,15 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
 
   useEffect(() => {
     controllerRef.current?.close();
+    controllerRef.current = null;
+    if (!session) {
+      setAgentState(initialVivaAgentSessionState());
+      return;
+    }
     const controller = controllerFactoryRef.current({
       WebSocketImpl: options.WebSocketImpl,
       session,
-      sessionToken: options.sessionToken ?? options.studySet.sessionToken,
+      sessionToken: options.sessionToken,
       token: options.token,
       url: options.url,
     });
@@ -491,20 +493,9 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
         controllerRef.current = null;
       }
     };
-  }, [
-    options.WebSocketImpl,
-    options.sessionToken,
-    options.studySet.sessionToken,
-    options.token,
-    options.url,
-    session,
-  ]);
+  }, [options.WebSocketImpl, options.sessionToken, options.token, options.url, session]);
 
   const derived = useMemo(() => deriveVivaAgentUiState(agentState), [agentState]);
-  const readiness: AgentStudySetReadiness = useMemo(
-    () => agentStudySetReadiness(options.studySet, options.trustedStudySetId),
-    [options.studySet, options.trustedStudySetId],
-  );
   const audio = useMemo(() => createVivaAgentAudioCommands(() => controllerRef.current), []);
 
   return {
@@ -515,7 +506,6 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     close: () => controllerRef.current?.close(),
     connect: (reason?: VivaAgentGenerationReason) => controllerRef.current?.connect(reason),
     derived,
-    readiness,
     refreshSession: (input?: {
       reason?: VivaAgentGenerationReason;
       sessionToken?: string | null;
@@ -531,18 +521,26 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
   };
 }
 
-export function studySetToAgentSessionConfig(
-  studySet: StudySet,
-  options: { mode: StudyMode; sessionId?: string; userId?: string },
+/**
+ * The authenticated projection, mapped straight into the signed session config.
+ *
+ * Every member comes from the server projection; only `user_id` is supplied by
+ * the caller, from the verified route identity the projection was fetched for.
+ * `initial_goal` is deliberately absent: the merged v5 `AgentSessionConfig`
+ * carries no such member (A-25's node-10 client obligation), so the session's
+ * goal is display state, never wire authority.
+ */
+export function studyProjectionToAgentSessionConfig(
+  projection: AuthenticatedStudyProjectionV1,
+  userId: string,
 ): AgentSessionConfig {
   return {
-    active_concepts: studySet.concepts.map((concept) => concept.id),
-    initial_goal: studySet.recommendedSession,
-    mode: options.mode,
-    session_id: studySet.sessionId ?? options.sessionId ?? "voice-session-1",
+    active_concepts: projection.concepts.map(({ id }) => id),
+    mode: projection.session.mode,
+    session_id: projection.session.id,
     source_context: [],
-    study_set_id: studySet.id,
-    user_id: studySet.userId ?? options.userId ?? "user-1",
+    study_set_id: projection.studySet.id,
+    user_id: userId,
   };
 }
 
@@ -564,7 +562,9 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,
     question,
-    recap: state.recap ? agentRecapToSessionRecap(state.recap) : undefined,
+    recap: state.recap
+      ? agentRecapToSessionRecap(state.recap, state.sources, state.conceptStatusEvents)
+      : undefined,
     sources: state.sources.map(agentSourceToUiSource),
     terminalReason: state.terminalReason,
     transcript: state.finalTranscript ?? state.transcript,
@@ -596,30 +596,44 @@ export function agentAnswerEvaluationToUiEvaluation(
   };
 }
 
-export function agentRecapToSessionRecap(recap: AgentStudySessionRecap): SessionRecap {
+/**
+ * Maps the merged v2 recap (`viva.study_session_recap.v2`) into the shared UI
+ * recap shape, without inventing anything the server did not send.
+ *
+ * Two deliberate absences:
+ * - `plan` is empty. v1's three-row "Now / Tomorrow / Next" timeline was
+ *   fabricated in the browser from status buckets; the v2 recap publishes a real
+ *   `review_schedule` instead, which the margin renders from the projection.
+ * - a source moment is DROPPED rather than labelled with a guessed status. A v2
+ *   moment names a `response_id` and a `source_id` only, so its status is the
+ *   status the same response was actually graded at; when the session's own
+ *   event trail does not name exactly one, there is no honest label to render.
+ */
+export function agentRecapToSessionRecap(
+  recap: AgentStudySessionRecap,
+  sources: readonly AgentStudySourceReference[] = [],
+  conceptStatusEvents: readonly VivaAgentConceptStatusEvent[] = [],
+): SessionRecap {
+  const sourceById = new Map(sources.map((source) => [source.source_id, source]));
+  const labelsWithStatus = (status: ConceptStatus) =>
+    recap.concepts.filter((concept) => concept.status === status).map((concept) => concept.label);
+
   return {
     durationLabel: "Agent session",
     headline: recap.headline,
-    missedConcepts: recap.missed_concepts,
+    missedConcepts: labelsWithStatus("missed"),
     nextAction: recap.next_action,
-    plan: [
-      { day: "Now", meta: "completed", status: "done", topics: recap.strong_concepts.join(", ") },
-      {
-        day: "Tomorrow",
-        meta: "scheduled",
-        status: "today",
-        topics: recap.review_later.join(", ") || "Source-backed recall",
-      },
-      { day: "Next", meta: "upcoming", status: "upcoming", topics: recap.next_action },
-    ],
-    reviewLater: recap.review_later,
-    shakyConcepts: recap.shaky_concepts,
-    sourceMoments: recap.source_moments.map((moment) => ({
-      source: agentSourceToUiSource(moment.source),
-      status: moment.status,
-      text: moment.text,
-    })),
-    strongConcepts: recap.strong_concepts,
+    plan: [],
+    reviewLater: labelsWithStatus("review"),
+    shakyConcepts: labelsWithStatus("shaky"),
+    sourceMoments: recap.source_moments.flatMap((moment) => {
+      const source = sourceById.get(moment.source_id);
+      const graded = conceptStatusEvents.filter((event) => event.responseId === moment.response_id);
+      const status = graded.length === 1 ? graded[0]?.status : undefined;
+      if (!source || !status) return [];
+      return [{ source: agentSourceToUiSource(source), status, text: source.excerpt }];
+    }),
+    strongConcepts: labelsWithStatus("strong"),
     summary: recap.summary,
   };
 }

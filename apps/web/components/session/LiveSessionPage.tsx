@@ -1,6 +1,11 @@
 "use client";
 
-import { type SessionRecap, seedStudySets, VIVA_AUDIO_MAX_TURN_SAMPLES } from "@viva/core";
+import {
+  type AuthenticatedStudyProjectionV1,
+  type SessionRecap,
+  type StudySetIngestionStatus,
+  VIVA_AUDIO_MAX_TURN_SAMPLES,
+} from "@viva/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
 import {
@@ -10,11 +15,14 @@ import {
   readBrowserSessionCredential,
   renewBrowserSessionCredential,
   replaceBrowserSessionCredential,
+  studyProjectionToAgentSessionConfig,
   useVivaAgentSession,
   type VivaAgentDerivedState,
 } from "../../lib/use-viva-agent-session";
 import {
+  type AuthenticatedStudyProjectionFailureCause,
   createVivaAgentSessionController,
+  fetchAuthenticatedStudyProjection,
   fetchVivaAgentReadinessProbe,
   isVivaAudioSendRejectedError,
   type VivaAgentAudioOutput,
@@ -38,7 +46,11 @@ import {
   createVivaAudioPlaybackSink,
   type VivaAudioPlaybackSink,
 } from "../../lib/viva-audio-playback";
-import { recapPlanFromSessionEvents } from "../../lib/viva-display";
+import {
+  type SessionReviewPlanItem,
+  sessionReviewPlanFromProjection,
+  studyProjectionReadiness,
+} from "../../lib/viva-display";
 import { vivaSceneReducer } from "../../lib/viva-scene-reducer";
 import {
   canonicalizeSessionBrowserUrl,
@@ -46,7 +58,6 @@ import {
   sessionRouteIdentityFromLocationParts,
 } from "../../lib/viva-session-entry";
 import {
-  projectConceptNodes,
   projectHighlightedTokens,
   projectRuntimeCopy,
   projectSourceFolio,
@@ -77,8 +88,6 @@ import type { VoiceTraceLevel } from "./VoiceTraceCanvas";
  * to the synthetic brain (which would restart the turn on every frame). A turn is
  * triggered explicitly when the student signals they are done answering.
  */
-const STUDY_SET = seedStudySets[0]; // biology-midterm — the trusted synthetic study set
-
 type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
@@ -113,6 +122,7 @@ export type LiveSessionPageDependencies = Readonly<{
   createAudioCaptureSource: typeof createBrowserVivaAudioCaptureSource;
   createAudioPlaybackSink: typeof createVivaAudioPlaybackSink;
   fetchReadiness: typeof fetchVivaAgentReadinessProbe;
+  fetchStudyProjection: typeof fetchAuthenticatedStudyProjection;
   readCredential: typeof readBrowserSessionCredential;
   replaceCredential: typeof replaceBrowserSessionCredential;
   renewCredential: RenewBrowserSessionCredential;
@@ -124,6 +134,7 @@ export const defaultLiveSessionPageDependencies: LiveSessionPageDependencies = {
   createAudioCaptureSource: createBrowserVivaAudioCaptureSource,
   createAudioPlaybackSink: createVivaAudioPlaybackSink,
   fetchReadiness: fetchVivaAgentReadinessProbe,
+  fetchStudyProjection: fetchAuthenticatedStudyProjection,
   reconnectClock: defaultVivaAgentReconnectClock,
   readCredential: readBrowserSessionCredential,
   renewCredential: renewBrowserSessionCredential,
@@ -146,6 +157,21 @@ export type SessionCredentialStage =
   | {
       kind: "failed";
       cause: "missing_identity" | "missing_credential" | "auth_terminal" | "renewal_unavailable";
+    };
+
+/**
+ * The authenticated projection's own gate. `identity_mismatch` is separate from
+ * `invalid_projection` so a projection that parsed but describes ANOTHER session
+ * is never reported as a malformed one.
+ */
+export type SessionProjectionStage =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready" }
+  | {
+      kind: "failed";
+      cause: AuthenticatedStudyProjectionFailureCause | "identity_mismatch";
+      retryAfterSeconds?: number;
     };
 
 /** The all-null identity both the server render and the first client render use. */
@@ -183,21 +209,18 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const credentialRef = useRef<BrowserSessionCredential | null>(null);
   const mountAttemptRef = useRef(0);
   const renewalAbortRef = useRef<AbortController | null>(null);
-  const activeStudySet = useMemo(
-    () => ({
-      ...STUDY_SET,
-      id: routeIdentity.studySetId ?? STUDY_SET.id,
-      userId: routeIdentity.userId ?? STUDY_SET.userId,
-      sessionId: routeIdentity.sessionId ?? STUDY_SET.sessionId,
-      sessionToken: bootstrapAccessToken ?? STUDY_SET.sessionToken,
-      serverOwned: routeIdentity.studySetId ? true : STUDY_SET.serverOwned,
-      ingestionStatus: routeIdentity.studySetId ? ("ready" as const) : STUDY_SET.ingestionStatus,
-    }),
-    [routeIdentity, bootstrapAccessToken],
+  // `WEBSESSION-DATA-01`: the server-owned projection is the ONLY study/session
+  // read model. There is no seed overlay and no library-metadata fallback to
+  // fall back to, so `null` here means the page cannot render a session at all.
+  const [studyProjection, setStudyProjection] = useState<AuthenticatedStudyProjectionV1 | null>(
+    null,
   );
+  const [projectionStage, setProjectionStage] = useState<SessionProjectionStage>({ kind: "idle" });
+  const [projectionAttemptTick, setProjectionAttemptTick] = useState(0);
+  const projectionAttemptRef = useRef("");
+  const projectionAbortRef = useRef<AbortController | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
-  const [hintUsed, setHintUsed] = useState(false);
   const [micState, setMicState] = useState<RuntimeMicState>("unknown");
   const [readinessProbe, setReadinessProbe] =
     useState<VivaAgentReadinessProbe>(initialReadinessProbe);
@@ -211,15 +234,24 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const routeIdentityRef = useRef(routeIdentity);
   const browserLifecycleAttemptRef = useRef(0);
 
+  // The signed session config is built from the projection alone; the only
+  // caller-supplied member is `user_id`, taken from the COMMITTED credential's
+  // verified identity rather than from the raw route. The memo key is that id,
+  // not the credential object, so a rotation never rebuilds the config and
+  // never costs the controller its retained audio ledger.
+  const credentialUserId = credential?.identity.userId ?? null;
+  const sessionConfig = useMemo(
+    () =>
+      studyProjection && credentialUserId
+        ? studyProjectionToAgentSessionConfig(studyProjection, credentialUserId)
+        : null,
+    [studyProjection, credentialUserId],
+  );
   const agent = useVivaAgentSession({
     controllerFactory: depsRef.current.createAgentController,
-    mode: "quiz",
-    sessionId: routeIdentity.sessionId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
+    session: sessionConfig,
     sessionToken: bootstrapAccessToken,
-    studySet: activeStudySet,
     token: sessionRouteWsAccessToken({ sessionToken: bootstrapAccessToken }),
-    trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
-    userId: routeIdentity.userId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
   });
   const agentRef = useRef(agent);
   agentRef.current = agent;
@@ -433,15 +465,94 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     };
   }, [credentialStage.kind, runCredentialRenewal]);
 
-  // Connect once, and only once the selected D-07 branch's renewal has settled
-  // for this attempt. The zero-delay deferral survives from the StrictMode fix,
-  // but eligibility — not the timer — is what makes exactly one socket open.
+  /**
+   * `WEBSESSION-DATA-01` — fetch and identity-verify the authenticated
+   * projection. One in-flight request per attempt: a route change, a browser
+   * lifecycle replacement, a retry supersession, and unmount all abort it, and a
+   * superseded response updates nothing.
+   */
   useEffect(() => {
     if (credentialStage.kind !== "ready") return;
+    const credential = credentialRef.current;
+    const identity = routeIdentityRef.current;
+    const studySetId = identity.studySetId?.trim();
+    const voiceSessionId = identity.sessionId?.trim();
+    if (!credential || !studySetId || !voiceSessionId) return;
+
+    const clock = depsRef.current.reconnectClock;
+    const controller = new AbortController();
+    projectionAbortRef.current?.abort();
+    projectionAbortRef.current = controller;
+    // The attempt key carries the explicit-refetch tick, so a retry supersedes
+    // an in-flight fetch by identity rather than by ordering luck.
+    const attempt = `${projectionAttemptTick}:${studySetId}:${voiceSessionId}`;
+    projectionAttemptRef.current = attempt;
+    setProjectionStage({ kind: "loading" });
+
+    const timer = clock.setTimeout(() => {
+      void depsRef.current
+        .fetchStudyProjection({
+          accessToken: credential.accessToken,
+          signal: controller.signal,
+          studySetId,
+          voiceSessionId,
+        })
+        .then((result) => {
+          if (controller.signal.aborted || !mountedRef.current) return;
+          if (attempt !== projectionAttemptRef.current) return;
+          if (result.status === "failed") {
+            setStudyProjection(null);
+            setProjectionStage({
+              cause: result.cause,
+              kind: "failed",
+              ...(result.retryAfterSeconds === undefined
+                ? {}
+                : { retryAfterSeconds: result.retryAfterSeconds }),
+            });
+            return;
+          }
+          // The BFF already binds identity, but the browser verifies it again:
+          // a projection describing another set or session must never be
+          // rendered as this learner's own state, whatever produced it.
+          if (
+            result.projection.studySet.id !== studySetId ||
+            result.projection.session.id !== voiceSessionId
+          ) {
+            setStudyProjection(null);
+            setProjectionStage({ cause: "identity_mismatch", kind: "failed" });
+            return;
+          }
+          setStudyProjection(result.projection);
+          setProjectionStage({ kind: "ready" });
+        });
+    }, 0);
+
+    return () => {
+      clock.clearTimeout(timer);
+      controller.abort();
+      if (projectionAbortRef.current === controller) projectionAbortRef.current = null;
+    };
+  }, [credentialStage.kind, projectionAttemptTick]);
+
+  const projectionReadiness = useMemo(
+    () => (studyProjection ? studyProjectionReadiness(studyProjection) : null),
+    [studyProjection],
+  );
+
+  // Connect once, and only once route resolution, the selected D-07 branch's
+  // renewal, AND projection validation have all completed for this attempt. The
+  // zero-delay deferral survives from the StrictMode fix, but eligibility — not
+  // the timer — is what makes exactly one socket open.
+  const connectionEligible =
+    credentialStage.kind === "ready" &&
+    projectionStage.kind === "ready" &&
+    projectionReadiness?.canConnect === true;
+  useEffect(() => {
+    if (!connectionEligible) return;
     const clock = depsRef.current.reconnectClock;
     const id = clock.setTimeout(() => agentRef.current.connect(), 0);
     return () => clock.clearTimeout(id);
-  }, [credentialStage.kind]);
+  }, [connectionEligible]);
 
   /**
    * Opens the next generation with the CURRENT credential, through the existing
@@ -814,6 +925,20 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     }
     renewAndReopen("token_refresh", "auth_expired");
   }, [renewAndReopen, resetPlaybackForGeneration, retryAgent]);
+  /**
+   * `WEBSESSION-DATA-01` retry: reruns the selected D-07 renewal AND the
+   * projection fetch for the latest route attempt. It never calls `connect`, and
+   * it never falls back to the library snapshot endpoint.
+   */
+  const retryBootstrap = useCallback(() => {
+    const identity = routeIdentityRef.current;
+    if (!completeSessionRouteIdentity(identity)) return;
+    projectionAbortRef.current?.abort();
+    setStudyProjection(null);
+    setProjectionStage({ kind: "idle" });
+    setProjectionAttemptTick((tick) => tick + 1);
+  }, []);
+
   const startNewSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
@@ -864,39 +989,46 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     setInterruptAcknowledged(false);
   }, [activeQuestionId, cancelActiveAudioTurn]);
 
-  // Stable session-start reference so FSRS review intervals are deterministic
-  // across renders (and don't recompute the projection every tick).
+  // Stable session-start reference so the rendered review intervals are computed
+  // against one instant for the whole session rather than drifting every tick.
   const sessionStart = useRef(new Date()).current;
-  const recapPlan = useMemo(
-    () =>
-      recapPlanFromSessionEvents({
-        conceptStatuses: agent.derived.conceptStatuses,
-        now: sessionStart,
-        recap: agent.derived.recap,
-        signals: { hinted: hintUsed },
-        studySet: activeStudySet,
-      }),
-    [activeStudySet, agent.derived.conceptStatuses, agent.derived.recap, hintUsed, sessionStart],
-  );
-  const projectedDerived = useMemo(
-    () => derivedStateWithProjectedRecap(agent.derived, recapPlan.recap),
-    [agent.derived, recapPlan.recap],
-  );
-  const projection = useMemo(
-    () => projectTrace(projectedDerived, agent.status, sessionStart),
-    [projectedDerived, agent.status, sessionStart],
+  // `WEBSESSION-RECAP-01` boundary: the validated server recap is rendered as
+  // emitted. Nothing here re-buckets its concepts, rewrites its next action, or
+  // fabricates a study plan out of local status events.
+  const trace = useMemo(
+    () => projectTrace(agent.derived, agent.status, sessionStart),
+    [agent.derived, agent.status, sessionStart],
   );
   const sourceFolio = useMemo(
     () => projectSourceFolio(agent.derived, sessionStart),
     [agent.derived, sessionStart],
   );
+  // The review plan is READ from the projection: the persisted `dueAt`, the
+  // projection's own concept label, and the interval the shared reader derives
+  // from that instant. Nothing is scheduled in the browser.
+  const reviewPlanProjection = useMemo(
+    () => (studyProjection ? sessionReviewPlanFromProjection(studyProjection, sessionStart) : null),
+    [studyProjection, sessionStart],
+  );
+  const reviewPlan: SessionReviewPlanItem[] =
+    reviewPlanProjection?.status === "ready" ? reviewPlanProjection.items : [];
+  const projectionConcepts = useMemo(() => studyProjection?.concepts ?? [], [studyProjection]);
   const conceptNodes = useMemo(
-    () => projectConceptNodes(activeStudySet.concepts, agent.agentState.conceptStatuses),
-    [activeStudySet.concepts, agent.agentState.conceptStatuses],
+    () =>
+      projectionConcepts.map((concept) => {
+        const live = agent.agentState.conceptStatuses[concept.id];
+        return {
+          emphasis: live !== undefined ? 1 : 0.5,
+          id: concept.id,
+          label: concept.label,
+          status: live ?? concept.status,
+        };
+      }),
+    [projectionConcepts, agent.agentState.conceptStatuses],
   );
   const scene = useMemo(() => {
     const knownEntityIds = new Set<string>([
-      ...activeStudySet.concepts.map((concept) => concept.id),
+      ...projectionConcepts.map((concept) => concept.id),
       "hint-1",
       "source-folio",
       "correction-note",
@@ -916,44 +1048,50 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       knownEntityIds: [...knownEntityIds],
     });
   }, [
-    activeStudySet.concepts,
+    projectionConcepts,
     agent.derived.manuscriptIntents,
     agent.derived.question,
     agent.derived.sources,
   ]);
-  const isRecap = projection.state === "recap";
+  const isRecap = trace.state === "recap";
   const effectiveState: SessionState = isRecap
     ? "recap"
     : sourceOpen
       ? "source"
       : textRetryOpen
         ? "listening"
-        : projection.state;
+        : trace.state;
   const highlightedTokens = isRecap
-    ? projection.highlightedTokens
+    ? trace.highlightedTokens
     : sourceOpen
       ? projectHighlightedTokens("source", agent.derived)
       : textRetryOpen
         ? projectHighlightedTokens("listening", agent.derived)
-        : projection.highlightedTokens;
+        : trace.highlightedTokens;
+  // Readiness comes from the AUTHENTICATED projection plus the readiness probe.
+  // With no projection there is no readiness to state, so no runtime copy is
+  // produced at all — the page renders its pre-loop shell instead of asserting
+  // an ingestion status the server never sent.
   const runtime = useMemo(
     () =>
-      projectRuntimeCopy({
-        close: agent.agentState.close,
-        errors: agent.derived.errors,
-        mic: micState,
-        readinessProbe,
-        readiness: agent.readiness,
-        ready: agent.agentState.ready,
-        status: agent.status,
-        terminalReason: agent.derived.terminalReason,
-      }),
+      projectionReadiness
+        ? projectRuntimeCopy({
+            close: agent.agentState.close,
+            errors: agent.derived.errors,
+            mic: micState,
+            readiness: projectionReadiness,
+            readinessProbe,
+            ready: agent.agentState.ready,
+            status: agent.status,
+            terminalReason: agent.derived.terminalReason,
+          })
+        : null,
     [
       agent.agentState.close,
       agent.agentState.ready,
       agent.derived.errors,
       agent.derived.terminalReason,
-      agent.readiness,
+      projectionReadiness,
       agent.status,
       micState,
       readinessProbe,
@@ -988,32 +1126,34 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   );
   const turnTaking = useMemo(
     () =>
-      projectTurnTakingState({
-        hasPendingAudio: agent.agentState.audio.length > 0,
-        interruptAcknowledged,
-        playbackSpeaking,
-        question: projection.question,
-        runtime,
-        state: effectiveState,
-        textAnswerFallbackActive: shouldShowNoSpeechNudge({ textAnswerState, textRetryOpen }),
-      }),
+      runtime
+        ? projectTurnTakingState({
+            hasPendingAudio: agent.agentState.audio.length > 0,
+            interruptAcknowledged,
+            playbackSpeaking,
+            question: trace.question,
+            runtime,
+            state: effectiveState,
+            textAnswerFallbackActive: shouldShowNoSpeechNudge({ textAnswerState, textRetryOpen }),
+          })
+        : null,
     [
       agent.agentState.audio.length,
       effectiveState,
       interruptAcknowledged,
       playbackSpeaking,
-      projection.question,
+      trace.question,
       runtime,
       textAnswerState,
       textRetryOpen,
     ],
   );
   const submitRuntimePrimaryAction =
-    runtime.primaryActionIntent === "refresh_session"
+    runtime?.primaryActionIntent === "refresh_session"
       ? refreshSession
-      : runtime.primaryActionIntent === "retry_agent"
+      : runtime?.primaryActionIntent === "retry_agent"
         ? retryAgent
-        : runtime.primaryActionIntent === "start_session"
+        : runtime?.primaryActionIntent === "start_session"
           ? startNewSession
           : submitSpokenTurn;
 
@@ -1037,11 +1177,33 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // Before the mount effect has resolved a credential — which is exactly the
   // server render and the first client render — the header states the neutral
   // truth rather than naming a study set the page has not been authorized for.
-  const sessionContextLabel = !credential
-    ? "Preparing your session"
-    : agent.readiness.reason === "trusted"
-      ? `Trusted server set: ${activeStudySet.title}`
-      : `Local demo set: ${activeStudySet.title}`;
+  const sessionContextLabel = studyProjection
+    ? `${studyProjection.studySet.title}${
+        studyProjection.studySet.course ? ` · ${studyProjection.studySet.course}` : ""
+      }`
+    : "Preparing your session";
+
+  // `WEBSESSION-DATA-01` / Step 6: while the authenticated projection is
+  // unresolved or failed, the page renders a neutral pre-loop state with every
+  // microphone, text, and connection control disabled. It never opens a socket
+  // and never calls the library snapshot endpoint to fill the gap.
+  if (
+    !studyProjection ||
+    projectionStage.kind !== "ready" ||
+    !runtime ||
+    !turnTaking ||
+    projectionReadiness?.canConnect !== true
+  ) {
+    return (
+      <SessionPreloopShell
+        credentialStage={credentialStage}
+        ingestionStatus={studyProjection?.studySet.ingestionStatus}
+        onRetry={retryBootstrap}
+        projectionStage={projectionStage}
+        reviewPlanInvalid={reviewPlanProjection?.status === "invalid_projection"}
+      />
+    );
+  }
 
   return (
     <LiveSessionShell
@@ -1066,10 +1228,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       onBackToQuestion={() => setSourceOpen(false)}
       onChallengeSource={challengeSource}
       onEndSession={endSession}
-      onHint={() => {
-        setHintUsed(true);
-        setHintShown((shown) => !shown);
-      }}
+      onHint={() => setHintShown((shown) => !shown)}
       onNextQuestion={submitSpokenTurn}
       onShowSource={() => setSourceOpen(true)}
       onSubmitAnswer={submitRuntimePrimaryAction}
@@ -1085,17 +1244,223 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
         setTextAnswerEnabled(false);
         onUserGesture();
       }}
-      question={projection.question}
-      recap={recapPlan.recap}
-      reviewPlan={recapPlan.reviewPlan}
+      question={trace.question}
+      recap={agent.derived.recap}
+      reviewPlan={reviewPlan}
       runtime={runtime}
       scene={scene}
       sourceFolio={sourceFolio}
       state={effectiveState}
+      studyContext={{
+        activeQuestionPrompt: studyProjection.activeQuestion?.prompt ?? null,
+        concepts: studyProjection.concepts.map(({ id, label, status }) => ({
+          id,
+          label,
+          status,
+        })),
+        course: studyProjection.studySet.course,
+        examLabel: studyProjection.studySet.examLabel,
+        ingestionStatus: studyProjection.studySet.ingestionStatus,
+        progress: studyProjection.questionProgress,
+        sessionGoal: studyProjection.session.goal,
+        sessionMode: studyProjection.session.mode,
+        title: studyProjection.studySet.title,
+      }}
       transcript={agent.derived.transcript}
       textAnswer={textAnswerState}
       turnTaking={turnTaking}
     />
+  );
+}
+
+/**
+ * The exact learner-facing copy for every unresolved or failed pre-loop state.
+ *
+ * Every string here is a sanitized classification, never a parser excerpt, a
+ * close reason, a fetch message, or any credential material — the projection
+ * client's discriminated `cause` is the only input.
+ */
+export type SessionPreloopCopy = Readonly<{
+  headline: string;
+  detail: string;
+  actionLabel: string | null;
+  statusLabel: string;
+}>;
+
+export function sessionPreloopCopy(input: {
+  credentialStage: SessionCredentialStage;
+  ingestionStatus?: StudySetIngestionStatus;
+  projectionStage: SessionProjectionStage;
+  reviewPlanInvalid: boolean;
+}): SessionPreloopCopy {
+  if (input.credentialStage.kind === "failed") {
+    switch (input.credentialStage.cause) {
+      case "missing_identity":
+        return {
+          actionLabel: null,
+          detail: "Open this session from your library so Viva knows which study set to load.",
+          headline: "This session link is incomplete",
+          statusLabel: "missing session identity",
+        };
+      case "missing_credential":
+        return {
+          actionLabel: null,
+          detail: "Start the session again from your library to get a fresh signed session.",
+          headline: "This session needs a fresh sign-in",
+          statusLabel: "missing session credential",
+        };
+      case "auth_terminal":
+        return {
+          actionLabel: null,
+          detail: "Your signed session ended. Start it again from your library to continue.",
+          headline: "Your signed session ended",
+          statusLabel: "session auth terminal",
+        };
+      default:
+        return {
+          actionLabel: "Try again",
+          detail: "Viva could not renew this session's credential. Try again in a moment.",
+          headline: "Session credential unavailable",
+          statusLabel: "credential renewal unavailable",
+        };
+    }
+  }
+
+  if (input.reviewPlanInvalid) {
+    return {
+      actionLabel: "Try again",
+      detail: "Viva refused a study projection it could not fully trust. Nothing was guessed.",
+      headline: "This session's study data did not check out",
+      statusLabel: "invalid projection",
+    };
+  }
+
+  if (input.projectionStage.kind === "failed") {
+    switch (input.projectionStage.cause) {
+      case "unauthorized":
+        return {
+          actionLabel: null,
+          detail:
+            "Your signed session is no longer valid here. Start the session again from your library.",
+          headline: "Your signed session ended",
+          statusLabel: "session auth terminal",
+        };
+      case "not_found":
+        return {
+          actionLabel: null,
+          detail: "Viva has no session for this link. Start a new one from your library.",
+          headline: "This session was not found",
+          statusLabel: "projection not found",
+        };
+      case "rate_limited":
+        return {
+          actionLabel: "Try again",
+          detail:
+            input.projectionStage.retryAfterSeconds === undefined
+              ? "Too many session requests. Wait a moment and try again."
+              : `Too many session requests. Try again in about ${input.projectionStage.retryAfterSeconds} seconds.`,
+          headline: "Too many session requests",
+          statusLabel: "rate limited",
+        };
+      case "timeout":
+        return {
+          actionLabel: "Try again",
+          detail: "Loading your study set took too long. Try again.",
+          headline: "Your study set took too long to load",
+          statusLabel: "projection timeout",
+        };
+      case "invalid_request":
+      case "invalid_projection":
+      case "identity_mismatch":
+        return {
+          actionLabel: "Try again",
+          detail: "Viva refused a study projection it could not fully trust. Nothing was guessed.",
+          headline: "This session's study data did not check out",
+          statusLabel: "invalid projection",
+        };
+      default:
+        return {
+          actionLabel: "Try again",
+          detail: "Viva could not load your study set right now. Try again in a moment.",
+          headline: "Your study set is unavailable",
+          statusLabel: "projection unavailable",
+        };
+    }
+  }
+
+  // A projection the server marked anything but `ready` states that status as
+  // the server gave it. The only way past it is a fresh projection: the page
+  // never overwrites a server ingestion status with a local `ready`.
+  if (input.ingestionStatus === "failed") {
+    return {
+      actionLabel: "Check again",
+      detail: "Your study set could not be processed. Re-upload it or check its ingestion status.",
+      headline: "Ingestion failed for this study set",
+      statusLabel: "ingestion failed",
+    };
+  }
+  if (input.ingestionStatus && input.ingestionStatus !== "ready") {
+    return {
+      actionLabel: "Check again",
+      detail: "Viva is still preparing this study set on the server. Check again in a moment.",
+      headline: `Your study set is still ${input.ingestionStatus}`,
+      statusLabel: `ingestion ${input.ingestionStatus}`,
+    };
+  }
+
+  return {
+    actionLabel: null,
+    detail: "Loading the study set and question this session was authorized for.",
+    headline: "Preparing your session",
+    statusLabel: "preparing session",
+  };
+}
+
+/**
+ * The neutral, control-free pre-loop shell.
+ *
+ * It renders the same markup on the server and on the first client render (it
+ * reads no browser state), and it exposes no microphone, text-answer, or
+ * connection control at all — a disabled control the learner could still focus
+ * would be an invitation to act on a session that does not exist yet.
+ */
+function SessionPreloopShell({
+  credentialStage,
+  ingestionStatus,
+  onRetry,
+  projectionStage,
+  reviewPlanInvalid,
+}: {
+  credentialStage: SessionCredentialStage;
+  ingestionStatus?: StudySetIngestionStatus;
+  onRetry: () => void;
+  projectionStage: SessionProjectionStage;
+  reviewPlanInvalid: boolean;
+}) {
+  const copy = sessionPreloopCopy({
+    credentialStage,
+    ingestionStatus,
+    projectionStage,
+    reviewPlanInvalid,
+  });
+  return (
+    <section aria-label="Session status" className="live-session live-session--preloop">
+      <div className="session-preloop">
+        <p className="session-preloop__status" data-status={copy.statusLabel}>
+          {copy.statusLabel}
+        </p>
+        <h1 className="session-preloop__headline">{copy.headline}</h1>
+        <p className="session-preloop__detail">{copy.detail}</p>
+        {copy.actionLabel ? (
+          <button className="session-preloop__action" onClick={onRetry} type="button">
+            {copy.actionLabel}
+          </button>
+        ) : null}
+        <p aria-atomic="true" aria-live="polite" className="sr-only">
+          {copy.headline}. {copy.detail}
+        </p>
+      </div>
+    </section>
   );
 }
 

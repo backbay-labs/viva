@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   type AgentSessionConfig,
   type AgentStudySourceReference,
@@ -9,9 +9,9 @@ import {
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
-import readyFixture from "../../../agent/fixtures/voice-protocol/server-ready.json";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
 import sessionFixture from "../../../agent/fixtures/voice-protocol/v5/seeded-session-config.json";
+import readyFixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
   agentProtocolVersion,
@@ -19,11 +19,12 @@ import {
   deleteVivaSessionHistory,
   deleteVivaStudySet,
   exportVivaLibraryData,
+  fetchAuthenticatedStudyProjection,
   fetchVivaAgentReadinessProbe,
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
-  refreshVivaSessionToken,
+  VIVA_STUDY_PROJECTION_TIMEOUT_MS,
   vivaAgentHttpBaseUrl,
   vivaAgentProtocols,
   vivaAgentReducer,
@@ -31,6 +32,19 @@ import {
   vivaApiBaseUrl,
 } from "./viva-agent-client";
 import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
+
+/**
+ * A v5-shaped signed session credential: the `viva1` prefix plus two canonical
+ * unpadded base64url segments. `parseVivaClientFrame` checks the SHAPE of the
+ * credential on every `session_config`, so a placeholder string is not a valid
+ * fixture — and the controller now refuses to send an unauthenticated first
+ * frame at all.
+ */
+const SIGNED_SESSION_CREDENTIAL = "viva1.eyJzZXNzaW9uIjoiZml4dHVyZSJ9.c2lnbmF0dXJlLWZpeHR1cmU";
+
+/** The rotated credential the refresh path exchanges the one above for. */
+const REFRESHED_SESSION_CREDENTIAL =
+  "viva1.eyJzZXNzaW9uIjoicmVmcmVzaGVkIn0.cmVmcmVzaGVkLXNpZ25hdHVyZQ";
 
 describe("Viva agent browser client", () => {
   test("uses explicit env URL with local service fallback", () => {
@@ -203,57 +217,13 @@ describe("Viva agent browser client", () => {
     expect(agentProtocolVersion()).toBe(VIVA_VOICE_PROTOCOL_VERSION);
   });
 
-  test("refreshes signed session material through the same-origin browser route", async () => {
-    const calls: Array<{ body: unknown; url: string }> = [];
-    const result = await refreshVivaSessionToken(
-      {
-        sessionId: "session-1",
-        sessionToken: "placeholder-current-material",
-        studySetId: "study-set-1",
-        userId: "user-1",
-      },
-      {
-        apiBaseUrl: "http://localhost:3000",
-        fetchImpl: async (input, init) => {
-          calls.push({
-            body: JSON.parse(String(init?.body ?? "{}")),
-            url: String(input),
-          });
-          return jsonResponse(200, {
-            failure_class: null,
-            session: {
-              session_id: "session-1",
-              study_set_id: "study-set-1",
-              user_id: "user-1",
-            },
-            session_token: "placeholder-refreshed-material",
-            token_refresh_outcome: "refreshed",
-          });
-        },
-      },
-    );
-
-    expect(calls).toEqual([
-      {
-        body: {
-          session_id: "session-1",
-          session_token: "placeholder-current-material",
-          study_set_id: "study-set-1",
-          user_id: "user-1",
-        },
-        url: "http://localhost:3000/api/viva-session/refresh",
-      },
-    ]);
-    expect(result.session_token).toBe("placeholder-refreshed-material");
-  });
-
   test("controller sends initial session config and command frames", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
-      sessionToken: "signed-session-token",
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       url: "ws://localhost:4318/ws",
       token: "secret",
     });
@@ -267,7 +237,7 @@ describe("Viva agent browser client", () => {
     expect(sessionConfig.type).toBe("session_config");
     if (sessionConfig.type !== "session_config") throw new Error("Expected session config");
     expect(sessionConfig.client_generation_id).toBe("session_bootstrap-1");
-    expect(sessionConfig.session_token).toBe("signed-session-token");
+    expect(sessionConfig.session_token).toBe(SIGNED_SESSION_CREDENTIAL);
     expect("session_token" in sessionConfig.session).toBe(false);
 
     socket.message(JSON.stringify(readyFixture));
@@ -304,15 +274,29 @@ describe("Viva agent browser client", () => {
   test("controller clears stale connected state on reconnect", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       initialState: {
         ...initialVivaAgentSessionState(),
         status: "closed",
         question: {
+          concept_id: "oxidative-phosphorylation",
           question_id: "old-question",
           prompt: "Old prompt",
           expected_terms: [],
           follow_up: "old",
+          rubric: {
+            policy_version: "viva.rubric.v1",
+            criteria: [
+              {
+                claim: "Old claim.",
+                concept_id: "oxidative-phosphorylation",
+                criterion_id: "crit-old",
+                required: true,
+                source_id: "src-lecture-5-slide-18",
+              },
+            ],
+          },
           source: {
             confidence: "high",
             document_id: "lec-5",
@@ -323,15 +307,15 @@ describe("Viva agent browser client", () => {
           },
         },
         recap: {
-          voice_session_id: "voice-session-1",
+          concepts: [{ concept_id: "old", label: "Old", status: "strong" }],
+          deferred_turns: 0,
           headline: "Old recap",
-          summary: "Old summary",
-          strong_concepts: ["old"],
-          shaky_concepts: [],
-          missed_concepts: [],
-          review_later: [],
           next_action: "old",
+          review_schedule: [],
+          schema: "viva.study_session_recap.v2",
           source_moments: [],
+          summary: "Old summary",
+          voice_session_id: "voice-session-1",
         },
         transcript: "old transcript",
       },
@@ -354,6 +338,7 @@ describe("Viva agent browser client", () => {
       { responseId: "r2", frame: {} },
     ] as unknown as ReturnType<typeof initialVivaAgentSessionState>["audio"];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       initialState: { ...initialVivaAgentSessionState(), audio },
@@ -377,6 +362,7 @@ describe("Viva agent browser client", () => {
     const r2a = { responseId: "r2", frame: {} };
     const liveAudio = [r2a] as unknown as ReturnType<typeof initialVivaAgentSessionState>["audio"];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       initialState: { ...initialVivaAgentSessionState(), audio: liveAudio },
@@ -392,6 +378,7 @@ describe("Viva agent browser client", () => {
   test("controller preserves terminal recap when the server closes after stop", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       url: "ws://localhost:4318/ws",
@@ -447,16 +434,17 @@ describe("Viva agent browser client", () => {
         event: {
           type: "recap_ready",
           response_id: "response-a",
+          partial: false,
           recap: {
-            voice_session_id: "voice-session-1",
+            concepts: [],
+            deferred_turns: 0,
             headline: "Stale recap",
-            summary: "Old answer recap",
-            strong_concepts: [],
-            shaky_concepts: [],
-            missed_concepts: [],
-            review_later: [],
             next_action: "Keep working on the current answer.",
+            review_schedule: [],
+            schema: "viva.study_session_recap.v2",
             source_moments: [],
+            summary: "Old answer recap",
+            voice_session_id: "voice-session-1",
           },
         },
       }),
@@ -555,7 +543,21 @@ describe("Viva agent browser client", () => {
         event: {
           type: "question_started",
           response_id: "resp-2",
+          turn_id: "turn-resp-2",
           question: {
+            concept_id: "oxidative-phosphorylation",
+            rubric: {
+              policy_version: "viva.rubric.v1",
+              criteria: [
+                {
+                  claim: "Second question claim.",
+                  concept_id: "oxidative-phosphorylation",
+                  criterion_id: "crit-q2",
+                  required: true,
+                  source_id: "src-lecture-5-slide-18",
+                },
+              ],
+            },
             question_id: "q2",
             prompt: "Next question.",
             expected_terms: [],
@@ -645,6 +647,7 @@ describe("Viva agent browser client", () => {
   test("controller records sanitized close diagnostics when the server closes the socket", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       url: "ws://localhost:4318/ws",
@@ -670,6 +673,7 @@ describe("Viva agent browser client", () => {
   test("controller only displays allowlisted close reasons", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       url: "ws://localhost:4318/ws",
@@ -693,6 +697,7 @@ describe("Viva agent browser client", () => {
   test("controller preserves standardized auth close reasons for recovery classification", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
       url: "ws://localhost:4318/ws",
@@ -721,6 +726,7 @@ describe("Viva agent browser client", () => {
     ]) {
       FakeWebSocket.instances = [];
       const controller = createVivaAgentSessionController({
+        sessionToken: SIGNED_SESSION_CREDENTIAL,
         WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
         session: sessionFixture as AgentSessionConfig,
         url: "ws://localhost:4318/ws",
@@ -745,6 +751,7 @@ describe("Viva agent browser client", () => {
   test("controller reconnect closes the previous socket before opening a replacement", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
@@ -774,6 +781,7 @@ describe("Viva agent browser client", () => {
   test("controller ignores stale socket events and close frames from prior generations", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
@@ -815,7 +823,7 @@ describe("Viva agent browser client", () => {
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
-      sessionToken: "placeholder-initial-material",
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       url: "ws://localhost:4318/ws",
     });
 
@@ -832,9 +840,9 @@ describe("Viva agent browser client", () => {
     expect(controller.getState().phase).toBe("thinking");
 
     const refreshed = controller.refreshSession({
-      sessionToken: "placeholder-refreshed-material",
+      sessionToken: REFRESHED_SESSION_CREDENTIAL,
     }) as unknown as FakeWebSocket;
-    expect(refreshed.protocols).toEqual(vivaAgentProtocols("placeholder-refreshed-material"));
+    expect(refreshed.protocols).toEqual(vivaAgentProtocols(REFRESHED_SESSION_CREDENTIAL));
     expect(controller.getState().status).toBe("connecting");
     expect(controller.getState().phase).toBe("ready");
     expect(controller.getState().generation?.id).toBe("token_refresh-2");
@@ -853,7 +861,7 @@ describe("Viva agent browser client", () => {
     expect(refreshConfig.type).toBe("session_config");
     if (refreshConfig.type !== "session_config") throw new Error("Expected session config");
     expect(refreshConfig.client_generation_id).toBe("token_refresh-2");
-    expect(refreshConfig.session_token).toBe("placeholder-refreshed-material");
+    expect(refreshConfig.session_token).toBe(REFRESHED_SESSION_CREDENTIAL);
     refreshed.message(JSON.stringify(readyFixture));
 
     expect(controller.getState().status).toBe("open");
@@ -867,7 +875,7 @@ describe("Viva agent browser client", () => {
     const controller = createVivaAgentSessionController({
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       session: sessionFixture as AgentSessionConfig,
-      sessionToken: "placeholder-expired-material",
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       token: "placeholder-expired-material",
       url: "ws://localhost:4318/ws",
     });
@@ -882,6 +890,7 @@ describe("Viva agent browser client", () => {
   test("controller drops duplicate answer submits while a provider turn is pending", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
@@ -971,19 +980,25 @@ describe("Viva agent browser client", () => {
     }
 
     expect(state.question?.question_id).toBe("q-oxidative-phosphorylation-nadh");
-    expect(state.evaluation?.concept_status).toBe("shaky");
+    expect(state.evaluation?.concept_status).toBe("strong");
     expect(state.currentSource?.source_id).toBe("src-lecture-5-slide-18");
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
-    expect(state.currentConceptStatus).toBe("shaky");
-    expect(state.conceptStatuses.nadh).toBe("shaky");
+    expect(state.currentConceptStatus).toBe("strong");
+    expect(state.conceptStatuses["oxidative-phosphorylation"]).toBe("strong");
+    expect(state.conceptStatusEvents).toEqual([
+      {
+        conceptId: "oxidative-phosphorylation",
+        responseId: "response-1-generation-1",
+        status: "strong",
+      },
+    ]);
     expect(state.manuscriptIntents.map((event) => event.intent.type)).toEqual([
       "scene_intent",
-      "marginalia_intent",
       "entity_intent",
     ]);
     expect(state.recap?.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
-    expect(state.cancelledResponseIds).toContain("response-2");
+    expect(state.cancelledResponseIds).toContain("response-2-generation-1");
 
     const stale = parseVivaServerFrame({
       type: "event",
@@ -1008,8 +1023,22 @@ describe("Viva agent browser client", () => {
         event: {
           type: "question_started",
           response_id: "response-next",
+          turn_id: "turn-response-next",
           question: {
             ...currentQuestion,
+            concept_id: "oxidative-phosphorylation",
+            rubric: {
+              policy_version: "viva.rubric.v1",
+              criteria: [
+                {
+                  claim: "Next question claim.",
+                  concept_id: "oxidative-phosphorylation",
+                  criterion_id: "crit-q-next",
+                  required: true,
+                  source_id: "src-lecture-5-slide-18",
+                },
+              ],
+            },
             question_id: "q-next",
             prompt: "Next question",
           },
@@ -1019,7 +1048,7 @@ describe("Viva agent browser client", () => {
     expect(nextQuestion.currentSource).toBeUndefined();
     expect(nextQuestion.currentConceptStatus).toBeUndefined();
     expect(nextQuestion.sources).toEqual([]);
-    expect(nextQuestion.conceptStatuses.nadh).toBe("shaky");
+    expect(nextQuestion.conceptStatuses["oxidative-phosphorylation"]).toBe("strong");
   });
 
   test("reducer stores manuscript intents and suppresses stale intent events", () => {
@@ -1027,7 +1056,7 @@ describe("Viva agent browser client", () => {
     for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
       state = vivaAgentReducer(state, frame);
     }
-    expect(state.activeResponseId).toBe("response-1");
+    expect(state.activeResponseId).toBe("response-1-generation-1");
 
     state = vivaAgentReducer(
       state,
@@ -1036,14 +1065,14 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
         },
       }),
     );
     expect(state.manuscriptIntents).toEqual([
       {
-        responseId: "response-1",
+        responseId: "response-1-generation-1",
         intent: { type: "scene_intent", register: "examining", emphasis: "measured" },
       },
     ]);
@@ -1094,14 +1123,14 @@ describe("Viva agent browser client", () => {
     for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
       state = vivaAgentReducer(state, frame);
     }
-    expect(state.activeResponseId).toBe("response-1");
+    expect(state.activeResponseId).toBe("response-1-generation-1");
 
     state = vivaAgentReducer(
       state,
       parseVivaServerFrame({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
-        event: { type: "cancellation", response_id: "response-1" },
+        event: { type: "cancellation", response_id: "response-1-generation-1" },
       }),
     );
     const afterCancelledDelta = vivaAgentReducer(
@@ -1111,7 +1140,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "transcript_delta",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           text: "should not land",
         },
       }),
@@ -1126,7 +1155,7 @@ describe("Viva agent browser client", () => {
     for (const frame of fullSessionFixture.server.slice(0, 3).map(parseVivaServerFrame)) {
       state = vivaAgentReducer(state, frame);
     }
-    expect(state.activeResponseId).toBe("response-1");
+    expect(state.activeResponseId).toBe("response-1-generation-1");
     const source = state.question?.source;
     if (!source) throw new Error("Expected active question source");
     state = vivaAgentReducer(
@@ -1150,7 +1179,7 @@ describe("Viva agent browser client", () => {
 
     expect(state.activeResponseId).toBeUndefined();
     expect(state.phase).toBe("listening");
-    expect(state.cancelledResponseIds).toContain("response-1");
+    expect(state.cancelledResponseIds).toContain("response-1-generation-1");
 
     const staleFrames = [
       parseVivaServerFrame({
@@ -1158,7 +1187,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "answer_evaluated",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           evaluation: {
             question_id: "q-oxidative-phosphorylation-nadh",
             answer_text: "stale answer",
@@ -1176,7 +1205,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "source_reference",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           source,
         },
       }),
@@ -1185,17 +1214,22 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "recap_ready",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
+          partial: false,
           recap: {
-            voice_session_id: "voice-session-1",
+            concepts: [
+              { concept_id: "oxidative-phosphorylation", label: "NADH", status: "strong" },
+            ],
+            deferred_turns: 0,
             headline: "Stale recap",
-            summary: "Stale summary",
-            strong_concepts: ["NADH"],
-            shaky_concepts: [],
-            missed_concepts: [],
-            review_later: [],
             next_action: "Do not surface stale recap.",
-            source_moments: [{ text: "Stale source", source, status: "strong" }],
+            review_schedule: [],
+            schema: "viva.study_session_recap.v2",
+            source_moments: [
+              { response_id: "response-1-generation-1", source_id: "src-lecture-5-slide-18" },
+            ],
+            summary: "Stale summary",
+            voice_session_id: "voice-session-1",
           },
         },
       }),
@@ -1204,7 +1238,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "audio_delta",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           frame: { pcm16_base64: "AQIDBA==" },
         },
       }),
@@ -1231,7 +1265,7 @@ describe("Viva agent browser client", () => {
       parseVivaServerFrame({
         type: "event",
         version: VIVA_VOICE_PROTOCOL_VERSION,
-        event: { type: "cancellation", response_id: "response-1" },
+        event: { type: "cancellation", response_id: "response-1-generation-1" },
       }),
     );
 
@@ -1242,7 +1276,7 @@ describe("Viva agent browser client", () => {
         version: VIVA_VOICE_PROTOCOL_VERSION,
         event: {
           type: "manuscript_intent",
-          response_id: "response-1",
+          response_id: "response-1-generation-1",
           intent: { type: "scene_intent", register: "correcting", emphasis: "marked" },
         },
       }),
@@ -1504,6 +1538,7 @@ describe("bounded audio turn ledger", () => {
       WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
       generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
       session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
       url: "ws://localhost:4318/ws",
     });
     const socket = controller.connect() as unknown as FakeWebSocket;
@@ -1955,3 +1990,313 @@ function jsonResponse(status: number, body: unknown) {
     json: async () => body,
   } as Response;
 }
+
+/**
+ * `WEBSESSION-DATA-01` — the authenticated study projection client.
+ *
+ * The projection is the only study/session read model; there is no library
+ * metadata fallback and no seed overlay to fall through to.
+ */
+describe("authenticated study projection client", () => {
+  const SENTINEL = "VIVA_PROJECTION_SENTINEL_TOKEN";
+
+  function thermoProjection(overrides: Record<string, unknown> = {}) {
+    return {
+      activeQuestion: {
+        conceptId: "enthalpy",
+        id: "q-enthalpy-1",
+        prompt: "Why is enthalpy a state function?",
+        sourceCitations: [
+          {
+            confidence: "high",
+            documentId: "chem-lec-3",
+            label: "Lecture 3 · slide 11",
+            sourceId: "src-chem-lec-3-slide-11",
+            span: "slide:11",
+          },
+        ],
+      },
+      concepts: [
+        {
+          dueAt: "2026-08-27T09:00:00.000Z",
+          id: "enthalpy",
+          label: "Enthalpy",
+          lastReviewedAt: "2026-08-20T09:00:00.000Z",
+          status: "shaky",
+        },
+        {
+          dueAt: "2026-08-26T09:00:00.000Z",
+          id: "gibbs-free-energy",
+          label: "Gibbs free energy",
+          lastReviewedAt: null,
+          status: "missed",
+        },
+      ],
+      questionProgress: { completed: 2, total: 5 },
+      reviewSchedule: [
+        {
+          authority: "server_persisted_fsrs",
+          conceptId: "enthalpy",
+          dueAt: "2026-08-27T09:00:00.000Z",
+        },
+        {
+          authority: "server_persisted_fsrs",
+          conceptId: "gibbs-free-energy",
+          dueAt: "2026-08-26T09:00:00.000Z",
+        },
+      ],
+      session: { goal: null, id: "voice-session-9", mode: "quiz" },
+      studySet: {
+        course: "CHEM-401",
+        examLabel: "Oral final",
+        id: "thermo-401",
+        ingestionStatus: "ready",
+        title: "Thermodynamic State Functions",
+      },
+      version: 1,
+      ...overrides,
+    };
+  }
+
+  function request(signal = new AbortController().signal) {
+    return {
+      accessToken: "viva1.projection-access-token",
+      signal,
+      studySetId: "thermo 401/α",
+      voiceSessionId: "voice session 9",
+    };
+  }
+
+  type FetchCall = { init?: RequestInit; url: string };
+
+  function recordingFetch(responses: Array<() => Response | Promise<Response>>) {
+    const calls: FetchCall[] = [];
+    const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(url) });
+      const next = responses[Math.min(calls.length, responses.length) - 1];
+      if (!next) throw new Error("no response configured");
+      return next();
+    }) as typeof fetch;
+    return { calls, fetchImpl };
+  }
+
+  function projectionResponse(body: unknown, status = 200, headers: Record<string, string> = {}) {
+    return new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json", ...headers },
+      status,
+    });
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test("sends the exact same-origin request and carries no credential in the URL", async () => {
+    const { calls, fetchImpl } = recordingFetch([() => projectionResponse(thermoProjection())]);
+    const signal = new AbortController().signal;
+    const result = await fetchAuthenticatedStudyProjection(request(signal), fetchImpl);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(
+      "/api/viva-session/projection?study_set_id=thermo+401%2F%CE%B1&voice_session_id=voice+session+9",
+    );
+    expect(calls[0]?.init?.method).toBe("GET");
+    expect(calls[0]?.init?.cache).toBe("no-store");
+    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe(
+      "Bearer viva1.projection-access-token",
+    );
+    // `Sec-Fetch-Site` is a forbidden header name: the browser's own same-origin
+    // fetch metadata is the proof Plan 11's guard reads, and a script that tried
+    // to set it would simply have it dropped.
+    expect(new Headers(calls[0]?.init?.headers).get("sec-fetch-site")).toBe(null);
+    expect(calls[0]?.url).not.toContain("viva1.");
+    // The attempt carries its OWN signal — the caller's is forwarded into it,
+    // never handed to `fetch` directly, so one attempt's deadline can never
+    // cancel a later one.
+    expect(calls[0]?.init?.signal).not.toBe(signal);
+    expect(calls[0]?.init?.signal instanceof AbortSignal).toBe(true);
+    expect(result.status).toBe("ready");
+  });
+
+  test("forwards the caller's abort into the in-flight attempt", async () => {
+    const controller = new AbortController();
+    let observed: AbortSignal | undefined;
+    const pending = fetchAuthenticatedStudyProjection(request(controller.signal), ((
+      _url: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      observed = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+          once: true,
+        });
+      });
+    }) as typeof fetch);
+
+    await Promise.resolve();
+    expect(observed?.aborted).toBe(false);
+    controller.abort();
+    expect(observed?.aborted).toBe(true);
+    expect(await pending).toEqual({ cause: "unavailable", status: "failed" });
+  });
+
+  test("returns the validated projection, reconstructed and frozen", async () => {
+    const { fetchImpl } = recordingFetch([() => projectionResponse(thermoProjection())]);
+    const result = await fetchAuthenticatedStudyProjection(request(), fetchImpl);
+
+    if (result.status !== "ready") throw new Error("expected a ready projection");
+    expect(result.projection).toEqual(thermoProjection());
+    expect(Object.isFrozen(result.projection)).toBe(true);
+    expect(result.projection.reviewSchedule[0]?.authority).toBe("server_persisted_fsrs");
+  });
+
+  test("maps each locked failure status to its exact sanitized cause", async () => {
+    const cases: Array<[number, string, Record<string, string>]> = [
+      [400, "invalid_request", {}],
+      [401, "unauthorized", {}],
+      [403, "unauthorized", {}],
+      [404, "not_found", {}],
+      [503, "unavailable", {}],
+    ];
+    for (const [status, cause, headers] of cases) {
+      const { calls, fetchImpl } = recordingFetch([
+        () => projectionResponse({ error: "refused", title: SENTINEL }, status, headers),
+      ]);
+      const result = await fetchAuthenticatedStudyProjection(request(), fetchImpl);
+
+      expect(result).toEqual({ cause, status: "failed" });
+      // One request each: an answer is not an outage, and the shared-store 503
+      // has no agent fallback to try.
+      expect(calls).toHaveLength(1);
+      expect(JSON.stringify(result)).not.toContain(SENTINEL);
+    }
+  });
+
+  test("carries a bounded integer Retry-After through a rate limit and nothing else", async () => {
+    const limited = recordingFetch([
+      () =>
+        projectionResponse({ error: "session_projection_rate_limited" }, 429, {
+          "retry-after": "12",
+        }),
+    ]);
+    const dateForm = recordingFetch([
+      () =>
+        projectionResponse({ error: "session_projection_rate_limited" }, 429, {
+          "retry-after": "Wed, 26 Aug 2026 09:00:00 GMT",
+        }),
+    ]);
+
+    expect(await fetchAuthenticatedStudyProjection(request(), limited.fetchImpl)).toEqual({
+      cause: "rate_limited",
+      retryAfterSeconds: 12,
+      status: "failed",
+    });
+    expect(await fetchAuthenticatedStudyProjection(request(), dateForm.fetchImpl)).toEqual({
+      cause: "rate_limited",
+      status: "failed",
+    });
+    expect(limited.calls).toHaveLength(1);
+    expect(dateForm.calls).toHaveLength(1);
+  });
+
+  test("retries once after 502 and once after 504, then terminates", async () => {
+    const recovered = recordingFetch([
+      () => projectionResponse({ error: "viva_session_projection_unavailable" }, 502),
+      () => projectionResponse(thermoProjection()),
+    ]);
+    const exhausted502 = recordingFetch([
+      () => projectionResponse({ error: "viva_session_projection_unavailable" }, 502),
+      () => projectionResponse({ error: "viva_session_projection_unavailable" }, 502),
+    ]);
+    const exhausted504 = recordingFetch([
+      () => projectionResponse({ error: "viva_session_projection_timeout" }, 504),
+      () => projectionResponse({ error: "viva_session_projection_timeout" }, 504),
+    ]);
+
+    expect((await fetchAuthenticatedStudyProjection(request(), recovered.fetchImpl)).status).toBe(
+      "ready",
+    );
+    expect(recovered.calls).toHaveLength(2);
+    expect(await fetchAuthenticatedStudyProjection(request(), exhausted502.fetchImpl)).toEqual({
+      cause: "unavailable",
+      status: "failed",
+    });
+    expect(exhausted502.calls).toHaveLength(2);
+    expect(await fetchAuthenticatedStudyProjection(request(), exhausted504.fetchImpl)).toEqual({
+      cause: "timeout",
+      status: "failed",
+    });
+    expect(exhausted504.calls).toHaveLength(2);
+  });
+
+  test("each attempt owns an independent 8,000 ms deadline", async () => {
+    jest.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    let settleFirst: ((response: Response) => void) | undefined;
+    const fetchImpl = ((_url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      if (signals.length === 1) {
+        return new Promise<Response>((resolve, reject) => {
+          settleFirst = resolve;
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
+      }
+      return Promise.resolve(projectionResponse(thermoProjection()));
+    }) as typeof fetch;
+
+    const pending = fetchAuthenticatedStudyProjection(request(), fetchImpl);
+    jest.advanceTimersByTime(VIVA_STUDY_PROJECTION_TIMEOUT_MS - 1);
+    expect(signals[0]?.aborted).toBe(false);
+    jest.advanceTimersByTime(1);
+    expect(signals[0]?.aborted).toBe(true);
+    // A client-side deadline is not a 502/504, so it terminates rather than
+    // spending a second attempt.
+    expect(await pending).toEqual({ cause: "timeout", status: "failed" });
+    expect(signals).toHaveLength(1);
+    expect(typeof settleFirst).toBe("function");
+  });
+
+  test("an invalid or non-JSON 200 is invalid_projection and leaks no upstream text", async () => {
+    const wrongAuthority = recordingFetch([
+      () =>
+        projectionResponse(
+          thermoProjection({
+            reviewSchedule: [
+              {
+                authority: "core_fsrs_read_time",
+                conceptId: "enthalpy",
+                dueAt: "2026-08-27T09:00:00.000Z",
+              },
+              {
+                authority: "server_persisted_fsrs",
+                conceptId: "gibbs-free-energy",
+                dueAt: "2026-08-26T09:00:00.000Z",
+              },
+            ],
+          }),
+        ),
+    ]);
+    const unknownField = recordingFetch([
+      () => projectionResponse(thermoProjection({ smuggled: SENTINEL })),
+    ]);
+    const notJson = recordingFetch([() => new Response(`not json ${SENTINEL}`, { status: 200 })]);
+
+    for (const attempt of [wrongAuthority, unknownField, notJson]) {
+      const result = await fetchAuthenticatedStudyProjection(request(), attempt.fetchImpl);
+      expect(result).toEqual({ cause: "invalid_projection", status: "failed" });
+      expect(JSON.stringify(result)).not.toContain(SENTINEL);
+      expect(attempt.calls).toHaveLength(1);
+    }
+  });
+
+  test("a network failure is unavailable, never a thrown fetch message", async () => {
+    const result = await fetchAuthenticatedStudyProjection(request(), (async () => {
+      throw new Error(`ECONNREFUSED ${SENTINEL}`);
+    }) as typeof fetch);
+
+    expect(result).toEqual({ cause: "unavailable", status: "failed" });
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+});
