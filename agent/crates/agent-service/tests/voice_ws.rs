@@ -17,8 +17,8 @@ use agent_domain::{
     RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, ReviewOutcomeV1,
     ReviewSchedulingContextV1, SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore,
     StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
-    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
-    VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome,
+    TerminalSessionReason, VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
     begin_drain_and_wait, build_router, verify_session_token_at, AppState, ClientFrame,
@@ -4469,6 +4469,812 @@ async fn authenticated_projection_sanitizes_store_failures() {
             "the caller learns only this route's coarse code"
         );
     }
+}
+
+const STARTED_SESSION_SECRET: &str = "viva-fixture-started-session-secret1";
+const STARTED_SESSION_ORIGIN: &str = "http://localhost:3000";
+
+/// Logs every `record_voice_session` the service performs, with the outcome the
+/// store answered, so the write order and the exact `StudyStoreWriteOutcome`
+/// vocabulary can be asserted at the service boundary rather than inferred.
+struct StartedSessionAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    writes: Mutex<Vec<(String, Result<StudyStoreWriteOutcome, String>)>>,
+}
+
+impl StartedSessionAuditStore {
+    fn new(inner: Arc<data::InMemoryStudyStore>) -> Self {
+        Self {
+            inner,
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn writes(&self) -> Vec<(String, Result<StudyStoreWriteOutcome, String>)> {
+        self.writes.lock().expect("write log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for StartedSessionAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    /// The one intercepted call: the outcome is logged and then returned unchanged.
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        let outcome = self.inner.record_voice_session(config).await;
+        self.writes.lock().expect("write log").push((
+            config
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            outcome
+                .as_ref()
+                .copied()
+                .map_err(|error| error.kind().as_str().to_owned()),
+        ));
+        outcome
+    }
+
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        self.inner
+            .pending_answer_attempts_for_session(voice_session_id)
+            .await
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::StudySessionDurableCounts, PortError> {
+        self.inner
+            .study_session_durable_counts(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn answer_attempt_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Result<bool, PortError> {
+        self.inner
+            .answer_attempt_was_recorded(user_id, study_set_id, voice_session_id, response_id)
+            .await
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
+    async fn close_voice_session(
+        &self,
+        voice_session_id: &str,
+        terminal_reason: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .close_voice_session(voice_session_id, terminal_reason)
+            .await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn library_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<agent_domain::StudyLibrarySnapshot, PortError> {
+        self.inner.library_snapshot(user_id).await
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner.delete_study_set(user_id, study_set_id).await
+    }
+
+    async fn delete_session_history(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .delete_session_history(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_question_started(user_id, study_set_id, voice_session_id, question)
+            .await
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_source_reference(user_id, study_set_id, voice_session_id, source)
+            .await
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_manuscript_intent(user_id, study_set_id, voice_session_id, intent)
+            .await
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_usage(event).await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: agent_domain::ChallengeResolution,
+    ) -> Result<agent_domain::ChallengeResolution, PortError> {
+        self.inner
+            .record_challenge_resolution(user_id, study_set_id, voice_session_id, resolution)
+            .await
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+/// A store whose library snapshot answers but whose voice-session write cannot
+/// commit — the fail-closed case for the start mint.
+struct RefusingVoiceSessionStore {
+    inner: Arc<data::InMemoryStudyStore>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for RefusingVoiceSessionStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::durability(
+            "memory",
+            config
+                .session_id
+                .as_ref()
+                .map_or("unknown", |session_id| session_id.as_str()),
+            "voice session write refused by the harness",
+        ))
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn library_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<agent_domain::StudyLibrarySnapshot, PortError> {
+        self.inner.library_snapshot(user_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+}
+
+/// The deployment shape `main.rs` builds for a public signed-start service: the
+/// session-token secret mints the start credential, and the scoped library-read
+/// credential plus that same secret construct the projection route.
+fn signed_start_state(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(STARTED_SESSION_SECRET.into()),
+            allowed_origins: vec![STARTED_SESSION_ORIGIN.to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        STARTED_SESSION_SECRET.into(),
+        vec![STARTED_SESSION_ORIGIN.to_owned()],
+    ))
+}
+
+/// Performs the product's own signed start: the library snapshot that
+/// `POST /api/viva-session/start` reads, returning the exact `session_id` and
+/// `session_token` pair the web tier hands the browser.
+async fn signed_start(app: &axum::Router, study_set_id: &str) -> (String, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", STARTED_SESSION_ORIGIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the library snapshot is the mint path"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let start = payload["study_sets"]
+        .as_array()
+        .expect("study sets")
+        .iter()
+        .find(|set| set["id"] == study_set_id)
+        .unwrap_or_else(|| panic!("{study_set_id} missing from the library snapshot"))["actions"]
+        ["start"]
+        .clone();
+    assert_eq!(
+        start["available"], true,
+        "the fixture set must offer a signed start: {start}"
+    );
+    (
+        start["session_id"]
+            .as_str()
+            .expect("minted session id")
+            .to_owned(),
+        start["session_token"]
+            .as_str()
+            .expect("minted session token")
+            .to_owned(),
+    )
+}
+
+async fn projection_after_start(
+    app: &axum::Router,
+    study_set_id: &str,
+    session_id: &str,
+    session_token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(projection_request(ProjectionRequest {
+            uri: &format!("/v1/study-sets/{study_set_id}/projection?voice_session_id={session_id}"),
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(session_token),
+            origin: Some(STARTED_SESSION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// `A-32`: the signed start IS the session. The mint records the `voice_sessions`
+/// row `authenticated_study_projection` requires, with the same identity the socket
+/// later claims, so the projection validates before any socket exists.
+///
+/// Without that write the deadlock lane 12 probed is exact: the start mints an id,
+/// the projection refuses it because no row exists, and the client never opens the
+/// socket that is the row's only other writer.
+#[tokio::test]
+async fn signed_start_records_the_voice_session_its_projection_requires() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let (session_id, session_token) = signed_start(&app, "biology-midterm").await;
+
+    let recorded = inner
+        .snapshot()
+        .sessions
+        .into_iter()
+        .filter(|session| session.voice_session_id == session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the signed start records exactly one voice session"
+    );
+    assert_eq!(recorded[0].user_id, "user-1");
+    assert_eq!(recorded[0].study_set_id, "biology-midterm");
+    assert_eq!(recorded[0].status, "open");
+    assert_eq!(recorded[0].mode, StudyMode::Quiz);
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "the mint performs exactly one insert, through the record_voice_session port"
+    );
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the started session must be projectable before any socket opens: {projection}"
+    );
+    assert_eq!(projection["session"]["id"], session_id);
+    assert_eq!(projection["session"]["mode"], "quiz");
+}
+
+/// `A-32`: a start that cannot be recorded is not a start. The service reports the
+/// action unavailable rather than handing out a credential whose projection can
+/// never validate.
+#[tokio::test]
+async fn signed_start_is_unavailable_when_the_voice_session_cannot_be_recorded() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(RefusingVoiceSessionStore {
+        inner: inner.clone(),
+    });
+    let app = build_router(signed_start_state(store, inner.clone()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header("origin", STARTED_SESSION_ORIGIN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let start = payload["study_sets"]
+        .as_array()
+        .expect("study sets")
+        .iter()
+        .find(|set| set["id"] == "biology-midterm")
+        .expect("fixture set")["actions"]["start"]
+        .clone();
+    assert_eq!(
+        start["available"], false,
+        "a store that cannot record the session must not advertise a start"
+    );
+    assert_eq!(start["unavailable_reason"], "session_record_unavailable");
+    assert!(
+        start["session_token"].is_null(),
+        "no credential is minted for a session that was never recorded"
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a refused start records nothing"
+    );
+}
+
+/// `A-32`, the full entry flow over a real socket: signed start, projection valid
+/// pre-socket, the socket opens with the same credential, its own provisioning
+/// replays the started session idempotently — one row, the `IdempotentReplay`
+/// outcome, no error — and the session proceeds to its first question.
+#[tokio::test]
+async fn signed_start_projection_and_socket_complete_the_entry_flow() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    // One store behind both the HTTP mint and the socket's provider, so the two
+    // writes and their outcomes are observed on the same port.
+    let state = signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (session_id, session_token) = signed_start(&app, "biology-midterm").await;
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connectionEligible requires a valid projection before the socket: {projection}"
+    );
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    // The browser presents the same canonical origin the start was minted from.
+    let mut request = token_only_request(&url, &session_token);
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+    let (mut socket, _) = connect_async(request)
+        .await
+        .expect("the minted credential opens the socket");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", &session_id, &session_token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the started session proceeds to its first question, got {question:?}"
+    );
+
+    let writes = store.writes();
+    assert_eq!(
+        writes,
+        vec![
+            (session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted)),
+            (
+                session_id.clone(),
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            ),
+        ],
+        "the socket's own provisioning is an idempotent replay of the started session"
+    );
+    assert_eq!(
+        inner
+            .snapshot()
+            .sessions
+            .iter()
+            .filter(|session| session.voice_session_id == session_id)
+            .count(),
+        1,
+        "the replay must not create a second session"
+    );
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
 }
 
 /// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard

@@ -5,8 +5,8 @@
 //! changed; only the file the code lives in and the visibility the move forces.
 
 use agent_domain::{
-    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary,
-    StudySetIngestionStatus,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, SessionConfig,
+    SessionId, StudyMode, StudySetIngestionStatus, StudyStoreWriteOutcome,
 };
 use axum::{
     extract::{rejection::QueryRejection, Path, Query},
@@ -161,71 +161,67 @@ pub(super) async fn library_snapshot(
         }
     };
     let request_origin = request_origin(&headers).map(ToOwned::to_owned);
-    let study_sets = snapshot
-        .study_sets
-        .into_iter()
-        .map(|study_set| {
-            let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
-            let unavailable_reason = study_set_start_unavailable_reason(&study_set);
-            let start = match unavailable_reason {
-                Some(reason) => unavailable_action(reason),
-                None => {
-                    let session_id = Uuid::new_v4().to_string();
-                    signed_library_action(
-                        &state,
-                        &study_set.user_id,
-                        &study_set.id,
-                        session_id,
-                        request_origin.as_deref(),
-                    )
-                }
-            };
-            let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
-                (Some(reason), _) => unavailable_action(reason),
-                (None, Some(session_id)) => signed_library_action(
+    let mut study_sets = Vec::with_capacity(snapshot.study_sets.len());
+    for study_set in snapshot.study_sets {
+        let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
+        let unavailable_reason = study_set_start_unavailable_reason(&study_set);
+        let start = match unavailable_reason {
+            Some(reason) => unavailable_action(reason),
+            None => {
+                recorded_signed_start_action(
                     &state,
                     &study_set.user_id,
                     &study_set.id,
-                    session_id,
                     request_origin.as_deref(),
-                ),
-                (None, None) => unavailable_action("no_open_session"),
-            };
-            let mutation_auth_unavailable_reason =
-                library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
-            let delete = if let Some(reason) = mutation_auth_unavailable_reason {
-                unavailable_action(reason)
-            } else if mutation_control_token.is_none() {
-                unavailable_action("control_token_unavailable")
-            } else if study_set.server_owned
-                && !study_set.documents.is_empty()
-                && study_set.documents.iter().any(|document| !document.deleted)
-            {
-                available_mutation_action(mutation_control_token.clone())
-            } else {
-                unavailable_action(unavailable_reason.unwrap_or("source_deleted"))
-            };
-
-            LibraryStudySetResponse {
-                id: study_set.id,
-                user_id: study_set.user_id,
-                title: study_set.title,
-                course: study_set.course,
-                ingestion_status: study_set.ingestion_status,
-                ingestion_error: study_set.ingestion_error,
-                server_owned: study_set.server_owned,
-                documents: study_set.documents,
-                concept_count: study_set.concept_count,
-                question_count: study_set.question_count,
-                actions: LibraryStudySetActions {
-                    start,
-                    resume,
-                    archive: unavailable_action("server_mutation_unavailable"),
-                    delete,
-                },
+                )
+                .await
             }
-        })
-        .collect::<Vec<_>>();
+        };
+        let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
+            (Some(reason), _) => unavailable_action(reason),
+            (None, Some(session_id)) => signed_library_action(
+                &state,
+                &study_set.user_id,
+                &study_set.id,
+                session_id,
+                request_origin.as_deref(),
+            ),
+            (None, None) => unavailable_action("no_open_session"),
+        };
+        let mutation_auth_unavailable_reason =
+            library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
+        let delete = if let Some(reason) = mutation_auth_unavailable_reason {
+            unavailable_action(reason)
+        } else if mutation_control_token.is_none() {
+            unavailable_action("control_token_unavailable")
+        } else if study_set.server_owned
+            && !study_set.documents.is_empty()
+            && study_set.documents.iter().any(|document| !document.deleted)
+        {
+            available_mutation_action(mutation_control_token.clone())
+        } else {
+            unavailable_action(unavailable_reason.unwrap_or("source_deleted"))
+        };
+
+        study_sets.push(LibraryStudySetResponse {
+            id: study_set.id,
+            user_id: study_set.user_id,
+            title: study_set.title,
+            course: study_set.course,
+            ingestion_status: study_set.ingestion_status,
+            ingestion_error: study_set.ingestion_error,
+            server_owned: study_set.server_owned,
+            documents: study_set.documents,
+            concept_count: study_set.concept_count,
+            question_count: study_set.question_count,
+            actions: LibraryStudySetActions {
+                start,
+                resume,
+                archive: unavailable_action("server_mutation_unavailable"),
+                delete,
+            },
+        });
+    }
 
     (
         StatusCode::OK,
@@ -519,6 +515,55 @@ pub(super) fn available_mutation_action(control_token: Option<String>) -> Librar
         session_token: None,
         control_token,
         unavailable_reason: None,
+    }
+}
+
+/// `A-32`: a started session IS a session.
+///
+/// The signed start mints a session id and, in the same step, records the
+/// `voice_sessions` row `authenticated_study_projection` requires — under the
+/// exact identity (`user_id`, `study_set_id`, `session_id`, `D-03B` quiz mode) the
+/// socket's own provisioning claims later. The projection therefore validates
+/// before any socket exists, which is what the browser's `connectionEligible`
+/// gate waits for; the socket's own `record_voice_session` is then an idempotent
+/// replay of this row, never a second session.
+///
+/// Fail closed in both directions: no row is written unless a credential could
+/// actually be minted for it, and no credential is returned unless its row
+/// committed. A store that cannot record the session reports the start
+/// unavailable rather than handing out a credential whose projection can never
+/// validate.
+pub(super) async fn recorded_signed_start_action(
+    state: &AppState,
+    user_id: &str,
+    study_set_id: &str,
+    origin: Option<&str>,
+) -> LibraryAction {
+    let session_id = Uuid::new_v4().to_string();
+    let action = signed_library_action(state, user_id, study_set_id, session_id.clone(), origin);
+    if !action.available {
+        return action;
+    }
+    let recorded = state
+        .study_store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new(session_id)),
+            user_id: Some(user_id.to_owned()),
+            study_set_id: Some(study_set_id.to_owned()),
+            // `D-03B QUIZ_ONLY`: the only mode this service starts, and the mode a
+            // later `session_config` is sanitized to, so the socket's replay
+            // matches this row instead of conflicting with it.
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await;
+    match recorded {
+        // A fresh v4 identifier can only insert; the replay arm is named because
+        // the outcome is the vocabulary this write speaks, not a value to discard.
+        Ok(StudyStoreWriteOutcome::Inserted | StudyStoreWriteOutcome::IdempotentReplay) => action,
+        // The store's own diagnostic never reaches the browser: the action carries
+        // one fixed reason, exactly like every other unavailable start.
+        Err(_) => unavailable_action("session_record_unavailable"),
     }
 }
 

@@ -11,8 +11,8 @@ use agent_domain::{
     BrainEvent, BrainFailureClass, BrainFailureStage, BrainInput, BrainProviderError,
     BrainProviderFailure, BrainProviderFailureParts, PortError, PortErrorKind, RealtimeSession,
     RealtimeSessionTaskGuard, SessionConfig, SessionTokenNonceClaim, StudyQuestion,
-    StudySessionDurableCounts, StudySessionPhase, StudySessionRecap, TerminalSessionReason,
-    VoiceUsageRecord,
+    StudySessionDurableCounts, StudySessionPhase, StudySessionRecap, StudyStoreWriteOutcome,
+    TerminalSessionReason, VoiceUsageRecord,
 };
 use axum::{
     extract::{
