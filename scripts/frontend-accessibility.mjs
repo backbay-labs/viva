@@ -955,9 +955,14 @@ async function checkZoomSafety(browser, baseUrl) {
           style.overflowX === "hidden" ||
           style.textOverflow === "ellipsis";
         if (clippedHorizontally && el.scrollWidth > el.clientWidth + 1) {
-          truncated.push(
-            (el.textContent ?? el.getAttribute("aria-label") ?? "").trim().slice(0, 80),
-          );
+          // `Element.textContent` is never null (only ever "" for an empty
+          // element), so a `??` fallback to `aria-label` here could never
+          // trigger -- an icon-only `[aria-label]` match would report an
+          // empty failure message. `||` falls through on the empty string
+          // too, so a real aria-label still names the element.
+          const ownText = (el.textContent ?? "").trim();
+          const label = ownText || (el.getAttribute("aria-label") ?? "").trim();
+          truncated.push(label.slice(0, 80));
         }
       }
       return { overflow, truncated };
@@ -984,9 +989,26 @@ async function checkZoomSafety(browser, baseUrl) {
  * agent-connected session surface — Frontend C3/C7's responsive-story matrix
  * (rows 592/596/530) previously only ever ran against `/`. Resizes the
  * ALREADY-MOUNTED `/session` page (never a fresh navigation, so the real
- * agent connection survives) to 320x568, applies the same 200% root
- * text-scale `checkZoomSafety` above uses, and asserts document horizontal
- * overflow stays at most 1px and no visible session copy is clipped.
+ * agent connection survives) to 320x568 and applies the same 200% root
+ * text-scale `checkZoomSafety` above uses.
+ *
+ * Unlike `/`, `/session` nests a genuine, pre-existing `.live-session {
+ * overflow-x: hidden }` containment rule — an adversarial review caught that
+ * `checkZoomSafety`'s `document.documentElement.scrollWidth` probe is dead
+ * by construction on this route (that containment always keeps the
+ * *document's own* scrollWidth pinned to its clientWidth, however far
+ * something clips *inside* it), while a real concept-status chip sat 38px
+ * past the viewport edge, undetected. This instead asserts, directly, that
+ * no visible, non-`aria-hidden` element's own rendered box extends past the
+ * viewport's right edge — the general form of "does not clip or
+ * horizontally overflow" that holds regardless of which nested container
+ * (if any) locally contains the overflow, so it cannot be defeated the same
+ * way again by some other future container growing its own `overflow-x:
+ * hidden`. The truncation scan is likewise generalized from a hardcoded
+ * per-route selector allowlist (blind to any element this file's authors
+ * didn't happen to list — it missed `.session-capsule__primary`'s own real
+ * ellipsis truncation) to every element carrying its own direct,
+ * non-whitespace text, wherever it sits in the DOM.
  *
  * @param {import("playwright").Page} page — an already-navigated, mounted /session page
  */
@@ -1001,36 +1023,71 @@ async function checkSessionZoomSafety(page) {
   });
   await page.waitForTimeout(100);
   const report = await page.evaluate(() => {
-    const doc = document.documentElement;
-    const overflow = Math.max(0, doc.scrollWidth - doc.clientWidth);
+    function isVisible(el) {
+      const rect = el.getBoundingClientRect();
+      // The standard "visually hidden but accessible" technique (`.sr-only`
+      // here: `width: 1px; height: 1px; ... clip: rect(0, 0, 0, 0)`) is a
+      // deliberate, correct pattern -- its content reaches assistive tech
+      // through the accessibility tree, never through pixels, so it is
+      // never "clipped" in the sense this check cares about. No genuine
+      // piece of on-screen content renders at 1px x 1px or smaller.
+      if (rect.width <= 1 || rect.height <= 1) return false;
+      const style = getComputedStyle(el);
+      if (style.visibility === "hidden" || style.display === "none") return false;
+      if (el.closest('[aria-hidden="true"], [hidden]')) return false;
+      return true;
+    }
+    // An element's OWN direct text (ignoring descendant elements' text, so
+    // a wrapping ancestor is never flagged a second time for the same
+    // truncated leaf) — real content a reader needs, not decoration.
+    function ownText(el) {
+      return [...el.childNodes]
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent)
+        .join(" ")
+        .trim();
+    }
+    function describe(el) {
+      const label = ownText(el) || (el.getAttribute("aria-label") ?? "").trim();
+      const className = typeof el.className === "string" ? el.className : "";
+      const selector = className
+        ? `${el.tagName.toLowerCase()}.${className.split(/\s+/).join(".")}`
+        : el.tagName.toLowerCase();
+      return `<${selector}> "${label.slice(0, 80)}"`;
+    }
+
+    const viewportWidth = document.documentElement.clientWidth;
+    const offscreen = [];
     const truncated = [];
-    const copyNodes = document.querySelectorAll(
-      ".session-consent__label, .session-consent__copy, .margin-note__title, .margin-note__text, " +
-        ".margin-note__next, .margin-note__hint, .written-answer__note, [aria-label]",
-    );
-    for (const el of copyNodes) {
+    for (const el of document.body.querySelectorAll("*")) {
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.right > viewportWidth + 1) {
+        offscreen.push(
+          `${describe(el)} right edge at ${Math.round(rect.right * 100) / 100}px (viewport is ${viewportWidth}px)`,
+        );
+      }
+      if (!ownText(el)) continue;
       const style = getComputedStyle(el);
       const clippedHorizontally =
         style.overflow === "hidden" ||
         style.overflowX === "hidden" ||
         style.textOverflow === "ellipsis";
       if (clippedHorizontally && el.scrollWidth > el.clientWidth + 1) {
-        truncated.push(
-          (el.textContent ?? el.getAttribute("aria-label") ?? "").trim().slice(0, 80),
-        );
+        truncated.push(describe(el));
       }
     }
-    return { overflow, truncated };
+    return { offscreen, truncated };
   });
-  if (report.overflow > 1) {
+  for (const item of report.offscreen) {
     failures.push(
-      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] document horizontal ` +
-        `overflow is ${report.overflow}px, expected <= 1px`,
+      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] visible content extends past ` +
+        `the viewport: ${item}`,
     );
   }
-  for (const text of report.truncated) {
+  for (const item of report.truncated) {
     failures.push(
-      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] copy is truncated: "${text}"`,
+      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] copy is truncated: ${item}`,
     );
   }
   return failures;

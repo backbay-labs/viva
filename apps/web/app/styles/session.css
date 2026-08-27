@@ -590,6 +590,24 @@
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * `A-31.4(b)`: `StudyContextBar`'s per-concept row (`LiveSessionShell.tsx`,
+ * `<li data-status><span>{label}</span><span>{status}</span></li>`) is
+ * otherwise unstyled — two adjacent inline `<span>`s with no separating
+ * whitespace between them share no line-break opportunity, so at a 200%
+ * text scale the second (status) span can be pushed past the 320px
+ * viewport edge instead of wrapping. `display: flex` gives each span its
+ * own wrappable box (falling to its own line as a whole unit rather than
+ * being clipped mid-word) and `gap` restores the visual separation the
+ * missing whitespace otherwise removes, at every viewport width.
+ */
+.session-study-context__concepts li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35em;
+}
+
 .live-session__stage-wrap {
   position: relative;
   z-index: 5;
@@ -2256,6 +2274,23 @@
   .session-controls__btn {
     padding: 0.4rem 0.55rem;
     font-size: 0.78rem;
+  }
+
+  /*
+   * `A-31.4(b)`: at 320px combined with a 200% text-scale (the standard
+   * emulation of an OS/browser text-only zoom setting), the capsule's fixed
+   * single-line `nowrap`/`ellipsis` primary label no longer fits its
+   * available width and silently truncates real content (e.g. "Biology
+   * Midterm · Biology 201"). `.session-capsule` already wraps its own flex
+   * children at this breakpoint (the rule above); letting the primary label
+   * itself wrap onto a second line, instead of clipping it, keeps every
+   * character visible without touching its single-line desktop/tablet
+   * presentation above 620px.
+   */
+  .session-capsule__primary {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
 }
 
