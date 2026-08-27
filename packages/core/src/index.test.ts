@@ -1,14 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   agentStudySetReadiness,
-  buildSessionRecap,
   createStudySetPreview,
-  evaluateAnswer,
   generatedHomeCards,
   type PasteIngestionResponse,
-  seedStudySets,
   studySetFromPasteIngestionResponse,
 } from "./index";
+import { seedStudySets } from "./fixtures";
+import { buildSessionRecap, evaluateAnswer } from "./testing/fake-evaluator";
 
 describe("Viva study set generation", () => {
   test("creates an honest pending study set preview from pasted notes and uploaded files", () => {
