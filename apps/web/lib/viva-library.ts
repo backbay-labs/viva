@@ -194,12 +194,11 @@ export function browserInitialLibrarySnapshot(
   snapshot: VivaLibrarySnapshot,
   options: {
     directSessionTokens?: boolean;
-    staticExport?: boolean;
   } = {},
 ): VivaLibrarySnapshot {
   return stripBrowserOnlyTokenFields(snapshot, {
-    controlToken: !options.staticExport,
-    sessionToken: !(options.staticExport || options.directSessionTokens),
+    controlToken: true,
+    sessionToken: !options.directSessionTokens,
   }) as VivaLibrarySnapshot;
 }
 

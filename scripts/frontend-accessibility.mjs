@@ -155,10 +155,11 @@ const OWNED_SURFACE_ROUTES = ["/", "/session"];
  * session/control-token shape reused from a real deployment.
  *
  * `app/page.tsx`'s server pipeline both strips every raw `control_token`
- * field (`browserInitialLibrarySnapshot`, since this harness never sets
- * `VIVA_STATIC_EXPORT`) and, since `frontend-harness.mjs` clears the real
- * signing secret so this harness can never mint a genuine capability,
- * fails to mint a replacement `same_origin_control_token`/
+ * field (`browserInitialLibrarySnapshot` always strips it now that D-06's
+ * DELETE branch retired the build-mode-conditional composition) and, since
+ * `frontend-harness.mjs` clears the real signing secret so this harness can
+ * never mint a genuine capability, fails to mint a replacement
+ * `same_origin_control_token`/
  * `session_bootstrap_token`. The library-mutation and session-start
  * actions below therefore supply their own `same_origin_control_token` /
  * non-null `session_id` directly, so they still project as *available* on

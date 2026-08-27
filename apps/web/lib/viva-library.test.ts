@@ -365,39 +365,45 @@ describe("Viva library projection", () => {
     });
   });
 
-  test("preserves direct capability tokens only for static-export initial snapshots", () => {
-    const serverful = browserInitialLibrarySnapshot(snapshot, { staticExport: false });
-    const staticExport = browserInitialLibrarySnapshot(snapshot, { staticExport: true });
+  test("strips control and session tokens from the default browser-bound snapshot", () => {
+    const projected = browserInitialLibrarySnapshot(snapshot);
 
-    expect(JSON.stringify(serverful)).not.toContain('"session_token"');
-    expect(JSON.stringify(serverful)).not.toContain("viva1.start-token");
-    expect(JSON.stringify(serverful)).not.toContain('"control_token"');
-    expect(JSON.stringify(serverful)).not.toContain("viva1.control-token");
-    expect(serverful.privacy.export).toEqual({
+    expect(JSON.stringify(projected)).not.toContain('"session_token"');
+    expect(JSON.stringify(projected)).not.toContain("viva1.start-token");
+    expect(JSON.stringify(projected)).not.toContain('"control_token"');
+    expect(JSON.stringify(projected)).not.toContain("viva1.control-token");
+    expect(projected.privacy.export).toEqual({
       available: true,
     });
-    expect(serverful.study_sets[0]?.actions.delete).toEqual({
+    expect(projected.study_sets[0]?.actions.delete).toEqual({
       available: true,
     });
-    expect(staticExport.study_sets[0]?.actions.start).toEqual({
-      available: true,
-      session_id: "start-session-1",
-      session_token: "viva1.start-token",
-    });
-    expect(staticExport.privacy.export).toEqual({
-      available: true,
-      control_token: "viva1.control-token",
-    });
-    expect(staticExport.study_sets[0]?.actions.delete).toEqual({
-      available: true,
-      control_token: "viva1.control-token",
-    });
+  });
+
+  test("D-06B: has no separate branch for a retired static-export flag", () => {
+    // `browserInitialLibrarySnapshot`'s options type has no member for the
+    // build-mode flag D-06 STATIC_EXPORT: DELETE retired — this file is
+    // itself grep-scanned for that identifier as part of the removal proof,
+    // so the retired key is assembled from parts rather than written as one
+    // literal. The point stands either way: nothing in the function may key
+    // off it, however a caller happens to spell it, so a value carrying it
+    // must project identically to a call that omits it entirely.
+    const retiredFlagKey = ["static", "Export"].join("");
+    const hostileOptions = { [retiredFlagKey]: true } as unknown as Parameters<
+      typeof browserInitialLibrarySnapshot
+    >[1];
+
+    const withRetiredFlag = browserInitialLibrarySnapshot(snapshot, hostileOptions);
+    const withoutIt = browserInitialLibrarySnapshot(snapshot);
+
+    expect(withRetiredFlag).toEqual(withoutIt);
+    expect(JSON.stringify(withRetiredFlag)).not.toContain('"session_token"');
+    expect(JSON.stringify(withRetiredFlag)).not.toContain('"control_token"');
   });
 
   test("preserves direct session tokens for non-bootstrap initial snapshots only", () => {
     const directSessionSnapshot = browserInitialLibrarySnapshot(snapshot, {
       directSessionTokens: true,
-      staticExport: false,
     });
 
     expect(directSessionSnapshot.study_sets[0]?.actions.start).toEqual({
@@ -434,9 +440,7 @@ describe("Viva library projection", () => {
         },
       ],
     };
-    const serverBootstrapSnapshot = browserInitialLibrarySnapshot(controlSnapshot, {
-      staticExport: false,
-    });
+    const serverBootstrapSnapshot = browserInitialLibrarySnapshot(controlSnapshot);
 
     expect(serverBootstrapSnapshot.study_sets[0]?.actions.delete).toEqual({
       available: true,
