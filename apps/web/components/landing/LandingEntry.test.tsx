@@ -91,6 +91,7 @@ const originalRestBearer = process.env.VIVA_AGENT_REST_BEARER_TOKEN;
 const originalAllowedUsers = process.env.VIVA_SESSION_ALLOWED_USER_IDS;
 const originalAllowedStudySets = process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS;
 const originalBootstrapSecret = process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET;
+const originalCanonicalOrigin = process.env.VIVA_WEB_CANONICAL_ORIGIN;
 
 describe("LandingEntry", () => {
   test("renders the hero without mounting the legacy study app", () => {
@@ -174,6 +175,15 @@ describe("LandingEntry", () => {
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
       process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "redacted-bootstrap-signing-secret";
+      // CROSS-LANE FIXTURE COMPLETION, PENDING COORDINATOR RATIFICATION. This file is
+      // Plan-13-owned; Plan 11 Task 3 lists app/page.tsx as READ ONLY and does not list this
+      // test. WEBAPI-003 makes SSR capability minting bound to the configured canonical web
+      // origin, so without this line page.tsx correctly mints nothing and the assertion below
+      // on same_origin_control_token reads undefined. Mechanical, deterministic, and
+      // assertion-preserving — the A-07 / A-08 / A-12.4 category — but those precedents were
+      // coordinator-applied, so this one needs its own amendment row before merge. Plan 13
+      // owns the file wholesale and may rewrite this setup freely.
+      process.env.VIVA_WEB_CANONICAL_ORIGIN = "https://web.example";
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify(librarySnapshot), {
@@ -217,6 +227,7 @@ describe("LandingEntry", () => {
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
       restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
+      restoreEnv("VIVA_WEB_CANONICAL_ORIGIN", originalCanonicalOrigin);
     }
   });
 

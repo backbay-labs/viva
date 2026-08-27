@@ -2,9 +2,18 @@ import { type NextRequest, NextResponse } from "next/server";
 import {
   attachVivaLibraryControlTokensToLibrarySnapshot,
   attachVivaSessionBootstrapTokensToLibrarySnapshot,
+  consumeVivaLibraryDeleteCapability,
+  isVivaCanonicalMutatingRequest,
   isVivaLibraryControlToken,
+  parseBoundedJson,
+  readBoundedBody,
   type VivaLibraryControlScope,
-  verifyVivaLibraryControlToken,
+  vivaAgentScopedCredential,
+  vivaBoundedBodyRejection,
+  vivaCanonicalWebOrigin,
+  vivaSessionSecurityStore,
+  vivaWebApiResponseHeaders,
+  WEB_API_BODY_LIMITS,
 } from "../../viva-session/shared";
 
 export const dynamic = "force-dynamic";
@@ -38,20 +47,38 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     return vivaLibraryProxyJsonError(503, "viva_agent_unavailable");
   }
   const { path = [] } = await context.params;
+  if (!vivaCanonicalWebOrigin()) {
+    return libraryConfigUnavailableResponse(request.method, path);
+  }
   const upstream = new URL(
     `${trimTrailingSlash(agentBaseUrl)}/${path.map(encodeURIComponent).join("/")}`,
   );
   upstream.search = request.nextUrl.search;
 
+  // The destructive sequence is fixed and fail-closed: canonical origin, route/query allowlist,
+  // a selectable shared store, then (inside the authorization step) constant-time capability
+  // verification, one-time consumption, and only then the scoped delete credential.
   const controlTarget = libraryControlRouteTarget(request.method, path);
+  const unsupportedControlScope = guardUnsupportedControlScope(request.method, path, controlTarget);
+  if (unsupportedControlScope) return unsupportedControlScope;
+
+  const originGuard = guardDestructiveRequestOrigin(request, controlTarget);
+  if (originGuard) return originGuard;
   const controlGuard = guardAllowedLibraryControlRoute(request, controlTarget);
   if (controlGuard) return controlGuard;
+  const storeGuard = guardDestructiveSecurityStore(request, controlTarget);
+  if (storeGuard) return storeGuard;
 
-  const serverBearer = serverBearerForBrowserLibraryRequest(request, path, controlTarget);
-  if (!serverBearer.ok) return serverBearer.response;
+  const ingestion = libraryIngestionContract(request.method, path);
+  const ingestionOriginGuard = guardIngestionRequestOrigin(request, ingestion);
+  if (ingestionOriginGuard) return ingestionOriginGuard;
+
+  const authorized = await authorizeBrowserLibraryRequest(request, path, controlTarget);
+  if (!authorized.ok) return authorized.response;
+  const { snapshotFilter } = authorized;
   const headers = vivaLibraryProxyHeaders(request, {
-    forwardControlToken: !serverBearer.consumedControlToken,
-    serverBearerToken: serverBearer.token,
+    forwardBrowserCapability: !authorized.consumedCapability,
+    scopedCredential: authorized.credential,
   });
   let response: Response;
   let timedOut = false;
@@ -65,10 +92,27 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   );
   const terminalReason = libraryPreLoopTerminalReason(path, request.method);
   try {
-    const body =
-      request.method === "POST"
-        ? await requestTextWithAbort(request, controller.signal)
-        : undefined;
+    let body: string | undefined;
+    if (request.method === "POST") {
+      const requestBody = await readBoundedLibraryRequestBody(
+        request,
+        ingestion,
+        controller.signal,
+      );
+      if (!requestBody.ok) {
+        if (requestBody.reason === "too_large") {
+          return libraryRequestTooLargeResponse(terminalReason);
+        }
+        // A stalled request body is the route deadline expiring, not a malformed body.
+        if (requestBody.reason === "aborted") {
+          return terminalReason
+            ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
+            : libraryProxyJsonError(504, "viva_library_proxy_timeout");
+        }
+        return libraryIngestionInvalidResponse();
+      }
+      body = requestBody.value;
+    }
     response = await fetch(upstream, {
       body,
       cache: "no-store",
@@ -78,12 +122,14 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
     });
     if (!response.ok && terminalReason) {
       if (isUpstreamValidationFailure(response.status)) {
+        // A browser snapshot never relays an upstream validation body, not even a stripped one.
         if (isBrowserLibrarySnapshotRequest(request.method, path)) {
           await cancelResponseBody(response);
           return libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", terminalReason);
         }
-        const preserved = await browserSafeLibraryResponse(response, path, {
-          origin: vivaLibraryProxyOrigin(request),
+        // Every other upstream 400/422 is preserved, but only after bounded reading and stripping.
+        const preserved = await browserSafeLibraryResponse(response, path, controller.signal, {
+          terminalReason,
         });
         if (timedOut) {
           return libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason);
@@ -98,22 +144,14 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
         ? libraryPreLoopJsonError(504, "viva_library_pre_loop_timeout", terminalReason)
         : libraryProxyJsonError(504, "viva_library_proxy_timeout");
     }
-    if (isBrowserLibrarySnapshotRequest(request.method, path) && !response.ok) {
-      return vivaLibraryProxyJsonError(response.status, "viva_library_proxy_unavailable");
+    return await browserSafeLibraryResponse(response, path, controller.signal, {
+      snapshotFilter,
+      terminalReason,
+    });
+  } catch (error) {
+    if (vivaBoundedBodyRejection(error) === "too_large") {
+      return libraryUpstreamTooLargeResponse(terminalReason);
     }
-    const responseHeaders = new Headers();
-    const contentType = response.headers.get("content-type");
-    if (contentType) responseHeaders.set("content-type", contentType);
-    responseHeaders.set("cache-control", "no-store");
-    const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, {
-      origin: vivaLibraryProxyOrigin(request),
-      snapshotFilter: browserLibrarySnapshotFilter(request, path),
-    });
-    return new NextResponse(responseBody, {
-      headers: responseHeaders,
-      status: response.status,
-    });
-  } catch {
     if (terminalReason) {
       return libraryPreLoopJsonError(
         timedOut ? 504 : 502,
@@ -128,6 +166,135 @@ async function proxyVivaLibraryRequest(request: NextRequest, context: VivaLibrar
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * The exact accepted field set for each ingestion route. A body is validated against this and
+ * then REBUILT field by field, so a browser-supplied identity, status, or authority field can
+ * never ride along just because the agent currently ignores it.
+ */
+type LibraryIngestionContract = {
+  optional: readonly string[];
+  required: readonly string[];
+};
+
+const LIBRARY_INGESTION_CONTRACTS: Record<string, LibraryIngestionContract> = {
+  paste: { optional: ["course", "exam_date"], required: ["title", "pasted_text"] },
+  retry: { optional: ["content_type"], required: ["file_name", "file_base64"] },
+  upload: {
+    optional: ["course", "exam_date", "content_type"],
+    required: ["title", "file_name", "file_base64"],
+  },
+};
+
+function libraryIngestionContract(method: string, path: string[]): LibraryIngestionContract | null {
+  if (method !== "POST") return null;
+  const route = path.join("/");
+  if (route === "study-sets/paste") return LIBRARY_INGESTION_CONTRACTS.paste ?? null;
+  if (route === "study-sets/files") return LIBRARY_INGESTION_CONTRACTS.upload ?? null;
+  if (path.length === 4 && path[0] === "study-sets" && path[2] === "files" && path[3] === "retry") {
+    return LIBRARY_INGESTION_CONTRACTS.retry ?? null;
+  }
+  return null;
+}
+
+/**
+ * Ingestion POSTs are mutating routes, so Task 3 Step 3's same-origin primitive applies here too
+ * (A-23.4 routed this decision to Task 5). Without it the BFF would rewrite an attacker's
+ * cross-origin request into a same-origin outbound `Origin` for the agent. Refusal reuses the
+ * ingestion route's single coarse body, exactly as the destructive routes reuse one body for
+ * "malformed, expired, wrong origin/scope, replay"; no new public vocabulary is invented.
+ */
+function guardIngestionRequestOrigin(
+  request: NextRequest,
+  ingestion: LibraryIngestionContract | null,
+): NextResponse | null {
+  if (!ingestion) return null;
+  return isVivaCanonicalMutatingRequest(request) ? null : libraryIngestionInvalidResponse();
+}
+
+async function readBoundedLibraryRequestBody(
+  request: NextRequest,
+  ingestion: LibraryIngestionContract | null,
+  signal: AbortSignal,
+): Promise<
+  { ok: true; value: string } | { ok: false; reason: "aborted" | "invalid" | "too_large" }
+> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await readBoundedBody(request.body, {
+      contentLength: request.headers.get("content-length"),
+      limit: WEB_API_BODY_LIMITS.libraryRequest,
+      signal,
+    });
+  } catch (error) {
+    return { ok: false, reason: vivaBoundedBodyRejection(error) ?? "invalid" };
+  }
+  if (!ingestion) return { ok: true, value: new TextDecoder().decode(bytes) };
+
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok) return { ok: false, reason: "invalid" };
+  const rebuilt = reconstructIngestionBody(parsed.value, ingestion);
+  return rebuilt ? { ok: true, value: JSON.stringify(rebuilt) } : { ok: false, reason: "invalid" };
+}
+
+function reconstructIngestionBody(
+  value: unknown,
+  contract: LibraryIngestionContract,
+): Record<string, string> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const allowed = new Set([...contract.required, ...contract.optional]);
+  for (const key of Object.keys(source)) {
+    if (!allowed.has(key)) return null;
+  }
+  const rebuilt: Record<string, string> = {};
+  for (const key of contract.required) {
+    const field = source[key];
+    if (typeof field !== "string" || field.length === 0) return null;
+    rebuilt[key] = field;
+  }
+  for (const key of contract.optional) {
+    if (!(key in source)) continue;
+    const field = source[key];
+    if (typeof field !== "string" || field.length === 0) return null;
+    rebuilt[key] = field;
+  }
+  return rebuilt;
+}
+
+function libraryIngestionInvalidResponse(): NextResponse {
+  return libraryAccessDeniedJsonError(400, "viva_library_request_invalid");
+}
+
+function libraryRequestTooLargeResponse(terminalReason: string | null): NextResponse {
+  return terminalReason
+    ? libraryPreLoopJsonError(413, "viva_request_body_too_large", terminalReason)
+    : libraryProxyJsonError(413, "viva_request_body_too_large");
+}
+
+function libraryUpstreamTooLargeResponse(terminalReason: string | null): NextResponse {
+  return terminalReason
+    ? libraryPreLoopJsonError(502, "viva_upstream_response_too_large", terminalReason)
+    : libraryProxyJsonError(502, "viva_upstream_response_too_large");
+}
+
+/**
+ * Missing/weak canonical origin or scoped service credential: one route-specific `*_unavailable`
+ * 503 that never names the environment variable, its value, or the upstream URL.
+ */
+function libraryConfigUnavailableResponse(method: string, path: string[]): NextResponse {
+  if (isBrowserLibrarySnapshotRequest(method, path)) {
+    return libraryPreLoopJsonError(
+      503,
+      "viva_library_auth_unavailable",
+      "pre_loop_ingestion_unavailable",
+    );
+  }
+  if (method === "DELETE" && libraryControlRouteTarget(method, path)) {
+    return vivaLibraryProxyJsonError(503, "viva_library_control_unavailable");
+  }
+  return vivaLibraryProxyJsonError(503, "viva_library_proxy_unavailable");
 }
 
 function libraryPreLoopJsonError(
@@ -195,17 +362,6 @@ function isBrowserLibrarySnapshotRequest(method: string, path: string[]): boolea
   return method === "GET" && path.join("/") === "study-sets/library";
 }
 
-function browserLibrarySnapshotFilter(
-  request: NextRequest,
-  path: string[],
-): { allowedStudySetIds: Set<string>; userId: string } | undefined {
-  if (!isBrowserLibrarySnapshotRequest(request.method, path)) return undefined;
-  const userId = request.nextUrl.searchParams.get("user_id")?.trim();
-  const allowedStudySetIds = configuredAllowlist("VIVA_SESSION_ALLOWED_STUDY_SET_IDS");
-  if (!userId || !allowedStudySetIds) return undefined;
-  return { allowedStudySetIds, userId };
-}
-
 function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   const maxTimeout =
     libraryPreLoopTerminalReason(path, method) === "pre_loop_upload_unavailable"
@@ -216,44 +372,16 @@ function vivaLibraryProxyTimeoutMs(path: string[], method: string): number {
   return maxTimeout;
 }
 
-async function requestTextWithAbort(request: NextRequest, signal: AbortSignal): Promise<string> {
-  if (!request.body) return "";
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let abortHandler: (() => void) | undefined;
-  const abortError = new Error("viva_library_proxy_timeout");
-  const abort = new Promise<never>((_, reject) => {
-    abortHandler = () => {
-      void reader.cancel().catch(() => undefined);
-      reject(abortError);
-    };
-    signal.addEventListener("abort", abortHandler, { once: true });
-  });
-
-  try {
-    while (true) {
-      if (signal.aborted) throw abortError;
-      const chunk = await Promise.race([reader.read(), abort]);
-      if (signal.aborted) throw abortError;
-      if (chunk.done) break;
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    return text + decoder.decode();
-  } finally {
-    if (abortHandler) signal.removeEventListener("abort", abortHandler);
-    reader.releaseLock();
-  }
-}
-
 function vivaAgentServerHttpBaseUrl(): string | null {
   return process.env.VIVA_AGENT_HTTP_URL?.trim() || null;
 }
 
-function noStoreHeaders(headers: HeadersInit = {}): Headers {
-  const output = new Headers(headers);
-  output.set("cache-control", "no-store");
-  return output;
+/**
+ * Route-owned response headers only. The optional extras are this route's own allowlist —
+ * the validated upstream content type and nothing else — never a cloned upstream header.
+ */
+function noStoreHeaders(extra: Record<string, string> = {}): Headers {
+  return vivaWebApiResponseHeaders(extra);
 }
 
 function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<{ error: string }> {
@@ -262,102 +390,100 @@ function vivaLibraryProxyJsonError(status: number, error: string): NextResponse<
 
 function vivaLibraryProxyHeaders(
   request: NextRequest,
-  options: { forwardControlToken?: boolean; serverBearerToken?: string } = {},
+  options: { forwardBrowserCapability?: boolean; scopedCredential?: string } = {},
 ): Headers {
   const headers = new Headers();
   const authorization = request.headers.get("authorization");
-  if (options.serverBearerToken) {
-    headers.set("authorization", `Bearer ${options.serverBearerToken}`);
+  if (options.scopedCredential) {
+    headers.set("authorization", `Bearer ${options.scopedCredential}`);
   } else if (authorization) {
     headers.set("authorization", authorization);
   }
   const controlToken = request.headers.get("x-viva-library-control-token");
-  if (controlToken && options.forwardControlToken !== false) {
+  if (controlToken && options.forwardBrowserCapability !== false) {
     headers.set("x-viva-library-control-token", controlToken);
   }
   const contentType = request.headers.get("content-type");
   if (contentType) headers.set("content-type", contentType);
-  const origin = vivaLibraryProxyOrigin(request);
+  const origin = vivaLibraryProxyOrigin();
   if (origin) headers.set("origin", origin);
   return headers;
 }
 
-function vivaLibraryProxyOrigin(request: NextRequest): string | null {
-  const origin = request.headers.get("origin");
-  if (origin) return origin;
-  const host = request.headers.get("host");
-  if (host) {
-    const protocol =
-      request.headers.get("x-forwarded-proto") ?? request.nextUrl.protocol.slice(0, -1);
-    return `${protocol}://${host}`;
-  }
-  return request.nextUrl.origin;
+/**
+ * The proxy's outbound origin is the configured canonical web origin and nothing else. An
+ * `Origin`, `Host`, `Forwarded`, or `X-Forwarded-Proto` header can never move it.
+ */
+function vivaLibraryProxyOrigin(): string | null {
+  return vivaCanonicalWebOrigin();
 }
 
-function serverBearerForBrowserLibraryRequest(
+async function authorizeBrowserLibraryRequest(
   request: NextRequest,
   path: string[],
   controlTarget: LibraryControlRouteTarget | null,
-):
+): Promise<
   | {
-      consumedControlToken?: boolean;
+      consumedCapability?: boolean;
+      credential?: string;
       ok: true;
       snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
-      token?: string;
     }
-  | { ok: false; response: NextResponse } {
+  | { ok: false; response: NextResponse }
+> {
   const browserSnapshotRequest =
     request.method === "GET" && path.join("/") === "study-sets/library";
   const controlToken = request.headers.get("x-viva-library-control-token")?.trim() || null;
-  const sameOriginControlRequest =
-    request.method === "DELETE" &&
-    Boolean(controlTarget?.studySetId) &&
-    isVivaLibraryControlToken(controlToken);
-  const missingControlCapabilityRequest =
-    request.method === "DELETE" && Boolean(controlTarget?.studySetId) && !controlToken;
-  if (!browserSnapshotRequest && !sameOriginControlRequest && !missingControlCapabilityRequest) {
+  // One predicate decides that a request is destructive, and it depends on the METHOD and TARGET
+  // only. Deciding it from the capability instead would let an unusable capability (absent, wrong
+  // prefix, unverifiable) escape the destructive branch and be proxied upstream as an ordinary
+  // DELETE, taking the browser-supplied capability header with it.
+  const destructiveControlRequest =
+    request.method === "DELETE" && Boolean(controlTarget?.studySetId);
+  if (!browserSnapshotRequest && !destructiveControlRequest) {
     return { ok: true };
   }
-  if (missingControlCapabilityRequest) {
+  if (destructiveControlRequest && !isVivaLibraryControlToken(controlToken)) {
+    // Not even shaped like a capability this deployment could have minted, so it fails HMAC
+    // verification by construction. Absent and malformed share the one coarse 403 the error table
+    // pins for every capability rejection, and neither reaches the store or the agent.
     return {
       ok: false,
       response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
     };
   }
-  const token = process.env.VIVA_AGENT_REST_BEARER_TOKEN?.trim();
-  if (!token) {
-    return {
-      ok: false,
-      response: libraryPreLoopJsonError(
-        503,
-        "viva_library_auth_unavailable",
-        "pre_loop_ingestion_unavailable",
-      ),
-    };
-  }
-  if (sameOriginControlRequest) {
+  if (destructiveControlRequest) {
+    // Verify and SPEND the capability before any delete authority is resolved, so an unspendable
+    // capability can never reach the agent and a spent one can never be replayed.
     const userId = request.nextUrl.searchParams.get("user_id")?.trim() || "";
-    const verification = verifyVivaLibraryControlToken({
-      origin: vivaLibraryProxyOrigin(request),
+    const consumption = await consumeVivaLibraryDeleteCapability({
       scope: controlTarget?.scope ?? "study_set_delete",
       studySetId: controlTarget?.studySetId ?? "",
-      token: controlToken ?? "",
+      capability: controlToken ?? "",
       userId,
       voiceSessionId: controlTarget?.voiceSessionId ?? null,
     });
-    if (verification === "missing_secret") {
+    if (!consumption.ok) {
       return {
         ok: false,
-        response: vivaLibraryProxyJsonError(503, "viva_library_control_unavailable"),
+        response:
+          consumption.reason === "unavailable"
+            ? libraryControlStoreUnavailableResponse()
+            : vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
       };
     }
-    if (verification !== "valid") {
-      return {
-        ok: false,
-        response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
-      };
+    const scopedDelete = vivaAgentScopedCredential("library_delete");
+    if (!scopedDelete) {
+      return { ok: false, response: libraryConfigUnavailableResponse(request.method, path) };
     }
-    return { consumedControlToken: true, ok: true, token };
+    return { consumedCapability: true, credential: scopedDelete, ok: true };
+  }
+  const scopedRead = vivaAgentScopedCredential("library_read");
+  if (!scopedRead) {
+    return {
+      ok: false,
+      response: libraryConfigUnavailableResponse(request.method, path),
+    };
   }
 
   const userId = request.nextUrl.searchParams.get("user_id")?.trim();
@@ -389,7 +515,7 @@ function serverBearerForBrowserLibraryRequest(
       response: libraryAccessDeniedJsonError(403, "viva_library_identity_not_allowed"),
     };
   }
-  return { ok: true, snapshotFilter: { allowedStudySetIds, userId }, token };
+  return { credential: scopedRead, ok: true, snapshotFilter: { allowedStudySetIds, userId } };
 }
 
 type LibraryControlRouteTarget = {
@@ -397,6 +523,34 @@ type LibraryControlRouteTarget = {
   studySetId: string | null;
   voiceSessionId: string | null;
 };
+
+/**
+ * D-04 is recorded as `CONFIRM_DELETE`: this deployment has confirmation plus permanent delete and
+ * no undo. The `POST /{study_set_id}/restore` shape is therefore not a route here, and the catch-all
+ * refuses it explicitly rather than relaying it upstream as an ordinary proxied POST.
+ *
+ * This is a path-shape match only — it mints and consumes nothing — so the D-04 Branch A absence
+ * proof still finds no restore-capability code in this file.
+ *
+ * The same reasoning closes the destructive method itself. `libraryControlRouteTarget` recognizes
+ * exactly the two DELETE shapes this deployment supports; every other DELETE has no control scope
+ * that any capability could ever satisfy. Without this refusal such a request leaves
+ * `controlTarget` null, skips the origin, allowlist, and store guards, and falls through to the
+ * ordinary proxy path, which relays the caller's `authorization` and `x-viva-library-control-token`
+ * upstream with no same-origin check. Deciding "destructive" from the METHOD and TARGET means the
+ * unrecognized target is refused, not relayed.
+ */
+function guardUnsupportedControlScope(
+  method: string,
+  path: string[],
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
+  const restoreShape = method === "POST" && path.length === 2 && path[1] === "restore";
+  const unrecognizedDestructiveShape = method === "DELETE" && !controlTarget;
+  return restoreShape || unrecognizedDestructiveShape
+    ? libraryAccessDeniedJsonError(403, "viva_library_control_scope_not_allowed")
+    : null;
+}
 
 function guardAllowedLibraryControlRoute(
   request: NextRequest,
@@ -420,6 +574,60 @@ function guardAllowedLibraryControlRoute(
     return vivaLibraryProxyJsonError(403, "viva_library_control_scope_not_allowed");
   }
   return null;
+}
+
+/**
+ * Destructive routes must be exactly same-origin. A missing or foreign `Origin`, or a
+ * cross-site fetch, returns the same coarse capability error as a forged capability.
+ *
+ * SCOPE — an open question this lane routed to the coordinator rather than deciding alone.
+ * Task 3 Step 3 words the rule as "mutating routes require an exact `Origin` match", but this
+ * guard runs only on destructive DELETE. Paste/file/retry POST is deliberately excluded: Task 3
+ * Step 4 makes it "separately authorized by its ingestion contract", the plan's public error
+ * table defines a 403 shape only for start/refresh and destructive DELETE, and this lane may not
+ * invent new public error vocabulary. Those POSTs are also handed no read, mint, or delete
+ * authority by authorizeBrowserLibraryRequest, so nothing is silently widened.
+ *
+ * The POST path is therefore an OWNED follow-up, not an unowned gap. Task 5 is the next task in
+ * this plan that reworks these routes, and it must either apply the same same-origin primitive
+ * there or record why the ingestion contract already closes it.
+ */
+function guardDestructiveRequestOrigin(
+  request: NextRequest,
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
+  if (request.method !== "DELETE" || !controlTarget) return null;
+  if (isVivaCanonicalMutatingRequest(request)) return null;
+  return vivaLibraryProxyJsonError(403, "viva_library_control_capability_required");
+}
+
+/**
+ * A destructive delete is a one-time capability consumption, and the shared store is what makes
+ * "one time" true across instances. If no shared store can be selected, the route refuses before
+ * it contacts the agent rather than performing an unbounded, unrevocable delete.
+ */
+function guardDestructiveSecurityStore(
+  request: NextRequest,
+  controlTarget: LibraryControlRouteTarget | null,
+): NextResponse | null {
+  if (request.method !== "DELETE" || !controlTarget?.studySetId) return null;
+  if (vivaSessionSecurityStore().ok) return null;
+  return libraryControlStoreUnavailableResponse();
+}
+
+/**
+ * An unavailable or ambiguous destructive store. The capability may or may not have been consumed,
+ * so the route refuses without contacting the agent and without hinting at a retry.
+ */
+function libraryControlStoreUnavailableResponse(): NextResponse {
+  return NextResponse.json(
+    {
+      error: "viva_library_control_unavailable",
+      failure_class: "pre_loop_unavailable",
+      stage: "pre_loop",
+    },
+    { headers: noStoreHeaders(), status: 503 },
+  );
 }
 
 function libraryControlRouteTarget(
@@ -464,64 +672,140 @@ function trimTrailingSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value;
 }
 
-async function browserSafeLibraryResponseBody(
-  response: Response,
-  path: string[],
-  contentType: string | null,
-  options: {
-    origin: string | null;
-    snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
-  },
-): Promise<ArrayBuffer | string> {
-  if (
-    response.ok &&
-    path.join("/") === "study-sets/library" &&
-    contentType?.toLowerCase().includes("application/json")
-  ) {
-    try {
-      const value = await response.json();
-      const filtered = options.snapshotFilter
-        ? filterBearerBackedLibrarySnapshot(value, options.snapshotFilter)
-        : value;
-      const withBootstrapTokens = options.snapshotFilter
-        ? attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
-            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            origin: options.origin,
-            userId: options.snapshotFilter.userId,
-          })
-        : filtered;
-      const withControlTokens = options.snapshotFilter
-        ? attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
-            allowedStudySetIds: options.snapshotFilter.allowedStudySetIds,
-            origin: options.origin,
-            userId: options.snapshotFilter.userId,
-          })
-        : withBootstrapTokens;
-      return JSON.stringify(stripBrowserLibraryCapabilityTokens(withControlTokens));
-    } catch {
-      return "{}";
-    }
-  }
-  return response.arrayBuffer();
-}
-
+/**
+ * The ONE bounded response builder every upstream response goes through.
+ *
+ * Order matters and is fixed: bounded read -> parse -> recursive credential strip -> snapshot
+ * allowlist filtering -> BFF capability minting. The strip pass never runs after minting, because
+ * the BFF's own freshly minted capabilities are the intended browser-safe outputs.
+ *
+ * Headers are rebuilt from a route-owned allowlist — the upstream content type plus this route's
+ * own cache/security headers — so no upstream cookie, auth, or cache header is ever cloned onto a
+ * browser-facing response. An overage cancels the upstream stream and raises, and the caller maps
+ * it to the recorded 502.
+ */
 async function browserSafeLibraryResponse(
   response: Response,
   path: string[],
+  signal: AbortSignal,
   options: {
-    origin: string | null;
     snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+    terminalReason?: string | null;
   },
 ): Promise<NextResponse> {
-  const responseHeaders = new Headers();
   const contentType = response.headers.get("content-type");
-  if (contentType) responseHeaders.set("content-type", contentType);
-  responseHeaders.set("cache-control", "no-store");
-  const responseBody = await browserSafeLibraryResponseBody(response, path, contentType, options);
-  return new NextResponse(responseBody, {
-    headers: responseHeaders,
-    status: response.status,
+  const bytes = await readBoundedBody(response.body, {
+    contentLength: response.headers.get("content-length"),
+    limit: WEB_API_BODY_LIMITS.libraryResponse,
+    signal,
   });
+  const built = browserSafeLibraryResponseBody(bytes, path, contentType, options);
+  if (!built.ok) {
+    // A JSON-expected route never relays ambiguous bytes; it returns the route's sanitized 502.
+    return options.terminalReason
+      ? libraryPreLoopJsonError(502, "viva_library_pre_loop_unavailable", options.terminalReason)
+      : libraryProxyJsonError(502, "viva_library_proxy_unavailable");
+  }
+  const responseHeaders = noStoreHeaders(contentType ? { "content-type": contentType } : {});
+  return new NextResponse(
+    typeof built.body === "string" ? built.body : new Uint8Array(built.body),
+    { headers: responseHeaders, status: response.status },
+  );
+}
+
+function browserSafeLibraryResponseBody(
+  bytes: Uint8Array,
+  path: string[],
+  contentType: string | null,
+  options: {
+    snapshotFilter?: { allowedStudySetIds: Set<string>; userId: string };
+  },
+): { ok: true; body: Uint8Array | string } | { ok: false } {
+  // An explicitly binary/export route keeps bounded byte pass-through.
+  if (isLibraryBytePassThroughRoute(path)) return { ok: true, body: bytes };
+  // A bodiless response (204, or a bare 4xx with no payload) has nothing to sanitize.
+  if (bytes.byteLength === 0) return { ok: true, body: bytes };
+  if (!contentType?.toLowerCase().includes("application/json")) return { ok: false };
+
+  const parsed = parseBoundedJson(bytes);
+  if (!parsed.ok) return { ok: false };
+  const stripped = stripAgentOriginatedCredentials(parsed.value);
+  if (path.join("/") !== "study-sets/library" || !options.snapshotFilter) {
+    return { ok: true, body: JSON.stringify(stripped) };
+  }
+
+  const filter = options.snapshotFilter;
+  const filtered = filterBearerBackedLibrarySnapshot(stripped, filter);
+  const withBootstrapTokens = attachVivaSessionBootstrapTokensToLibrarySnapshot(filtered, {
+    allowedStudySetIds: filter.allowedStudySetIds,
+    userId: filter.userId,
+  });
+  const withControlTokens = attachVivaLibraryControlTokensToLibrarySnapshot(withBootstrapTokens, {
+    allowedStudySetIds: filter.allowedStudySetIds,
+    userId: filter.userId,
+  });
+  return { ok: true, body: JSON.stringify(withControlTokens) };
+}
+
+/** Only an explicitly binary/export route relays upstream bytes unparsed. */
+function isLibraryBytePassThroughRoute(path: string[]): boolean {
+  return path.join("/") === "study-sets/export";
+}
+
+/**
+ * Recursive, order-sensitive credential removal for every proxied JSON body.
+ *
+ * Keys are compared case-insensitively against the closed credential set plus any `_token`
+ * suffix, so an upstream `session_bootstrap_token`, `same_origin_control_token`, or `Access_Token`
+ * is removed no matter how it is cased or nested. String VALUES are inspected one leaf at a time —
+ * never with a token-shaped regex over serialized JSON — and any string carrying a bearer
+ * credential or a Viva credential prefix is replaced whole.
+ */
+const AGENT_CREDENTIAL_KEYS: ReadonlySet<string> = new Set([
+  "api_key",
+  "authorization",
+  "credential",
+  "password",
+  "private_key",
+  "secret",
+  "token",
+]);
+/**
+ * Value markers, lowercase, matched against a lowercased string LEAF — never as a token-shaped
+ * regex over serialized JSON. These are the only credential shapes the agent can hand back:
+ * the HTTP authorization scheme below, and Viva's four credential prefixes.
+ */
+const AGENT_CREDENTIAL_VALUE_MARKERS = [
+  "bearer ",
+  "viva1.",
+  "viva-bootstrap1.",
+  "viva-control1.",
+  "viva-refresh1.",
+] as const;
+const AGENT_CREDENTIAL_REDACTION = "[redacted]";
+
+function stripAgentOriginatedCredentials(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripAgentOriginatedCredentials);
+  if (typeof value === "string") return redactedAgentCredentialString(value);
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (isAgentCredentialKey(key)) continue;
+    output[key] = stripAgentOriginatedCredentials(child);
+  }
+  return output;
+}
+
+function isAgentCredentialKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return AGENT_CREDENTIAL_KEYS.has(normalized) || normalized.endsWith("_token");
+}
+
+function redactedAgentCredentialString(value: string): string {
+  const normalized = value.toLowerCase();
+  return AGENT_CREDENTIAL_VALUE_MARKERS.some((marker) => normalized.includes(marker))
+    ? AGENT_CREDENTIAL_REDACTION
+    : value;
 }
 
 function filterBearerBackedLibrarySnapshot(
@@ -578,15 +862,4 @@ function librarySessionAllowed(
     typeof session.study_set_id === "string" &&
     filter.allowedStudySetIds.has(session.study_set_id)
   );
-}
-
-function stripBrowserLibraryCapabilityTokens(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripBrowserLibraryCapabilityTokens);
-  if (!value || typeof value !== "object") return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "control_token" || key === "session_token") continue;
-    output[key] = stripBrowserLibraryCapabilityTokens(child);
-  }
-  return output;
 }

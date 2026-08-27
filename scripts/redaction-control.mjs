@@ -2344,6 +2344,97 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(evaluation\),\s*$/,
     ]),
   },
+  // A-25 (2026-08-26): coordinator-applied sanction rows for Plan 11 Tasks 4-11
+  // (node 11 admission). Dual-keyed, file-filtered, anchored literals: header
+  // construction, type members, prefix-REFUSAL literals, parse regexes, and
+  // URL-credential refusal checks — never values or logging. Plan 12
+  // reconciles at 12B.
+  {
+    file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*headers\.set\("authorization",\ `Bearer\ \$\{options\.scopedCredential\}`\);\s*$/,
+      /^\s*"bearer\ ",\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
+    marker: "pasted_text",
+    patterns: Object.freeze([
+      /^\s*paste:\ \{\ optional:\ \["course",\ "exam_date"\],\ required:\ \["title",\ "pasted_text"\]\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
+    marker: "viva1.",
+    patterns: Object.freeze([
+      /^\s*"viva1\.",\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*"bearer\ ",\s*$/,
+      /^\s*authorization:\ `Bearer\ \$\{input\.scopedCredential\}`,\s*$/,
+      /^\s*const\ match\ =\ \/\^Bearer\ \(\[\\x21\-\\x7e\]\+\)\$\/\.exec\(value\);\s*$/,
+      /^\s*authorization:\ `Bearer\ \$\{credential\}`,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*authorization:\ `Bearer\ \$\{input\.scopedCredential\}`,\s*$/,
+      /^\s*authorization:\ `Bearer\ \$\{credential\}`,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "refresh_token",
+    patterns: Object.freeze([
+      /^\s*refresh_token:\ string;\s*$/,
+      /^\s*refresh_token:\ credential,\s*$/,
+      /^\s*const\ credential\ =\ requiredString\(record\.refresh_token\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*minted:\ \{\ session_token:\ string\ \},\s*$/,
+      /^\s*token:\ minted\.session_token,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*token:\ minted\.session_token,\s*$/,
+      /^\s*token:\ credential,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "viva1.",
+    patterns: Object.freeze([
+      /^\s*"viva1\.",\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/app/api/viva-session/shared.ts",
+    marker: "x_viva_session_token",
+    patterns: Object.freeze([
+      /^\s*"x\-viva\-session\-token":\ input\.sessionCredential,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/proxy.ts",
+    marker: "password",
+    patterns: Object.freeze([
+      /^\s*if\ \(url\.username\ \|\|\ url\.password\)\ return\ null;\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
