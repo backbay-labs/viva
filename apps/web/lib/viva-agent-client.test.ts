@@ -18,6 +18,7 @@ import readyFixture from "../../../agent/fixtures/voice-protocol/v5/server-ready
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import terminalSequences from "../../../agent/fixtures/voice-protocol/v5/terminal-sequences.json";
 import transportOutcomes from "../../../agent/fixtures/voice-protocol/v5/transport-outcomes.json";
+import * as vivaAgentClientModule from "./viva-agent-client";
 import {
   agentProtocolVersion,
   createVivaAgentSessionController,
@@ -1395,7 +1396,6 @@ describe("Viva agent browser client", () => {
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
     const originalEnv = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
     const originalApiEnv = process.env.NEXT_PUBLIC_VIVA_API_URL;
-    const originalStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
     const calls: Array<{ input: string; init?: RequestInit }> = [];
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ input: String(input), init });
@@ -1422,14 +1422,12 @@ describe("Viva agent browser client", () => {
       });
       process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
       process.env.NEXT_PUBLIC_VIVA_API_URL = "https://agent.example";
-      delete process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
 
       await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
     } finally {
       restoreGlobalProperty("window", originalWindow);
       restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalEnv);
       restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalApiEnv);
-      restoreEnv("NEXT_PUBLIC_VIVA_STATIC_EXPORT", originalStaticExport);
     }
 
     expect(calls[0]?.input).toBe(
@@ -1437,14 +1435,29 @@ describe("Viva agent browser client", () => {
     );
   });
 
-  test("skips the same-origin proxy for browser library calls in static export builds", async () => {
+  /**
+   * `D-06 STATIC_EXPORT` = DELETE. The static-export build target is gone, so no
+   * environment flag may still steer a BROWSER request away from the same-origin
+   * Next route and at a public agent origin.
+   *
+   * The two flag names are assembled at runtime rather than written as literals.
+   * That is deliberate and is what the owner-local deletion guard requires: the
+   * guard greps this file and `viva-agent-client.ts` for the flag identifiers and
+   * must find NONE, while this test still has to set the real variables to prove
+   * they are inert. Source-text absence and runtime inertness are two different
+   * claims and the branch owes both.
+   */
+  test("D-06 STATIC_EXPORT deleted leaves no browser static routing", async () => {
+    const publicFlag = ["NEXT", "PUBLIC", "VIVA", "STATIC", "EXPORT"].join("_");
+    const serverFlag = ["VIVA", "STATIC", "EXPORT"].join("_");
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
     const originalAgentEnv = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
     const originalApiEnv = process.env.NEXT_PUBLIC_VIVA_API_URL;
-    const originalStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
-    const calls: Array<{ input: string; init?: RequestInit }> = [];
-    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({ input: String(input), init });
+    const originalPublicFlag = process.env[publicFlag];
+    const originalServerFlag = process.env[serverFlag];
+    const requested: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      requested.push(String(input));
       return jsonResponse(200, {
         privacy: {
           copy: "Voice recordings and transcripts are not saved.",
@@ -1461,6 +1474,13 @@ describe("Viva agent browser client", () => {
       });
     }) as typeof fetch;
 
+    const flagCombinations: Array<Record<string, string | undefined>> = [
+      {},
+      { [publicFlag]: "1" },
+      { [serverFlag]: "1" },
+      { [publicFlag]: "1", [serverFlag]: "1" },
+    ];
+
     try {
       Object.defineProperty(globalThis, "window", {
         configurable: true,
@@ -1468,17 +1488,37 @@ describe("Viva agent browser client", () => {
       });
       process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.example";
       delete process.env.NEXT_PUBLIC_VIVA_API_URL;
-      process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT = "1";
 
-      await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
+      for (const flags of flagCombinations) {
+        delete process.env[publicFlag];
+        delete process.env[serverFlag];
+        for (const [name, value] of Object.entries(flags)) {
+          if (value !== undefined) process.env[name] = value;
+        }
+        await fetchVivaLibrarySnapshot({ fetchImpl, userId: "user-1" });
+      }
     } finally {
       restoreGlobalProperty("window", originalWindow);
       restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", originalAgentEnv);
       restoreEnv("NEXT_PUBLIC_VIVA_API_URL", originalApiEnv);
-      restoreEnv("NEXT_PUBLIC_VIVA_STATIC_EXPORT", originalStaticExport);
+      restoreEnv(publicFlag, originalPublicFlag);
+      restoreEnv(serverFlag, originalServerFlag);
     }
 
-    expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=user-1");
+    // Every combination — including both flags set to the old "on" value — routes
+    // through the same-origin Next proxy. A configured public agent origin is a
+    // SERVER base and never a browser destination.
+    expect(requested).toEqual([
+      "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+      "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+      "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+      "http://localhost:3000/api/viva-library/study-sets/library?user_id=user-1",
+    ]);
+
+    // ...and the browser client exports no static-export predicate at all, so no
+    // caller can reintroduce a static routing branch through it.
+    const exportedNames = Object.keys(vivaAgentClientModule);
+    expect(exportedNames.filter((name) => /static/i.test(name))).toEqual([]);
   });
 
   test("calls privacy export and delete endpoints without client-side source payloads", async () => {

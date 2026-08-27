@@ -488,8 +488,6 @@ export type VivaAgentSessionController = {
 const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
 const bundledVivaAgentHttpUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
-const bundledVivaStaticExport = process.env.VIVA_STATIC_EXPORT;
-const bundledNextPublicVivaStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
 const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
 export function vivaAgentWsUrl(env?: Record<string, string | undefined>): string {
@@ -1012,19 +1010,15 @@ function configuredVivaAgentHttpBaseUrl(): string | undefined {
   return explicitAgentHttp?.trim() ? trimTrailingSlash(explicitAgentHttp.trim()) : undefined;
 }
 
-export function vivaStaticExportEnabled(env?: Record<string, string | undefined>): boolean {
-  const explicitEnv = env !== undefined;
-  const resolvedEnv = env ?? envRecord();
-  const publicFlag =
-    resolvedEnv.NEXT_PUBLIC_VIVA_STATIC_EXPORT ??
-    (explicitEnv ? undefined : bundledNextPublicVivaStaticExport);
-  const serverFlag =
-    resolvedEnv.VIVA_STATIC_EXPORT ?? (explicitEnv ? undefined : bundledVivaStaticExport);
-  return publicFlag === "1" || serverFlag === "1";
-}
-
+/**
+ * `WEBSESSION-STATIC-01` under the recorded `D-06 STATIC_EXPORT: DELETE`. A
+ * browser call always goes to the same-origin Next route; the configured public
+ * agent origin is a SERVER base and never a browser destination. There is no
+ * remaining flag, predicate, or bundled variable that could route a browser
+ * request past the proxy — being in a browser is now the only condition.
+ */
 function browserVivaLibraryProxyBaseUrl(): string | undefined {
-  if (vivaStaticExportEnabled() || typeof window === "undefined") return undefined;
+  if (typeof window === "undefined") return undefined;
   return `${window.location.origin}/api/viva-library`;
 }
 

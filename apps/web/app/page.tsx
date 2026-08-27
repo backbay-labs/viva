@@ -2,7 +2,6 @@ import { LandingEntry } from "../components/landing/LandingEntry";
 import {
   fetchVivaLibrarySnapshot,
   type VivaLibrarySnapshotOptions,
-  vivaStaticExportEnabled,
 } from "../lib/viva-agent-client";
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 import {
@@ -46,9 +45,13 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
             userId: config.options.userId ?? "",
           })
         : bootstrapSnapshot;
+    // `D-06 STATIC_EXPORT: DELETE` removed the static-export predicate from the
+    // browser client, so this call no longer passes one. Plan 13 owns retiring
+    // `browserInitialLibrarySnapshot`'s remaining `staticExport` OPTION together
+    // with `viva-library.ts` and the static-only landing tests; omitting it here
+    // is the same `false` the deleted predicate returned in every served build.
     return browserInitialLibrarySnapshot(browserSnapshot as VivaLibrarySnapshot, {
       directSessionTokens: config.kind === "disabled",
-      staticExport: vivaStaticExportEnabled(),
     });
   } catch {
     return null;
