@@ -13,6 +13,7 @@ import type {
 import {
   VIVA_AGENT_TERMINAL_SESSION_REASONS,
   VIVA_LEARNER_LOOP_CONTRACT,
+  VIVA_VOICE_DEFERRAL_REASONS,
   VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
@@ -25,6 +26,7 @@ import {
   correctionFamily,
   expectedTermsRevealed,
   projectConceptNodes,
+  projectDeferredTurnNudge,
   projectHighlightedTokens,
   projectRuntimeCopy,
   projectSessionQuestion,
@@ -1023,6 +1025,59 @@ describe("projectTurnTakingState", () => {
     expect(turn.ariaStatus).not.toContain("No speech captured");
   });
 
+  test("an ungraded turn takes the nudge slot beside the open turn, capsule untouched", () => {
+    const turn = projectTurnTakingState({
+      deferredTurnNudge: projectDeferredTurnNudge({
+        deferredTurn: {
+          canRetrySameQuestion: true,
+          questionId: "q-fixture-1",
+          reason: "evaluator_unavailable",
+          responseId: "response-1",
+          turnId: "turn-1",
+        },
+      }),
+      // Both transient nudges are ALSO live here: the ungraded turn is the fact
+      // about the learner's own answer, so it outranks them.
+      interruptAcknowledged: true,
+      question: liveQuestion,
+      state: "listening",
+      textAnswerFallbackActive: true,
+    });
+
+    expect(turn.phase).toBe("listening");
+    expect(turn.nudge?.label).toBe("Retry this question");
+    expect(turn.nudge?.text).toContain("Viva could not grade that turn");
+    expect(turn.nudge?.retryQuestionId).toBe("q-fixture-1");
+    expect(turn.ariaStatus).toContain("Retry this question");
+    expect(turn.ariaStatus).toContain("Viva could not grade that turn");
+    // A deferral is a TURN affordance beside the capsule, never the capsule: the
+    // turn's own label/headline still describe the live turn.
+    expect(turn.label).toBe("Your turn");
+  });
+
+  test("a deferral nudge clears once the turn is no longer the learner's to answer", () => {
+    const deferredTurnNudge = projectDeferredTurnNudge({
+      deferredTurn: {
+        canRetrySameQuestion: false,
+        questionId: "q-fixture-1",
+        reason: "empty_answer",
+        responseId: "response-1",
+        turnId: "turn-1",
+      },
+    });
+    const thinking = projectTurnTakingState({
+      deferredTurnNudge,
+      question: liveQuestion,
+      state: "thinking",
+    });
+
+    expect(deferredTurnNudge?.label).toBe("Wait for the next question");
+    expect(thinking.phase).toBe("thinking");
+    expect(thinking.nudge).toBeUndefined();
+    expect(thinking.ariaStatus).not.toContain("Wait for the next question");
+    expect(thinking.ariaStatus).not.toContain("Viva could not grade that turn");
+  });
+
   test("captions the spoken question and feedback without surfacing source excerpts", () => {
     const feedbackQuestion = projectSessionQuestion(
       derived({ evaluation: evaluation(), phase: "feedback", question }),
@@ -1709,35 +1764,36 @@ describe("projectVoiceOutcomeCopy", () => {
   });
 
   test("a retryable deferred turn projects one neutral retry action bound to the question", () => {
-    const copy = projectVoiceOutcomeCopy({
-      deferredTurn: {
-        canRetrySameQuestion: true,
-        questionId: "q-fixture-1",
-        reason: "transcript_uncertain",
-        responseId: "response-1",
-        turnId: "turn-1",
-      },
-    });
+    for (const reason of VIVA_VOICE_DEFERRAL_REASONS) {
+      const copy = projectVoiceOutcomeCopy({
+        deferredTurn: {
+          canRetrySameQuestion: true,
+          questionId: "q-fixture-1",
+          reason,
+          responseId: "response-1",
+          turnId: "turn-1",
+        },
+      });
 
-    if (!copy) throw new Error("Expected copy");
-    expect(copy.action.nextActionLabel).toBe("Retry this question");
-    expect(copy.action.disabled).toBe(false);
-    expect(copy.retryQuestionId).toBe("q-fixture-1");
-    // A deferral is a TURN-scoped affordance, not a session capsule: it must not
-    // be able to masquerade as one of the contract's session runtime causes.
-    expect(copy.cause).toBe("turn_deferred");
-    expect(copy.scope).toBe("turn");
+      if (!copy) throw new Error("Expected copy");
+      expect({ label: copy.action.nextActionLabel, reason }).toEqual({
+        label: "Retry this question",
+        reason,
+      });
+      expect(copy.action.disabled).toBe(false);
+      expect(copy.retryQuestionId).toBe("q-fixture-1");
+      // A deferral is a TURN-scoped affordance, not a session capsule: it must
+      // not be able to masquerade as one of the contract's session runtime
+      // causes.
+      expect(copy.cause).toBe("turn_deferred");
+      expect(copy.scope).toBe("turn");
+      // Retryability is NEVER inferred from the reason string.
+      expect(JSON.stringify(copy)).not.toContain(reason);
+    }
   });
 
   test("a nonretryable deferred turn offers no retry-current action", () => {
-    for (const reason of [
-      "empty_answer",
-      "transcript_uncertain",
-      "evaluator_unavailable",
-      "invalid_evaluator_output",
-      "insufficient_semantic_evidence",
-      "contradictory_evidence",
-    ] as const) {
+    for (const reason of VIVA_VOICE_DEFERRAL_REASONS) {
       const copy = projectVoiceOutcomeCopy({
         deferredTurn: {
           canRetrySameQuestion: false,
@@ -1791,6 +1847,110 @@ describe("projectVoiceOutcomeCopy", () => {
 
     expect(recapWins?.cause).toBe("recap_success");
     expect(terminalWins?.cause).toBe("session_cap");
+  });
+});
+
+/**
+ * A-27.2 (`WEBSESSION-DEFERRED-01`) — the DISPLAY-ONLY deferral surface.
+ *
+ * `deferredTurnOutcome` has always authored the words; nothing rendered them, so
+ * a deferral was silent on screen. This projects those same words into the turn
+ * panel's nudge slot and stops there: there is deliberately NO retry control of
+ * any kind, because answering again IS the retry and the server's progression
+ * cursor — never the browser — decides which question an answer binds to.
+ */
+describe("projectDeferredTurnNudge", () => {
+  function deferred(
+    reason: (typeof VIVA_VOICE_DEFERRAL_REASONS)[number],
+    canRetrySameQuestion: boolean,
+  ) {
+    return {
+      canRetrySameQuestion,
+      questionId: "q-fixture-1",
+      reason,
+      responseId: "response-1",
+      turnId: "turn-1",
+    };
+  }
+
+  test("states every deferral reason with the guidance the server's boolean selects", () => {
+    for (const reason of VIVA_VOICE_DEFERRAL_REASONS) {
+      for (const canRetry of [false, true]) {
+        const nudge = projectDeferredTurnNudge({ deferredTurn: deferred(reason, canRetry) });
+
+        if (!nudge) throw new Error(`Expected a deferral nudge for ${reason}/${canRetry}`);
+        expect({ canRetry, label: nudge.label, reason }).toEqual({
+          canRetry,
+          label: canRetry ? "Retry this question" : "Wait for the next question",
+          reason,
+        });
+        expect(nudge.text).toContain("Viva could not grade that turn");
+        expect(nudge.retryQuestionId).toBe(canRetry ? "q-fixture-1" : undefined);
+        // The protocol token is never learner copy, in either spelling.
+        expect(JSON.stringify(nudge)).not.toContain(reason);
+        expect(JSON.stringify(nudge)).not.toContain(reason.replaceAll("_", " "));
+      }
+    }
+  });
+
+  test("what it renders is a function of the server boolean alone, never of the reason", () => {
+    for (const canRetry of [false, true]) {
+      const variants = new Set(
+        VIVA_VOICE_DEFERRAL_REASONS.map((reason) =>
+          JSON.stringify(projectDeferredTurnNudge({ deferredTurn: deferred(reason, canRetry) })),
+        ),
+      );
+
+      expect({ canRetry, variants: variants.size }).toEqual({ canRetry, variants: 1 });
+    }
+  });
+
+  test("carries words only — no action, no intent, and nothing a control could bind to", () => {
+    for (const canRetry of [false, true]) {
+      const nudge = projectDeferredTurnNudge({
+        deferredTurn: deferred("evaluator_unavailable", canRetry),
+      });
+
+      if (!nudge) throw new Error("Expected a deferral nudge");
+      expect([...Object.keys(nudge)].sort()).toEqual(["label", "retryQuestionId", "text"]);
+    }
+  });
+
+  test("is silent without a deferral and whenever a later outcome outranks it", () => {
+    const turn = deferred("transcript_uncertain", true);
+
+    expect(projectDeferredTurnNudge({})).toBeUndefined();
+    // The ONE outcome switch's precedence is REUSED here, never re-decided: a
+    // session that has said its last word never also says a turn is waiting.
+    expect(
+      projectDeferredTurnNudge({
+        deferredTurn: turn,
+        recap: { kind: "complete", recap: recapPayload() },
+      }),
+    ).toBeUndefined();
+    expect(
+      projectDeferredTurnNudge({ deferredTurn: turn, terminalReason: "session_cap" }),
+    ).toBeUndefined();
+    expect(
+      projectDeferredTurnNudge({
+        deferredTurn: turn,
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      }),
+    ).toBeUndefined();
+    expect(
+      projectDeferredTurnNudge({
+        deferredTurn: turn,
+        lastServerError: { code: "VOICE_AUTH_EXPIRED", retryable: true },
+      }),
+    ).toBeUndefined();
+    expect(
+      projectDeferredTurnNudge({
+        deferredTurn: turn,
+        structuredErrors: [
+          { terminalReason: "provider_malformed_stream", terminality: "terminal" },
+        ],
+      }),
+    ).toBeUndefined();
   });
 });
 

@@ -65,6 +65,7 @@ import {
   sessionRouteIdentityFromLocationParts,
 } from "../../lib/viva-session-entry";
 import {
+  projectDeferredTurnNudge,
   projectHighlightedTokens,
   projectRuntimeCopy,
   projectSourceFolio,
@@ -1555,6 +1556,31 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       agent.derived.finalTranscript,
     ],
   );
+  // A-27.2 (`WEBSESSION-DEFERRED-01`): the ungraded turn finally reaches the
+  // screen. It is DISPLAY-ONLY — the page renders the projection's words beside
+  // the open turn and offers no control at all, because answering again IS the
+  // retry and the server's progression cursor governs what an answer binds to.
+  const deferredTurnNudge = useMemo(
+    () =>
+      projectDeferredTurnNudge({
+        deferredTurn: agent.derived.deferredTurn,
+        diagnostics: agent.derived.diagnostics,
+        lastServerError: agent.derived.lastServerError,
+        recap: agent.derived.recapState,
+        structuredErrors: agent.derived.structuredErrors,
+        terminalReason: agent.derived.terminalReason,
+        termination: agent.derived.termination,
+      }),
+    [
+      agent.derived.deferredTurn,
+      agent.derived.diagnostics,
+      agent.derived.lastServerError,
+      agent.derived.recapState,
+      agent.derived.structuredErrors,
+      agent.derived.terminalReason,
+      agent.derived.termination,
+    ],
+  );
   const websocketReady = Boolean(agent.agentState.ready) && agent.status === "open";
   // The selected provider is LIVE when the server's own ready frame says so.
   const liveProvider = agent.agentState.ready?.brain.live_runtime === true;
@@ -1606,6 +1632,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     () =>
       runtime
         ? projectTurnTakingState({
+            deferredTurnNudge,
             hasPendingAudio: agent.agentState.audio.length > 0,
             interruptAcknowledged,
             playbackSpeaking,
@@ -1617,6 +1644,7 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
         : null,
     [
       agent.agentState.audio.length,
+      deferredTurnNudge,
       effectiveState,
       interruptAcknowledged,
       playbackSpeaking,

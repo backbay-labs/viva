@@ -2886,6 +2886,75 @@ describe("LiveSessionPage mounted behavior matrix (WEBSESSION-MOUNT-01)", () => 
     }
   });
 
+  /**
+   * A-27.2 (`WEBSESSION-DEFERRED-01`) closed on the mounted page.
+   *
+   * `deferredTurnOutcome` has always authored these words and NOTHING rendered
+   * them, so an ungraded turn was silent on screen — the learner watched an
+   * answer disappear with no account of it. The surface is DISPLAY-ONLY: it
+   * states what happened and what happens next, and there is nothing to press,
+   * because answering again IS the retry and the server's progression cursor
+   * decides which question that answer binds to.
+   */
+  test("a deferred turn states its outcome beside the turn, with nothing to press", async () => {
+    // Every way a browser could hand the learner an ACTION on the surface.
+    const actionable =
+      "a, area, button, details, embed, iframe, input, label, object, select, summary, " +
+      "textarea, [contenteditable], [href], [onclick], [tabindex], [role='button'], " +
+      "[role='link'], [role='menuitem'], [role='tab'], [role='checkbox'], [role='switch']";
+
+    async function renderDeferral(canRetry: boolean) {
+      const controller = programmableController();
+      const clock = createFakeReconnectClock(0);
+      const { container, root } = await mountMatrix(controller, clock);
+      await reachListening(controller, clock);
+      const silence = container.textContent ?? "";
+
+      await act(async () => {
+        controller.push({ deferredTurn: deferredTurn("evaluator_unavailable", canRetry) });
+      });
+      await step(clock);
+
+      const region = container.querySelector(".turn-taking__nudge");
+      const surface = {
+        actions: region ? [...region.querySelectorAll(actionable)].map((el) => el.tagName) : null,
+        children: region ? [...region.querySelectorAll("*")].map((el) => el.tagName) : null,
+        page: container.textContent ?? "",
+        silence,
+        text: region?.textContent ?? "",
+      };
+      await act(async () => {
+        root.unmount();
+      });
+      return surface;
+    }
+
+    const retryable = await renderDeferral(true);
+    const waiting = await renderDeferral(false);
+
+    for (const surface of [retryable, waiting]) {
+      // The silence this closes: an open turn says nothing about grading until
+      // the server defers one.
+      expect(surface.silence).not.toContain("Viva could not grade that turn");
+      expect(surface.text).toContain("Viva could not grade that turn");
+      expect(surface.text).toContain("nothing was recorded against this concept");
+      // NEGATIVE CONTROL: the surface is words. Not one focusable node, not one
+      // action role, not one click target — a client-side retry control would be
+      // the browser making a progression decision that is the server's alone.
+      expect(surface.actions).toEqual([]);
+      expect(surface.children).toEqual(["SPAN"]);
+    }
+
+    // The guidance is the server boolean's, rendered verbatim from the copy the
+    // projection already pinned.
+    expect(retryable.text).toContain("Retry this question");
+    expect(retryable.text).toContain("Answer the same question again when you are ready.");
+    expect(retryable.page).not.toContain("Wait for the next question");
+    expect(waiting.text).toContain("Wait for the next question");
+    expect(waiting.text).toContain("The Conductor will move on.");
+    expect(waiting.page).not.toContain("Retry this question");
+  });
+
   test("a cancellation stops that response, acknowledges only its consumed frames, and says so", async () => {
     const controller = programmableController();
     const clock = createFakeReconnectClock(0);

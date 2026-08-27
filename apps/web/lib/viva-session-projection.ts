@@ -76,6 +76,13 @@ export type VoiceTurnCaption = {
 export type VoiceTurnNudge = {
   label: string;
   text: string;
+  /**
+   * A-27.2 (`WEBSESSION-DEFERRED-01`): the question the SERVER marked retryable,
+   * present only on a deferral nudge whose `can_retry_same_question` was true.
+   * It is a record of what the server said, never a target the browser binds a
+   * control to — the surface carrying it has no control at all.
+   */
+  retryQuestionId?: string;
 };
 
 export type VoiceTurnTakingState = {
@@ -705,6 +712,61 @@ export function projectVoiceOutcomeCopy(input: {
   const diagnostic = (input.diagnostics ?? []).at(-1);
   if (diagnostic) return rejectedFrameOutcome();
   return null;
+}
+
+/**
+ * A-27.2 (`WEBSESSION-DEFERRED-01`): the deferral's DISPLAY-ONLY surface.
+ *
+ * `deferredTurnOutcome` authored this copy from the first day and nothing ever
+ * rendered it, so an ungraded turn was silent on screen — the learner watched an
+ * answer disappear with no account of it. This lifts those same words into the
+ * turn panel's nudge slot (the "TURN affordance which sits beside it" the switch
+ * above names) and deliberately DROPS the outcome's `action`: there is no
+ * client-side retry control of any kind, because answering again IS the retry
+ * and the server's progression cursor — never the browser — decides which
+ * question an answer binds to.
+ *
+ * Precedence is not re-decided here, it is reused: the one outcome switch above
+ * already ranks a recap, a terminal structured error, a termination, and a typed
+ * server error above a deferral. `terminalReason` is the single addition,
+ * because the runtime ladder ranks it above the switch itself. A session that
+ * has said its last word never also tells the learner a turn is waiting.
+ */
+export function projectDeferredTurnNudge({
+  deferredTurn,
+  diagnostics,
+  lastServerError,
+  recap,
+  structuredErrors,
+  terminalReason,
+  termination,
+}: {
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  recap?: VivaAgentRecapState;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  terminalReason?: AgentTerminalSessionReason;
+  termination?: VivaVoiceTermination;
+}): VoiceTurnNudge | undefined {
+  if (terminalReason) return undefined;
+  const outcome = projectVoiceOutcomeCopy({
+    deferredTurn,
+    diagnostics,
+    lastServerError,
+    recap,
+    structuredErrors,
+    termination,
+  });
+  if (outcome?.cause !== "turn_deferred" || outcome.scope !== "turn") return undefined;
+  return {
+    // The guidance the server's boolean already selected leads, and the reason
+    // sentence explains it. Neither string is rewritten, recomposed, or chosen
+    // here, and the deferral's own `reason` token reaches neither of them.
+    label: outcome.action.nextActionLabel,
+    retryQuestionId: outcome.retryQuestionId,
+    text: outcome.marginaliaText,
+  };
 }
 
 function terminationOutcome(termination: VivaVoiceTermination): VoiceOutcomeCopy {
@@ -1495,6 +1557,7 @@ function terminalReasonWithoutRecap(derived: VivaAgentDerivedState): boolean {
 }
 
 export function projectTurnTakingState(input: {
+  deferredTurnNudge?: VoiceTurnNudge;
   hasPendingAudio?: boolean;
   interruptAcknowledged?: boolean;
   playbackSpeaking?: boolean;
@@ -1514,6 +1577,11 @@ export function projectTurnTakingState(input: {
   });
   const interruptAcknowledged = base.phase === "listening" && Boolean(input.interruptAcknowledged);
   const nudge = turnNudge({
+    // A-27.2: the deferral is bounded by the SAME listening gate the other two
+    // nudges use. While the learner has a turn open, an ungraded answer is the
+    // thing to say; once they have answered again — or the session moved on —
+    // the panel states that instead of a turn outcome that is no longer current.
+    deferredTurnNudge: base.phase === "listening" ? input.deferredTurnNudge : undefined,
     interruptAcknowledged,
     textAnswerFallbackActive: base.phase === "listening" && input.textAnswerFallbackActive,
   });
@@ -1648,9 +1716,13 @@ function turnCaptions(question: Question): VoiceTurnCaption[] {
 }
 
 function turnNudge(input: {
+  deferredTurnNudge?: VoiceTurnNudge;
   interruptAcknowledged: boolean;
   textAnswerFallbackActive?: boolean;
 }): VoiceTurnNudge | undefined {
+  // A-27.2: an ungraded turn is a fact about the learner's OWN answer, so it
+  // outranks the two transient nudges, which only describe the current moment.
+  if (input.deferredTurnNudge) return input.deferredTurnNudge;
   if (input.interruptAcknowledged) {
     return {
       label: "Interruption acknowledged",
