@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import {
+  readVivaEffectsPreference,
+  resolveVivaEffectsPolicy,
+  VIVA_EFFECTS_CHANGE_EVENT,
+  type VivaEffectsPolicy,
+} from "../../lib/viva-effects";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import { conceptStatusColor } from "../../lib/viva-session-projection";
 import type { ConceptNode, SessionState } from "./session-data";
@@ -238,6 +244,21 @@ export function voiceTraceConceptDensity(conceptCount: number): "sparse" | "room
   return "sparse";
 }
 
+let labelPlanComputations = 0;
+
+/**
+ * How many concept-label layouts this module has solved since it was loaded.
+ *
+ * `WEBSESSION-CANVAS-01` makes label planning a cost paid per *data* change, not
+ * per animation frame — a claim about work done, which no assertion about the
+ * painted output can see. This monotonic counter is that claim's observable, so
+ * the guarantee is provable from outside the module instead of by reading its
+ * source. It is the only reason the counter exists; nothing branches on it.
+ */
+export function voiceTraceLabelPlanComputations(): number {
+  return labelPlanComputations;
+}
+
 export function planVoiceTraceConceptLabels({
   canvasHeight,
   canvasWidth,
@@ -249,6 +270,7 @@ export function planVoiceTraceConceptLabels({
   fontScale?: number;
   items: Array<{ emphasis: number; label: string; point: Vec }>;
 }): VoiceTraceConceptLabelPlan[] {
+  labelPlanComputations += 1;
   if (canvasWidth <= 0 || canvasHeight <= 0) return [];
 
   const padding = canvasWidth < 520 ? 8 : 12;
@@ -325,6 +347,59 @@ export function planVoiceTraceConceptLabels({
       y: label.y,
     };
   });
+}
+
+/**
+ * The cache key of one concept-label layout: the *semantic* inputs only.
+ *
+ * `items` carries the STABLE node anchors — `nodePos * canvas size` — and is
+ * deliberately absent from the key. Per-frame wobble is a drawing offset, not a
+ * layout input; feeding it back into the planner is what made lanes re-solve
+ * (and occasionally flip) 32 times a second. `conceptGeneration` is the caller's
+ * promise that the concept set itself changed.
+ */
+export type VoiceTraceLabelPlanCacheInput = Readonly<{
+  conceptGeneration: number;
+  canvasHeight: number;
+  canvasWidth: number;
+  fontScale: number;
+  items: Parameters<typeof planVoiceTraceConceptLabels>[0]["items"];
+}>;
+
+export type VoiceTraceLabelPlanCache = Readonly<{
+  plan(input: VoiceTraceLabelPlanCacheInput): ReturnType<typeof planVoiceTraceConceptLabels>;
+  reset(): void;
+}>;
+
+/**
+ * Memoizes `planVoiceTraceConceptLabels` on generation/size/font-scale. A hit
+ * returns the *same* plan array, so a steady animation neither recomputes the
+ * lane solve nor allocates a new plan per frame. The planner is injectable so a
+ * test can count calls without reading this module's source.
+ */
+export function createVoiceTraceLabelPlanCache(
+  planner: typeof planVoiceTraceConceptLabels = planVoiceTraceConceptLabels,
+): VoiceTraceLabelPlanCache {
+  let key: string | null = null;
+  let plan: VoiceTraceConceptLabelPlan[] = [];
+  return {
+    plan(input) {
+      const nextKey = `${input.conceptGeneration}|${input.canvasWidth}|${input.canvasHeight}|${input.fontScale}`;
+      if (key === nextKey) return plan;
+      plan = planner({
+        canvasHeight: input.canvasHeight,
+        canvasWidth: input.canvasWidth,
+        fontScale: input.fontScale,
+        items: input.items,
+      });
+      key = nextKey;
+      return plan;
+    },
+    reset() {
+      key = null;
+      plan = [];
+    },
+  };
 }
 
 function conceptLabelLaneOffsets(canvasWidth: number): number[] {
@@ -414,6 +489,39 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const REDUCED_TRANSPARENCY_QUERY = "(prefers-reduced-transparency: reduce)";
+
+/** `navigator.connection` is not in the DOM lib; only `saveData` is read. */
+type SaveDataNavigator = Navigator & { connection?: { saveData?: boolean } };
+
+function readSaveDataPreference(): boolean {
+  return (navigator as SaveDataNavigator).connection?.saveData === true;
+}
+
+/**
+ * Plan 13A owns the storage key and the fail-closed parse; this only guards the
+ * `window.localStorage` *access*, which itself throws in some privacy modes.
+ */
+function readEffectsPreference(): "reduced" | null {
+  try {
+    return readVivaEffectsPreference(window.localStorage);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Identity of the concept set as the label planner sees it: which concepts, in
+ * what order, with what label, status, and emphasis tier (the planner's only
+ * use of `emphasis` is its `>= 1` size bump).
+ */
+function conceptSetSignature(nodes: ConceptNode[] | undefined): string {
+  return (nodes ?? [])
+    .map((node) => `${node.id}${node.label}${node.status}${node.emphasis >= 1 ? "1" : "0"}`)
+    .join("");
+}
+
 export function VoiceTraceCanvas({
   state,
   scene,
@@ -435,7 +543,11 @@ export function VoiceTraceCanvas({
   const textModeRef = useRef(textMode);
   const highlightRef = useRef<Set<string>>(new Set());
   const conceptNodesRef = useRef<ConceptNode[]>(conceptNodes ?? []);
+  const conceptGenerationRef = useRef(0);
+  const conceptSignatureRef = useRef<string | null>(null);
+  const rebuildRef = useRef<(() => void) | null>(null);
   const levelRefHolder = useRef<VoiceTraceLevelRef | null>(levelRef ?? null);
+  const [effectsPolicy, setEffectsPolicy] = useState<VivaEffectsPolicy | null>(null);
   levelRefHolder.current = levelRef ?? null;
   stateRef.current = state;
   sceneRef.current = scene;
@@ -445,8 +557,16 @@ export function VoiceTraceCanvas({
     highlightRef.current = new Set(highlightedTokens ?? []);
   }, [highlightedTokens]);
 
+  // Only a change to the *semantic* concept set invalidates a label plan: a new
+  // array holding the same concepts is a React identity change, not a layout
+  // change, and must not force a replan or a repaint.
   useEffect(() => {
     conceptNodesRef.current = conceptNodes ?? [];
+    const signature = conceptSetSignature(conceptNodes);
+    if (conceptSignatureRef.current === signature) return;
+    conceptSignatureRef.current = signature;
+    conceptGenerationRef.current += 1;
+    rebuildRef.current?.();
   }, [conceptNodes]);
 
   useEffect(() => {
@@ -461,11 +581,37 @@ export function VoiceTraceCanvas({
     let cssH = 0;
     let raf = 0;
     let last = 0;
+    let lastDrawAt = 0;
     let animating = false;
     let particles: Particle[] = [];
     const cur: Params = { ...TARGETS.listening };
-    const reduceMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const FRAME = 1000 / 32;
+    const labelCache = createVoiceTraceLabelPlanCache();
+    const reduceMotionMQ = window.matchMedia(REDUCED_MOTION_QUERY);
+    const reduceTransparencyMQ = window.matchMedia(REDUCED_TRANSPARENCY_QUERY);
+
+    /**
+     * Plan 13A owns the effects table; this canvas only gathers its browser
+     * inputs and consumes `mode`/`dprCap`/`fps`. There is deliberately no local
+     * DPR or fps literal left to drift from it (`glyphCountScale` is not
+     * consumed here — particle density stays a width decision).
+     */
+    function resolvePolicy(): VivaEffectsPolicy {
+      return resolveVivaEffectsPolicy({
+        canvasRole: "voice_trace",
+        devicePixelRatio: window.devicePixelRatio || 1,
+        explicitPreference: readEffectsPreference(),
+        hardwareConcurrency:
+          typeof navigator.hardwareConcurrency === "number" ? navigator.hardwareConcurrency : null,
+        prefersReducedMotion: reduceMotionMQ.matches,
+        prefersReducedTransparency: reduceTransparencyMQ.matches,
+        saveData: readSaveDataPreference(),
+        viewportHeight: window.innerHeight,
+        viewportWidth: window.innerWidth,
+      });
+    }
+
+    let policy = resolvePolicy();
+    setEffectsPolicy(policy);
 
     const mainPoly = buildPoly(MAIN_SEQ, 26);
     const goldPoly = buildPoly(GOLD_SEQ, 26);
@@ -497,7 +643,7 @@ export function VoiceTraceCanvas({
       if (!rect) return;
       cssW = rect.width;
       cssH = rect.height;
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const dpr = Math.min(policy.dprCap, window.devicePixelRatio || 1);
       cv.width = Math.round(cssW * dpr);
       cv.height = Math.round(cssH * dpr);
       cv.style.width = `${cssW}px`;
@@ -623,27 +769,26 @@ export function VoiceTraceCanvas({
       // leader lines, never hidden concepts.
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      const nodeDrawState = nodes.map((node, i) => {
-        const phase = i * 1.3;
-        const point = {
-          x: nodePos[i].x * cssW + Math.sin(t * 0.3 + phase) * 3,
-          y: nodePos[i].y * cssH + Math.cos(t * 0.24 + phase) * 2.4,
-        };
-        return { node, phase, point };
-      });
-      const labelPlans = planVoiceTraceConceptLabels({
-        canvasHeight: cssH,
-        canvasWidth: cssW,
-        fontScale: fs,
-        items: nodeDrawState.map(({ node, point }) => ({
-          emphasis: node.emphasis,
-          label: node.label,
-          point,
-        })),
-      });
+      // The planner sees the STABLE anchors only. Wobble is added to the plan's
+      // output below, so a node, its leader line, and its label all drift by the
+      // same delta while the lane solve stays put.
+      const anchors = nodes.map((_node, i) => ({
+        x: nodePos[i].x * cssW,
+        y: nodePos[i].y * cssH,
+      }));
+      const nodeDrawState = nodes.map((node, i) => ({
+        node,
+        phase: i * 1.3,
+        wobble: {
+          x: Math.sin(t * 0.3 + i * 1.3) * 3,
+          y: Math.cos(t * 0.24 + i * 1.3) * 2.4,
+        },
+      }));
+      const labelPlans = currentLabelPlan(fs, anchors);
       for (let i = 0; i < nodeCount; i++) {
-        const { node, phase, point } = nodeDrawState[i];
-        const { x, y } = point;
+        const { node, phase, wobble } = nodeDrawState[i];
+        const x = anchors[i].x + wobble.x;
+        const y = anchors[i].y + wobble.y;
         const color = conceptStatusColor(node.status);
         const highlighted = hl.has(node.label);
         const sceneBoost = sceneEntityWeights.get(node.id) ?? 0;
@@ -685,8 +830,11 @@ export function VoiceTraceCanvas({
           ctx.lineWidth = 1;
           ctx.setLineDash([1.5, 4]);
           ctx.beginPath();
-          ctx.moveTo(labelPlan.leaderLine.from.x, labelPlan.leaderLine.from.y);
-          ctx.lineTo(labelPlan.leaderLine.to.x, labelPlan.leaderLine.to.y);
+          ctx.moveTo(
+            labelPlan.leaderLine.from.x + wobble.x,
+            labelPlan.leaderLine.from.y + wobble.y,
+          );
+          ctx.lineTo(labelPlan.leaderLine.to.x + wobble.x, labelPlan.leaderLine.to.y + wobble.y);
           ctx.stroke();
           ctx.setLineDash([]);
         }
@@ -696,8 +844,8 @@ export function VoiceTraceCanvas({
         ctx.fillStyle = rgba(labelColor, alpha);
         ctx.fillText(
           labelPlan?.text ?? node.label,
-          labelPlan?.x ?? x,
-          labelPlan?.y ?? y,
+          labelPlan ? labelPlan.x + wobble.x : x,
+          labelPlan ? labelPlan.y + wobble.y : y,
           labelPlan?.maxWidth,
         );
       }
@@ -747,19 +895,45 @@ export function VoiceTraceCanvas({
       ctx.fill();
     }
 
+    /**
+     * The plan for the current generation/size/font scale, taken from the cache
+     * rather than solved here: on a steady frame this is a key comparison, and
+     * the returned array is the *same object* the previous frame drew from.
+     */
+    function currentLabelPlan(fontScale: number, anchors: Vec[]): VoiceTraceConceptLabelPlan[] {
+      return labelCache.plan({
+        canvasHeight: cssH,
+        canvasWidth: cssW,
+        conceptGeneration: conceptGenerationRef.current,
+        fontScale,
+        items: conceptNodesRef.current.map((node, i) => ({
+          emphasis: node.emphasis,
+          label: node.label,
+          point: anchors[i],
+        })),
+      });
+    }
+
     function loop(now: number) {
       if (!animating) return;
       raf = requestAnimationFrame(loop);
-      if (now - last < FRAME) return;
-      const dt = Math.min(0.1, (now - last) / 1000);
-      last = now;
+      const frame = policy.fps > 0 ? 1000 / policy.fps : 0;
+      if (frame <= 0) return;
+      if (now - last < frame) return;
+      // Advance the budget clock by whole frames rather than snapping it to
+      // `now`: snapping turns a 32 Hz display into 16 fps under a 24 fps budget,
+      // because every second callback lands one budget short.
+      last += frame * Math.floor((now - last) / frame);
+      const dt = Math.min(0.1, (now - lastDrawAt) / 1000);
+      lastDrawAt = now;
       draw(now / 1000, dt);
     }
 
     function startAnim() {
-      if (animating || reduceMQ.matches) return;
+      if (animating || policy.fps <= 0) return;
       animating = true;
       last = performance.now();
+      lastDrawAt = last;
       raf = requestAnimationFrame(loop);
     }
 
@@ -773,11 +947,31 @@ export function VoiceTraceCanvas({
       resize();
       makeParticles();
       draw(performance.now() / 1000, 0.016);
-      if (reduceMQ.matches) stopAnim();
+      if (policy.fps <= 0) stopAnim();
       else startAnim();
     }
 
-    let resizeTimer: ReturnType<typeof setTimeout>;
+    /**
+     * One policy path for every signal that can change it — media query, stored
+     * preference, viewport. A changed policy stops the current loop before
+     * rebuilding, so a mode flip can never leave two animation loops running.
+     */
+    function applyPolicy() {
+      const next = resolvePolicy();
+      const changed =
+        next.mode !== policy.mode ||
+        next.fps !== policy.fps ||
+        next.dprCap !== policy.dprCap ||
+        next.glyphCountScale !== policy.glyphCountScale;
+      policy = next;
+      setEffectsPolicy((current) => (current && !changed ? current : next));
+      if (!changed) return;
+      stopAnim();
+      labelCache.reset();
+      rebuild();
+    }
+
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     const ro = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(rebuild, 180);
@@ -789,17 +983,23 @@ export function VoiceTraceCanvas({
       else startAnim();
     };
     document.addEventListener("visibilitychange", onVisibility);
-    const onReduce = () => rebuild();
-    reduceMQ.addEventListener("change", onReduce);
+    const onPolicySignal = () => applyPolicy();
+    reduceMotionMQ.addEventListener("change", onPolicySignal);
+    reduceTransparencyMQ.addEventListener("change", onPolicySignal);
+    window.addEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
 
+    rebuildRef.current = rebuild;
     rebuild();
 
     return () => {
+      rebuildRef.current = null;
       stopAnim();
       clearTimeout(resizeTimer);
       ro.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
-      reduceMQ.removeEventListener("change", onReduce);
+      reduceMotionMQ.removeEventListener("change", onPolicySignal);
+      reduceTransparencyMQ.removeEventListener("change", onPolicySignal);
+      window.removeEventListener(VIVA_EFFECTS_CHANGE_EVENT, onPolicySignal);
     };
   }, []);
 
@@ -811,11 +1011,15 @@ export function VoiceTraceCanvas({
       className="voice-trace"
       data-concept-count={conceptCount}
       data-concept-density={voiceTraceConceptDensity(conceptCount)}
+      data-dpr-cap={effectsPolicy ? String(effectsPolicy.dprCap) : undefined}
+      data-fps-budget={effectsPolicy ? String(effectsPolicy.fps) : undefined}
+      data-render-mode={effectsPolicy ? (effectsPolicy.fps > 0 ? "animated" : "static") : undefined}
       data-scene-emphasis={scene?.emphasis ?? "quiet"}
       data-scene-entity-count={scene?.entities.length ?? 0}
       data-scene-register={scene?.register ?? "examining"}
       data-state={state}
       data-text-mode={textMode ? "true" : "false"}
+      data-viva-effects={effectsPolicy?.mode}
     >
       <canvas className="voice-trace__canvas" ref={canvasRef} />
     </div>

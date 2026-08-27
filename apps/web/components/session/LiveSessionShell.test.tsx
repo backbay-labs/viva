@@ -298,6 +298,15 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-concept-count="7"');
     expect(canvasMarkup).toContain('data-concept-density="dense"');
     expect(canvasMarkup).toContain('data-text-mode="true"');
+    // `WEBSESSION-CANVAS-01`: the shared effects budget is a post-mount browser
+    // measurement (viewport, DPR, media queries, stored preference), so the
+    // server frame must publish NO policy attribute at all. Rendering a guessed
+    // one here would be both untrue and a hydration mismatch on the first
+    // client render.
+    expect(canvasMarkup).not.toContain("data-viva-effects");
+    expect(canvasMarkup).not.toContain("data-render-mode");
+    expect(canvasMarkup).not.toContain("data-fps-budget");
+    expect(canvasMarkup).not.toContain("data-dpr-cap");
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
     expect(marginaliaMarkup).toContain('data-scene-marginalia-count="1"');
