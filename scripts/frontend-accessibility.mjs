@@ -1162,6 +1162,15 @@ async function runSessionHandoffCheck({ disclosureScope }) {
             for (let attempt = 0; attempt < 20 && liveRuntimeObserved === null; attempt++) {
               await page.waitForTimeout(250);
             }
+            if (disclosureScope === "all-live-content" && liveRuntimeObserved === null) {
+              failures.push(
+                'expected a real "ready" WS frame with a boolean brain.live_runtime field from ' +
+                  `the connected agent, but none was observed (openedWebSocketUrls: ` +
+                  `${JSON.stringify(openedWebSocketUrls)}) -- without this, the D-08 Branch A ` +
+                  "scope check below cannot distinguish live-provider mode from a broken frame " +
+                  "parse, and would silently never enforce or report either way",
+              );
+            }
 
             // Item 1 (session half): exactly one <main>, plus a visible-on-focus
             // skip link targeting the active question/answer region.
