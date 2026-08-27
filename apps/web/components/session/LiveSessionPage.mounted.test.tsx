@@ -2,7 +2,11 @@
 // time) is loaded, so this stays the FIRST import in the file.
 import "../../test/setup-dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { AuthenticatedStudyProjectionV1 } from "@viva/core";
+import {
+  type AuthenticatedStudyProjectionV1,
+  VIVA_VOICE_DEFERRAL_REASONS,
+  type VivaVoiceDeferralReason,
+} from "@viva/core";
 import { act, StrictMode } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
@@ -962,6 +966,8 @@ function createFakeReconnectClock(random = 0): FakeReconnectClock {
 
 type ProgrammableController = {
   factory: LiveSessionPageDependencies["createAgentController"];
+  /** Each `acknowledgeAudio` call, holding the frame objects it was handed. */
+  acknowledged: Array<readonly unknown[]>;
   connects: string[];
   refreshes: Array<string | null>;
   retries: number;
@@ -988,10 +994,13 @@ function programmableController(): ProgrammableController {
   } as const;
 
   const record: ProgrammableController = {
+    acknowledged: [],
     cancelledTurns: [],
     connects: [],
     factory: (() => ({
-      acknowledgeAudio: () => {},
+      acknowledgeAudio: (consumed: readonly unknown[]) => {
+        record.acknowledged.push(consumed);
+      },
       cancel: () => {},
       cancelAudioTurn: (turnId: string) => {
         record.cancelledTurns.push(turnId);
@@ -2158,41 +2167,44 @@ describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () =
  * the turn stage, an explicit transcript disclosure the page owns, and a terminal
  * recap that stops the machinery while leaving the recap on screen.
  */
-describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-TERMINAL-01)", () => {
-  type PlaybackRecord = {
-    factory: LiveSessionPageDependencies["createAudioPlaybackSink"];
-    cancels: Array<string | null | undefined>;
-    closes: number;
-    enqueued: string[];
-    resets: number;
-  };
+type PlaybackRecord = {
+  factory: LiveSessionPageDependencies["createAudioPlaybackSink"];
+  cancels: Array<string | null | undefined>;
+  closes: number;
+  enqueued: string[];
+  resets: number;
+};
 
-  function recordingPlayback(): PlaybackRecord {
-    const record: PlaybackRecord = {
-      cancels: [],
-      closes: 0,
-      enqueued: [],
-      factory: (() => ({
-        cancel: (responseId?: string | null) => {
-          record.cancels.push(responseId);
-        },
-        close: async () => {
-          record.closes += 1;
-        },
-        enqueue: (input: { responseId: string }) => {
-          record.enqueued.push(input.responseId);
-        },
-        getOutputLevel: () => 0,
-        getState: () => ({}),
-        resetForGeneration: () => {
-          record.resets += 1;
-        },
-        unlock: async () => ({}),
-      })) as unknown as LiveSessionPageDependencies["createAudioPlaybackSink"],
-      resets: 0,
-    };
-    return record;
-  }
+/** A playback sink that records what the page asked it to do, and nothing else. */
+function recordingPlaybackSink(): PlaybackRecord {
+  const record: PlaybackRecord = {
+    cancels: [],
+    closes: 0,
+    enqueued: [],
+    factory: (() => ({
+      cancel: (responseId?: string | null) => {
+        record.cancels.push(responseId);
+      },
+      close: async () => {
+        record.closes += 1;
+      },
+      enqueue: (input: { responseId: string }) => {
+        record.enqueued.push(input.responseId);
+      },
+      getOutputLevel: () => 0,
+      getState: () => ({}),
+      resetForGeneration: () => {
+        record.resets += 1;
+      },
+      unlock: async () => ({}),
+    })) as unknown as LiveSessionPageDependencies["createAudioPlaybackSink"],
+    resets: 0,
+  };
+  return record;
+}
+
+describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-TERMINAL-01)", () => {
+  const recordingPlayback = recordingPlaybackSink;
 
   const COMPLETE_RECAP = {
     concepts: [{ concept_id: "enthalpy", label: "Enthalpy", status: "strong" }],
@@ -2701,5 +2713,415 @@ describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-
     expect(playback.cancels).toContain(null);
     // …and no recovery timer survives the terminal state.
     expect(clock.pending()).toEqual([]);
+  });
+});
+
+/**
+ * `WEBSESSION-MOUNT-01` — the rows of Task 14's matrix that the per-task suites
+ * above prove only through an exported helper, closed here on the real mounted
+ * page. Deliberately NOT re-proved here: bootstrap/credential precedence,
+ * projection rendering, typed intents, D-08A, readiness, recovery, recap,
+ * landmarks and the transcript toggle all already have mounted proofs above; the
+ * VoiceTrace frame/DPR budget and its 120-frame label-plan claim have theirs in
+ * `VoiceTraceCanvas.test.tsx`, which mounts the same component through the same
+ * `createRoot`/`act` path and can drive `requestAnimationFrame`, which this
+ * suite cannot.
+ */
+describe("LiveSessionPage mounted behavior matrix (WEBSESSION-MOUNT-01)", () => {
+  async function step(clock: FakeReconnectClock, ms = 0, rounds = 4) {
+    for (let round = 0; round < rounds; round += 1) {
+      await act(async () => {
+        clock.advance(round === 0 ? ms : 0);
+        await new Promise<void>((resolve) => {
+          globalThis.setTimeout(resolve, 0);
+        });
+      });
+    }
+  }
+
+  async function mountMatrix(
+    controller: ProgrammableController,
+    clock: FakeReconnectClock,
+    overrides: Partial<LiveSessionPageDependencies> = {},
+  ) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage
+            dependencies={testDependencies({
+              createAgentController: controller.factory,
+              reconnectClock: clock,
+              renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+              ...overrides,
+            })}
+          />
+        </StrictMode>,
+      );
+    });
+    await step(clock);
+    return { container, root };
+  }
+
+  /** The server's own open question, so the page has a real turn to be in. */
+  const AGENT_QUESTION = {
+    concept_id: "enthalpy",
+    expected_terms: ["state function", "path independence"],
+    follow_up: "Now connect that to Gibbs free energy in one sentence.",
+    prompt: "Why is enthalpy a state function?",
+    question_id: "q-enthalpy-1",
+    rubric: { must_include: ["state function"], should_include: [] },
+    source: {
+      confidence: "high",
+      document_id: "chem-lec-3",
+      excerpt: "Enthalpy is a state function.",
+      retrieval_reason: "server fixture source",
+      source_id: "src-chem-lec-3-slide-11",
+      span: "slide:11",
+    },
+  } as unknown as NonNullable<VivaAgentSessionState["question"]>;
+
+  /** An open, ready, listening session — the state every turn row starts from. */
+  async function reachListening(controller: ProgrammableController, clock: FakeReconnectClock) {
+    await act(async () => {
+      controller.push({
+        generation: { id: "gen-1", reason: "session_bootstrap", sequence: 1 },
+        // `ready` + an open question is what the hook turns into the LISTENING
+        // phase; pushing the phase word alone would not survive that derivation.
+        phase: "ready",
+        question: AGENT_QUESTION,
+        ready: READY_FRAME,
+        status: "open",
+      } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+  }
+
+  function deferredTurn(
+    reason: VivaVoiceDeferralReason,
+    canRetrySameQuestion: boolean,
+  ): VivaAgentSessionState["deferredTurn"] {
+    return {
+      canRetrySameQuestion,
+      questionId: "q-enthalpy-1",
+      reason,
+      responseId: "response-1",
+      turnId: "turn-deferred-1",
+    };
+  }
+
+  test("every canonical deferral reason stays ungraded, nonterminal, and unspoken", async () => {
+    // The reason set comes from Plan 05's exported constant, so a reason added
+    // to the protocol without page behaviour fails here instead of shipping.
+    expect(VIVA_VOICE_DEFERRAL_REASONS.length).toBeGreaterThan(0);
+
+    for (const reason of VIVA_VOICE_DEFERRAL_REASONS) {
+      const controller = programmableController();
+      const clock = createFakeReconnectClock(0);
+      const { container, root } = await mountMatrix(controller, clock);
+      await reachListening(controller, clock);
+      const connectsBefore = controller.connects.length;
+      const questionBefore = container.textContent?.includes("Why is enthalpy a state function?");
+
+      await act(async () => {
+        controller.push({ deferredTurn: deferredTurn(reason, false) });
+      });
+      await step(clock);
+
+      const text = container.textContent ?? "";
+      const at = (claim: string, actual: unknown) => `${reason} ${claim}: ${actual}`;
+      // A deferral is not a verdict and not the session's last word.
+      expect(at("terminal", text.includes("Session complete"))).toBe(at("terminal", false));
+      expect(at("lost", text.includes("Connection lost"))).toBe(at("lost", false));
+      expect(at("interrupted", text.includes("Session interrupted"))).toBe(
+        at("interrupted", false),
+      );
+      // The reason is a protocol token, never learner copy.
+      expect(at("token", text.includes(reason))).toBe(at("token", false));
+      expect(at("token", text.includes(reason.replace(/_/g, " ")))).toBe(at("token", false));
+      // The socket is untouched: no new generation and no recovery timer.
+      expect(at("connects", controller.connects.length)).toBe(at("connects", connectsBefore));
+      expect(at("timers", JSON.stringify(clock.pending()))).toBe(at("timers", "[]"));
+      // …and the browser did not advance the question off the back of it.
+      expect(at("question", text.includes("Why is enthalpy a state function?"))).toBe(
+        at("question", questionBefore),
+      );
+
+      await act(async () => {
+        root.unmount();
+      });
+    }
+  });
+
+  test("what a deferral renders follows the server boolean alone, never the reason", async () => {
+    async function renderDeferral(reason: VivaVoiceDeferralReason, canRetry: boolean) {
+      const controller = programmableController();
+      const clock = createFakeReconnectClock(0);
+      const { container, root } = await mountMatrix(controller, clock);
+      await reachListening(controller, clock);
+      await act(async () => {
+        controller.push({ deferredTurn: deferredTurn(reason, canRetry) });
+      });
+      await step(clock);
+      const text = container.textContent ?? "";
+      await act(async () => {
+        root.unmount();
+      });
+      return text;
+    }
+
+    // `insufficient_semantic_evidence` reads as the most retryable reason in the
+    // set and `empty_answer` as the least. Holding the server boolean fixed and
+    // swapping only the reason must change NOTHING the learner sees: the page
+    // may not infer retryability — or anything else — from the reason string.
+    // This is the differential the ledger's `WEBSESSION-DEFERRED-01` row needs,
+    // and it stays true whichever way the open turn-affordance item is closed.
+    for (const canRetry of [false, true]) {
+      const lenient = await renderDeferral("insufficient_semantic_evidence", canRetry);
+      const strict = await renderDeferral("empty_answer", canRetry);
+      expect(`canRetry=${canRetry}: ${lenient === strict}`).toBe(`canRetry=${canRetry}: true`);
+      expect(lenient.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("a cancellation stops that response, acknowledges only its consumed frames, and says so", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const playback = recordingPlaybackSink();
+    const { container } = await mountMatrix(controller, clock, {
+      createAudioPlaybackSink: playback.factory,
+    });
+    await reachListening(controller, clock);
+
+    // Two frames of one examiner response reach the page and are drained.
+    const first = { frame: { pcm16_base64: "AQEB" }, responseId: "response-1" };
+    const second = { frame: { pcm16_base64: "AgIC" }, responseId: "response-1" };
+    await act(async () => {
+      controller.push({ audio: [first, second] } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+
+    expect(playback.enqueued).toEqual(["response-1", "response-1"]);
+    // `acknowledgeAudio` releases the EXACT frame objects the sink consumed:
+    // identity, not a copy and not a count, is what lets the controller drop
+    // precisely those and keep anything that arrived while it was draining.
+    expect(controller.acknowledged).toHaveLength(1);
+    expect(controller.acknowledged[0]).toHaveLength(2);
+    expect(controller.acknowledged[0]?.[0]).toBe(first);
+    expect(controller.acknowledged[0]?.[1]).toBe(second);
+
+    // The learner barges in. The controller has already dropped the cancelled
+    // response's frames, so the page sees an empty queue plus the cancellation.
+    const acknowledgementsBefore = controller.acknowledged.length;
+    await act(async () => {
+      controller.push({
+        audio: [],
+        cancelledResponseIds: ["response-1"],
+      } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+
+    // Exactly the cancelled response is stopped, nothing is re-acknowledged…
+    expect(playback.cancels).toEqual(["response-1"]);
+    expect(controller.acknowledged).toHaveLength(acknowledgementsBefore);
+    // …and the learner is told the barge-in landed.
+    expect(container.textContent).toContain("Interruption acknowledged");
+    expect(container.textContent).toContain("Viva stopped speaking and is listening again.");
+  });
+
+  test("an acknowledged audio turn releases the ledger, so recovery replays nothing", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountMatrix(controller, clock);
+    await reachListening(controller, clock);
+    expect(controller.retries).toBe(0);
+
+    // The learner speaks: Plan 03 retains the turn until the server admits it…
+    controller.retainedTurn = RETAINED_TURN;
+    await act(async () => {
+      controller.push({ phase: "thinking" } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+    expect(container.textContent).not.toContain(RETAINED_TURN.turnId);
+
+    // …and `audio_turn_accepted` releases it, which the controller reports by
+    // having nothing retained left.
+    controller.retainedTurn = null;
+    await act(async () => {
+      controller.push({ phase: "listening" } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+
+    await act(async () => {
+      controller.push({
+        close: { code: 1006, wasClean: false },
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      });
+    });
+    await step(clock, 500);
+    expect(controller.connects.at(-1)).toBe("socket_retry");
+
+    await act(async () => {
+      controller.push({
+        close: undefined,
+        generation: { id: "gen-2", reason: "socket_retry", sequence: 2 },
+        ready: READY_FRAME,
+        status: "open",
+        termination: undefined,
+      });
+    });
+    await step(clock);
+
+    // An admitted turn is the server's, not the browser's: recovery must not
+    // resend it, and no copy may keep promising the learner a retained answer.
+    expect(controller.retries).toBe(0);
+    expect(controller.cancelledTurns).toEqual([]);
+    expect(container.textContent).not.toContain(
+      "Your spoken answer is retained on this device for retry",
+    );
+  });
+
+  test("a recap arriving with a still-retryable close opens nothing and leaves no timer", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountMatrix(controller, clock);
+    await reachListening(controller, clock);
+    const connectsBefore = controller.connects.length;
+
+    // The hardest ordering for the stop rule: the recap and a RETRYABLE
+    // transport termination land in the SAME update, so the recovery loop has
+    // a live, arguable reason to reconnect at the exact moment the session
+    // says its last word.
+    await act(async () => {
+      controller.push({
+        close: { code: 1006, wasClean: false },
+        recap: {
+          kind: "complete",
+          recap: {
+            concepts: [],
+            deferred_turns: 0,
+            headline: "You held the state-function argument.",
+            next_action: "n",
+            review_schedule: [],
+            schema: "viva.study_session_recap.v2",
+            source_moments: [],
+            summary: "s",
+            voice_session_id: ROUTE_IDENTITY.sessionId,
+          },
+        },
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock, 10_000);
+
+    expect(clock.pending()).toEqual([]);
+    expect(controller.connects).toHaveLength(connectsBefore);
+    expect(container.textContent).toContain("You held the state-function argument.");
+    expect(container.textContent).not.toContain("Reconnecting");
+  });
+
+  test("the voice trace is fed the authenticated projection's own concepts", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountMatrix(controller, clock);
+
+    const trace = container.querySelector(".voice-trace");
+    if (!trace) throw new Error("expected the voice trace on the mounted session");
+    // Two server concepts, so the canvas is told two — never a seed count.
+    expect(trace.getAttribute("data-concept-count")).toBe("2");
+    expect(trace.getAttribute("data-concept-density")).toBe("sparse");
+    // It is decoration over data the page states in text, so it is hidden from
+    // assistive technology rather than duplicated into it.
+    expect(trace.getAttribute("aria-hidden")).toBe("true");
+
+    // A live mastery event replaces the projection's status for that concept
+    // WITHOUT changing the set the canvas lays out — which is exactly why
+    // mastery is not part of the label plan's cache key.
+    await act(async () => {
+      controller.push({
+        conceptStatuses: { enthalpy: "strong" },
+      } as unknown as Partial<VivaAgentSessionState>);
+    });
+    await step(clock);
+    const after = container.querySelector(".voice-trace");
+    expect(after?.getAttribute("data-concept-count")).toBe("2");
+    expect(after?.getAttribute("data-concept-density")).toBe("sparse");
+  });
+
+  test("a full session lifecycle leaves no timer, listener, credential, or media behind", async () => {
+    const consoleSpy = spyOnConsoleError();
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const playback = recordingPlaybackSink();
+    const renewals: RenewalRecord = { calls: [] };
+    const captureStarts: string[] = [];
+    try {
+      const { root } = await mountMatrix(controller, clock, {
+        createAudioCaptureSource: (async () => {
+          captureStarts.push("started");
+          throw new Error("capture must not start without a gesture");
+        }) as LiveSessionPageDependencies["createAudioCaptureSource"],
+        createAudioPlaybackSink: playback.factory,
+        renewCredential: recordingRenewal(renewals, () => ({
+          credential: branchACredential({ accessToken: "viva1.access-b" }),
+          status: "renewed",
+        })),
+      });
+      await reachListening(controller, clock);
+
+      // StrictMode mounted, ran, and threw away a whole tree before this point.
+      // The one-use entry credential was spent exactly once by the surviving
+      // tree, and the throwaway pass constructed no media resource at all.
+      expect(renewals.calls).toHaveLength(1);
+      expect(renewals.calls[0]?.reason).toBe("session_entry");
+      expect(renewals.calls[0]?.refreshToken).toBe("viva-refresh1.credential-r1");
+      expect(captureStarts).toEqual([]);
+      expect(readBrowserSessionCredential()?.accessToken).toBe("viva1.access-b");
+
+      await act(async () => {
+        controller.push({
+          audio: [{ frame: { pcm16_base64: "AgIC" }, responseId: "response-1" }],
+        } as unknown as Partial<VivaAgentSessionState>);
+      });
+      await step(clock);
+      expect(playback.enqueued).toEqual(["response-1"]);
+
+      // Arm the recovery loop so the unmount has a live timer to clean up.
+      await act(async () => {
+        controller.push({
+          close: { code: 1006, wasClean: false },
+          status: "closed",
+          termination: { closeCode: 1006, kind: "transport", retryable: true },
+        });
+      });
+      await step(clock);
+      expect(clock.pending().length).toBeGreaterThan(0);
+
+      const connectsBefore = controller.connects.length;
+      await act(async () => {
+        root.unmount();
+      });
+
+      // Every owned resource is released, and time moving on afterwards
+      // produces nothing at all.
+      expect(clock.pending()).toEqual([]);
+      expect(playback.closes).toBeGreaterThan(0);
+      await act(async () => {
+        clock.advance(60_000);
+      });
+      expect(controller.connects).toHaveLength(connectsBefore);
+      expect(controller.retries).toBe(0);
+      expect(renewals.calls).toHaveLength(1);
+      // React logs on an update applied to an unmounted tree, and
+      // `IS_REACT_ACT_ENVIRONMENT` makes an un-acted update log too, so an
+      // empty console is the proof that nothing outlived the unmount.
+      expect(consoleSpy.calls).toEqual([]);
+    } finally {
+      consoleSpy.restore();
+    }
   });
 });
