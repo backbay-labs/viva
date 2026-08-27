@@ -5,6 +5,7 @@ import { ContextPill } from "./ContextPill";
 import { HeroCopy } from "./HeroCopy";
 import { MuseBackdrop } from "./MuseBackdrop";
 import { MuseGlyphCanvas, type MuseGlyphState } from "./MuseGlyphCanvas";
+import { VisualEffectsControl } from "./VisualEffectsControl";
 import { VivaWordmark } from "./VivaWordmark";
 
 /**
@@ -32,6 +33,7 @@ export function LandingHero({ onBegin }: { onBegin?: () => void }) {
       <div className="viva-hero__chrome">
         <header className="viva-hero__top">
           <VivaWordmark />
+          <VisualEffectsControl />
         </header>
 
         <div className="viva-hero__center">

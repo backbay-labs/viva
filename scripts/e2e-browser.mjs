@@ -200,7 +200,9 @@ try {
   await page.goto(webUrl, { waitUntil: "networkidle" });
   const startActionButton = failureControlPlan.enabled
     ? page.getByRole("button", { name: /^Start / }).first()
-    : page.getByRole("button", { name: "Review missed concepts" });
+    : // A-29.1: 13A's D-03B removed the suggestion chips; the one honest
+      // affordance is the 44px "Begin oral exam" button.
+      page.getByRole("button", { name: "Begin oral exam" });
   await startActionButton.waitFor({
     state: "visible",
     timeout: 20_000,

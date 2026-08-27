@@ -741,6 +741,38 @@
 .viva-hero__top {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+}
+
+.viva-effects-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--viva-target-min);
+  padding: 0 1.1rem;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(250, 244, 235, 0.52));
+  border: 1px solid rgba(65, 43, 82, 0.13);
+  -webkit-backdrop-filter: blur(14px) saturate(1.04);
+  backdrop-filter: blur(14px) saturate(1.04);
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: -0.006em;
+  color: var(--viva-ink-soft);
+  cursor: pointer;
+  transition: background-color 160ms ease;
+}
+
+.viva-effects-toggle:hover {
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.viva-effects-toggle:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px var(--viva-paper),
+    0 0 0 6px var(--viva-amethyst);
 }
 
 .viva-hero__center {
@@ -1095,6 +1127,62 @@
   color: #a14a4a;
 }
 
+/* D-04 CONFIRM_DELETE (FRONTEND-004): the named inline confirmation a
+ * study-set/source row and a session-recap/history row each open on their
+ * first delete click. `grid-column: 1 / -1` spans it beneath the row's own
+ * columns whichever grid-template-columns the owning row uses. */
+.viva-library__delete-dialog {
+  background: rgba(255, 253, 248, 0.96);
+  border: 1px solid rgba(176, 74, 74, 0.35);
+  border-radius: 8px;
+  display: grid;
+  gap: 0.6rem;
+  grid-column: 1 / -1;
+  padding: 0.9rem;
+}
+
+.viva-library__delete-dialog-title {
+  color: var(--viva-ink);
+  font-weight: 750;
+  margin: 0;
+}
+
+.viva-library__delete-dialog-description {
+  color: var(--viva-muted);
+  font-size: 0.86rem;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.viva-library__delete-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.viva-library__delete-dialog-actions button {
+  background: transparent;
+  border: 1px solid rgba(64, 42, 82, 0.22);
+  border-radius: 8px;
+  color: var(--viva-ink);
+  cursor: pointer;
+  font-weight: 750;
+  min-height: var(--viva-target-min);
+  padding: 0.48rem 0.72rem;
+}
+
+.viva-library__delete-dialog-actions button:last-child {
+  background: #a14a4a;
+  border-color: #a14a4a;
+  color: var(--viva-paper);
+}
+
+.viva-library__delete-dialog-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .viva-library__row--session {
   grid-template-columns: auto minmax(9rem, 1fr) minmax(12rem, 2fr) auto;
 }
@@ -1269,7 +1357,21 @@
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
+/*
+ * `FRONTEND-008`: reduced-effects support. Either OS-level accessibility
+ * setting (`prefers-reduced-motion`, `prefers-reduced-transparency`) or the
+ * app's own explicit preference (mirrored by `MuseGlyphCanvas` onto
+ * `html[data-viva-effects="reduced"]`) fully stops this route's named
+ * decorative animations — not just makes the canvas static — and replaces
+ * every translucent, blurred "glass" surface with an opaque token
+ * background. Never a smaller hitbox, a hidden control, or a lower-contrast
+ * one; borders and focus rings are untouched. `base.css`'s universal `*`
+ * rule already collapses every animation/transition's *duration* under the
+ * same three conditions; the named list here additionally pins
+ * `animation-iteration-count: 1` so these specific decorative loops fully
+ * stop rather than keep cycling imperceptibly fast forever.
+ */
+@media (prefers-reduced-motion: reduce), (prefers-reduced-transparency: reduce) {
   .viva-hero__paper::after,
   .viva-muse__img,
   .viva-context,
@@ -1285,6 +1387,38 @@
     opacity: 0.95;
     transform: none;
   }
+}
+
+html[data-viva-effects="reduced"] .viva-hero__paper::after,
+html[data-viva-effects="reduced"] .viva-muse__img,
+html[data-viva-effects="reduced"] .viva-context,
+html[data-viva-effects="reduced"] .viva-copy__headline,
+html[data-viva-effects="reduced"] .viva-copy__sub,
+html[data-viva-effects="reduced"] .viva-hero__begin,
+html[data-viva-effects="reduced"] .viva-hero__tagline {
+  animation-duration: 0.001ms;
+  animation-iteration-count: 1;
+}
+
+html[data-viva-effects="reduced"] .viva-muse__img {
+  opacity: 0.95;
+  transform: none;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .viva-context,
+  .viva-effects-toggle {
+    background: var(--viva-paper);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+html[data-viva-effects="reduced"] .viva-context,
+html[data-viva-effects="reduced"] .viva-effects-toggle {
+  background: var(--viva-paper);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
 
 @media (forced-colors: active) {

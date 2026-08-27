@@ -177,7 +177,18 @@ button {
   color: var(--ink-2);
 }
 
-@media (prefers-reduced-motion: reduce) {
+/*
+ * `FRONTEND-008`: the universal animation/transition-duration floor applies
+ * under the OS-level accessibility setting, the OS-level reduced-transparency
+ * setting, or the app's own explicit "Reduce visual effects" preference
+ * (mirrored by `MuseGlyphCanvas` onto `html[data-viva-effects="reduced"]`) —
+ * not only `prefers-reduced-motion` alone. Without this, toggling the app's
+ * own control without an OS-level reduced-motion setting left every
+ * decorative animation and transition running at full speed; only the
+ * canvas went static. Borders, focus rings, layout, and hitboxes are
+ * untouched — only timing collapses toward zero.
+ */
+@media (prefers-reduced-motion: reduce), (prefers-reduced-transparency: reduce) {
   *,
   *::before,
   *::after {
@@ -185,6 +196,14 @@ button {
     scroll-behavior: auto;
     transition-duration: 1ms;
   }
+}
+
+html[data-viva-effects="reduced"] *,
+html[data-viva-effects="reduced"] *::before,
+html[data-viva-effects="reduced"] *::after {
+  animation-duration: 1ms;
+  scroll-behavior: auto;
+  transition-duration: 1ms;
 }
 
 @media (max-width: 720px) {

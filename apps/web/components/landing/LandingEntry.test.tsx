@@ -4,6 +4,11 @@ import { act, Children, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import Page, { dynamic } from "../../app/page";
+import {
+  clearBrowserSessionCredential,
+  readBrowserSessionCredential,
+  replaceBrowserSessionCredential,
+} from "../../lib/use-viva-agent-session";
 import { projectLibrarySnapshot, type VivaLibrarySnapshot } from "../../lib/viva-library";
 import { LandingEntry, landingEntryTarget } from "./LandingEntry";
 import { LandingHero } from "./LandingHero";
@@ -462,12 +467,15 @@ describe("LandingEntry", () => {
 
 /**
  * D-07 Branch A (`retain-token-only`, `FRONTEND-011`): function-level proof
- * that `startServerSession` composes the "small local indirection" this task
- * owns in place of Plan 10's not-yet-published `replaceBrowserSessionCredential`
- * (confirmed absent from `apps/web/lib/use-viva-agent-session.ts` in this
- * tree before writing this test) — it must be handed the complete start
- * response and invoked strictly before navigation — and that the same-origin
- * start fetch is bounded so a hung mint can never hang the UI forever.
+ * that `startServerSession` composes the vault seam Plan 10's real
+ * `replaceBrowserSessionCredential` now publishes
+ * (`apps/web/lib/use-viva-agent-session.ts`) — it must be handed the
+ * complete start response and invoked strictly before navigation — and
+ * that the same-origin start fetch is bounded so a hung mint can never
+ * hang the UI forever. Most tests below inject a local double via
+ * `sessionCredentialVault` to pin the exact call shape/ordering in
+ * isolation; the "supplies none" test further down proves the real
+ * production default instead (A-28.4).
  */
 describe("D-07 Branch A session-bootstrap composition: vault seam and fetch bound (FRONTEND-011)", () => {
   test("calls the session credential vault with the complete start response before navigating", async () => {
@@ -577,20 +585,42 @@ describe("D-07 Branch A session-bootstrap composition: vault seam and fetch boun
     }
   });
 
-  test("defaults to the inert Phase-13A vault placeholder without throwing when the caller supplies none", async () => {
+  test("A-28.4: defaults to Plan 10's real browser session credential vault when the caller supplies none", async () => {
     const navigations: string[] = [];
     const row = projectLibrarySnapshot(librarySnapshotWithBootstrap("default-vault-sentinel"))
       .libraryRows[0];
     if (!row) throw new Error("fixture must include a library row");
+
+    // Baseline the real vault's monotonic revision counter (never reset by
+    // `clearBrowserSessionCredential`) with a seeded credential of our own,
+    // so "the default vault was called exactly once" is provable below as
+    // "the revision advanced by exactly 1" — not merely "some credential
+    // exists", which a stale value left by an unrelated earlier test could
+    // also satisfy.
+    replaceBrowserSessionCredential({
+      mode: "retain-token-only",
+      refresh_expires_at: null,
+      refresh_token: null,
+      session_absolute_expires_at: null,
+      session_id: "revision-baseline-session",
+      session_token: "revision-baseline-token",
+      study_set_id: "revision-baseline-study-set",
+      user_id: "revision-baseline-user",
+    });
+    const baselineRevision = readBrowserSessionCredential()?.revision ?? 0;
+    clearBrowserSessionCredential();
     try {
       globalThis.fetch = (async () =>
         new Response(
           JSON.stringify({
+            refresh_expires_at: "2026-09-01T00:00:00Z",
+            refresh_token: "viva1.default-vault-refresh-token",
             session: {
               session_id: "server-session",
               study_set_id: "biology-midterm",
               user_id: "user-1",
             },
+            session_absolute_expires_at: "2026-09-23T00:00:00Z",
             session_token: "viva1.default-vault-token",
           }),
           { headers: { "content-type": "application/json" }, status: 200 },
@@ -598,13 +628,41 @@ describe("D-07 Branch A session-bootstrap composition: vault seam and fetch boun
 
       const outcome = await startServerSession(row, "start", row.start, {
         navigate: (target) => navigations.push(target),
+        // No `sessionCredentialVault` supplied — this is exactly the
+        // production path: `LandingEntry.tsx` mounts `LibraryStatusPanel`
+        // with no such prop, so whatever `startServerSession` falls back to
+        // here is what a real browser calls (A-28.4).
       });
 
       expect(outcome).toEqual({ ok: true });
       expect(navigations).toEqual([
         "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.default-vault-token",
       ]);
+
+      // The complete start response must reach Plan 10's real, published
+      // vault (`browserSessionCredentialVault` /
+      // `replaceBrowserSessionCredential` in `use-viva-agent-session.ts`),
+      // not the inert Phase-13A `pendingBrowserSessionCredentialVault`
+      // stand-in that silently drops every field. `startServerSession`
+      // never exposes which vault object it defaulted to, so this reads
+      // the real vault's own module-memory state back out instead.
+      const stored = readBrowserSessionCredential();
+      if (stored?.mode !== "retain-token-only") {
+        throw new Error("expected the real vault to hold a retain-token-only credential");
+      }
+      expect(stored.accessToken).toBe("viva1.default-vault-token");
+      expect(stored.refreshToken).toBe("viva1.default-vault-refresh-token");
+      expect(stored.refreshExpiresAt).toBe(Date.parse("2026-09-01T00:00:00Z"));
+      expect(stored.sessionAbsoluteExpiresAt).toBe(Date.parse("2026-09-23T00:00:00Z"));
+      expect(stored.identity).toEqual({
+        sessionId: "server-session",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      // Exactly once: a second call would have advanced the revision by 2.
+      expect(stored.revision).toBe(baselineRevision + 1);
     } finally {
+      clearBrowserSessionCredential();
       globalThis.fetch = originalFetch;
     }
   });
@@ -907,6 +965,200 @@ describe("LibraryStatusPanel mounted session-bootstrap composition (D-07 Branch 
   });
 });
 
+describe("LibraryStatusPanel mounted deliberate deletion (D-04 CONFIRM_DELETE, FRONTEND-004, happy-dom)", () => {
+  type DeleteTarget = {
+    completeStatus: string;
+    dialogTitle: string;
+    expectedRequestSuffix: string;
+    initiatingSelector: string;
+    kind: "study_set" | "session_history";
+  };
+
+  const DELETE_TARGETS: DeleteTarget[] = [
+    {
+      completeStatus: "Delete source complete.",
+      dialogTitle: "Delete Biology Midterm?",
+      expectedRequestSuffix: "/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+      initiatingSelector: '[aria-label="Delete source for Biology Midterm"]',
+      kind: "study_set",
+    },
+    {
+      completeStatus: "Delete recap complete.",
+      dialogTitle: "Delete Biology Midterm session recap?",
+      expectedRequestSuffix:
+        "/api/viva-library/study-sets/biology-midterm/sessions/voice-session-1?user_id=user-1",
+      initiatingSelector: '[aria-label="Delete recap for Biology Midterm"]',
+      kind: "session_history",
+    },
+  ];
+
+  test("names the exact target, blocks any DELETE before confirmation, moves/restores focus correctly, and guards a synchronous double activation — for both a study-set row and a session-recap row", async () => {
+    // An explicit absolute `url` (unlike the other mounted tests in this
+    // file, which never construct a `new URL(...)` themselves): the real
+    // `deleteVivaStudySet`/`deleteVivaSessionHistory` build their request
+    // URL via `new URL(...)` against `window.location.origin`, which
+    // happy-dom's default (unnavigated) window cannot serialize to a valid
+    // absolute base.
+    GlobalRegistrator.register({ url: "http://localhost/" });
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    try {
+      for (const target of DELETE_TARGETS) {
+        const deleteRequests: Array<{ method: string; url: string }> = [];
+        let deferredDelete: {
+          promise: Promise<Response>;
+          resolve: (value: Response) => void;
+        } | null = null;
+        let container: HTMLDivElement | null = null;
+        let root: ReturnType<typeof createRoot> | null = null;
+        try {
+          globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+            const method = (init?.method ?? "GET").toUpperCase();
+            if (method === "DELETE") {
+              deleteRequests.push({ method, url: String(input) });
+              if (deferredDelete) return deferredDelete.promise;
+              return Promise.resolve(new Response("{}", { status: 200 }));
+            }
+            return Promise.resolve(
+              new Response(JSON.stringify(librarySnapshotWithDeletableSessionRecap()), {
+                headers: { "content-type": "application/json" },
+                status: 200,
+              }),
+            );
+          }) as typeof fetch;
+
+          container = document.createElement("div");
+          document.body.appendChild(container);
+          root = createRoot(container);
+          const mountedContainer = container;
+
+          await act(async () => {
+            root?.render(
+              <LibraryStatusPanel snapshot={librarySnapshotWithDeletableSessionRecap()} />,
+            );
+          });
+
+          const initiatingButton = mountedContainer.querySelector(target.initiatingSelector);
+          if (!(initiatingButton instanceof HTMLElement)) {
+            throw new Error(`expected a real initiating button for ${target.kind}`);
+          }
+
+          // The first click only opens named confirmation — zero DELETE requests,
+          // and focus lands on the confirm action, not the dialog root or Cancel.
+          await act(async () => {
+            initiatingButton.click();
+          });
+          expect(deleteRequests).toHaveLength(0);
+          let dialog = mountedContainer.querySelector('[role="alertdialog"]');
+          if (!(dialog instanceof HTMLElement)) {
+            throw new Error(`expected an open alertdialog for ${target.kind}`);
+          }
+          const labelledBy = dialog.getAttribute("aria-labelledby");
+          const titleNode = labelledBy ? document.getElementById(labelledBy) : null;
+          expect(titleNode?.textContent).toBe(target.dialogTitle);
+          let dialogButtons = Array.from(dialog.querySelectorAll("button"));
+          expect(dialogButtons).toHaveLength(2);
+          const cancelButton = dialogButtons.find((button) => button.textContent === "Cancel");
+          const confirmButton = dialogButtons.find((button) => button.textContent === "Delete");
+          if (!(cancelButton instanceof HTMLElement) || !(confirmButton instanceof HTMLElement)) {
+            throw new Error(`expected Cancel and Delete buttons in the ${target.kind} dialog`);
+          }
+          expect(document.activeElement).toBe(confirmButton);
+
+          // Escape closes the dialog without deleting and restores focus to the opener.
+          await act(async () => {
+            dialog?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }));
+          });
+          expect(mountedContainer.querySelector('[role="alertdialog"]')).toBeNull();
+          expect(document.activeElement).toBe(initiatingButton);
+          expect(deleteRequests).toHaveLength(0);
+
+          // Cancel closes the dialog without deleting and restores focus to the opener.
+          await act(async () => {
+            initiatingButton.click();
+          });
+          dialog = mountedContainer.querySelector('[role="alertdialog"]');
+          if (!(dialog instanceof HTMLElement)) {
+            throw new Error(`expected the ${target.kind} dialog to reopen`);
+          }
+          const cancelAgain = Array.from(dialog.querySelectorAll("button")).find(
+            (button) => button.textContent === "Cancel",
+          );
+          if (!(cancelAgain instanceof HTMLElement)) {
+            throw new Error(`expected a Cancel button in the reopened ${target.kind} dialog`);
+          }
+          await act(async () => {
+            cancelAgain.click();
+          });
+          expect(mountedContainer.querySelector('[role="alertdialog"]')).toBeNull();
+          expect(document.activeElement).toBe(initiatingButton);
+          expect(deleteRequests).toHaveLength(0);
+
+          // Reopen once more: confirm issues exactly one DELETE at the table's exact
+          // endpoint, and a synchronous second activation before the request settles
+          // cannot issue a second one.
+          await act(async () => {
+            initiatingButton.click();
+          });
+          dialog = mountedContainer.querySelector('[role="alertdialog"]');
+          if (!(dialog instanceof HTMLElement)) {
+            throw new Error(`expected the ${target.kind} dialog to reopen a second time`);
+          }
+          dialogButtons = Array.from(dialog.querySelectorAll("button"));
+          const finalConfirmButton = dialogButtons.find(
+            (button) => button.textContent === "Delete",
+          );
+          if (!(finalConfirmButton instanceof HTMLElement)) {
+            throw new Error(`expected a Delete button in the final ${target.kind} dialog`);
+          }
+
+          let resolveDelete!: (value: Response) => void;
+          deferredDelete = {
+            promise: new Promise<Response>((resolve) => {
+              resolveDelete = resolve;
+            }),
+            resolve: (value) => resolveDelete(value),
+          };
+
+          await act(async () => {
+            finalConfirmButton.click();
+            finalConfirmButton.click(); // synchronous double activation, before the request settles
+          });
+          expect(deleteRequests).toHaveLength(1);
+          expect(deleteRequests[0]?.method).toBe("DELETE");
+          expect(deleteRequests[0]?.url.endsWith(target.expectedRequestSuffix)).toBe(true);
+
+          await act(async () => {
+            deferredDelete?.resolve(new Response("{}", { status: 200 }));
+            await waitForCondition(
+              () =>
+                mountedContainer.querySelector(".viva-library__status")?.textContent ===
+                target.completeStatus,
+            );
+          });
+
+          // The DELETE fired exactly once in total, success is announced through a
+          // stable status region, and the dialog is gone without a stray focus jump.
+          expect(deleteRequests).toHaveLength(1);
+          const statusNode = mountedContainer.querySelector(".viva-library__status");
+          expect(statusNode?.textContent).toBe(target.completeStatus);
+          expect(statusNode?.getAttribute("role")).toBe("status");
+          expect(mountedContainer.querySelector('[role="alertdialog"]')).toBeNull();
+        } finally {
+          if (root) {
+            act(() => {
+              root?.unmount();
+            });
+          }
+          container?.remove();
+          globalThis.fetch = originalFetch;
+        }
+      }
+    } finally {
+      await GlobalRegistrator.unregister();
+    }
+  });
+});
+
 /**
  * Polls `check` on a macrotask boundary (never real wall-clock waiting
  * beyond scheduler yields) until it returns true or `maxIterations` elapses,
@@ -936,6 +1188,21 @@ function librarySnapshotWithBootstrap(sessionBootstrapToken: string): VivaLibrar
             session_id: "server-session",
           },
         },
+      },
+    ],
+  };
+}
+
+/** Grants the fixture session recap's delete action alongside the study-set's already-available one, so both D-04 CONFIRM_DELETE table rows are exercisable from one mounted panel. */
+function librarySnapshotWithDeletableSessionRecap(): VivaLibrarySnapshot {
+  const readySession = librarySnapshot.sessions[0];
+  if (!readySession) throw new Error("fixture must include a session recap");
+  return {
+    ...librarySnapshot,
+    sessions: [
+      {
+        ...readySession,
+        actions: { delete: { available: true, control_token: "viva1.control-token" } },
       },
     ],
   };
