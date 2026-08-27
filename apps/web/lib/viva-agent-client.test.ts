@@ -6,13 +6,18 @@ import {
   parseVivaServerFrame,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
   VIVA_AUDIO_MAX_TURN_BYTES,
+  VIVA_VOICE_DEFERRAL_REASONS,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
   VIVA_VOICE_PROTOCOL_VERSION,
 } from "@viva/core";
 import fakeSessionFixture from "../../../agent/fixtures/voice-protocol/v5/fake-cartesia-gemini-runtime-session.json";
+import manifestFixture from "../../../agent/fixtures/voice-protocol/v5/manifest.json";
 import sessionFixture from "../../../agent/fixtures/voice-protocol/v5/seeded-session-config.json";
+import serverDifferentialCases from "../../../agent/fixtures/voice-protocol/v5/server-differential-cases.json";
 import readyFixture from "../../../agent/fixtures/voice-protocol/v5/server-ready.json";
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
+import terminalSequences from "../../../agent/fixtures/voice-protocol/v5/terminal-sequences.json";
+import transportOutcomes from "../../../agent/fixtures/voice-protocol/v5/transport-outcomes.json";
 import {
   agentProtocolVersion,
   createVivaAgentSessionController,
@@ -259,12 +264,13 @@ describe("Viva agent browser client", () => {
     controller.endAudioTurn({ finalSequence: 0, turnId: "turn-command-frames" });
     controller.cancel();
     controller.stop();
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
-      client_generation_id: "session_bootstrap-1",
-      text: "quiz me",
-      type: "text",
-      version: VIVA_VOICE_PROTOCOL_VERSION,
-    });
+    const answerIntent = parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"));
+    expect(answerIntent.type).toBe("turn_intent");
+    if (answerIntent.type !== "turn_intent") throw new Error("Expected a turn intent");
+    expect(answerIntent.client_generation_id).toBe("session_bootstrap-1");
+    expect(answerIntent.version).toBe(VIVA_VOICE_PROTOCOL_VERSION);
+    expect(answerIntent.intent).toEqual({ kind: "answer_text", text: "quiz me" });
+    expect(answerIntent.turn_id.length).toBeGreaterThan(0);
     expect(parseVivaClientFrame(JSON.parse(socket.sent[2] ?? "{}")).type).toBe("audio_chunk");
     expect(parseVivaClientFrame(JSON.parse(socket.sent[3] ?? "{}")).type).toBe("audio_end");
     expect(parseVivaClientFrame(JSON.parse(socket.sent[4] ?? "{}")).type).toBe("cancel");
@@ -307,15 +313,18 @@ describe("Viva agent browser client", () => {
           },
         },
         recap: {
-          concepts: [{ concept_id: "old", label: "Old", status: "strong" }],
-          deferred_turns: 0,
-          headline: "Old recap",
-          next_action: "old",
-          review_schedule: [],
-          schema: "viva.study_session_recap.v2",
-          source_moments: [],
-          summary: "Old summary",
-          voice_session_id: "voice-session-1",
+          kind: "complete",
+          recap: {
+            concepts: [{ concept_id: "old", label: "Old", status: "strong" }],
+            deferred_turns: 0,
+            headline: "Old recap",
+            next_action: "old",
+            review_schedule: [],
+            schema: "viva.study_session_recap.v2",
+            source_moments: [],
+            summary: "Old summary",
+            voice_session_id: "voice-session-1",
+          },
         },
         transcript: "old transcript",
       },
@@ -390,12 +399,12 @@ describe("Viva agent browser client", () => {
     for (const frame of fullSessionFixture.server) {
       socket.message(JSON.stringify(frame));
     }
-    expect(controller.getState().recap?.voice_session_id).toBe("voice-session-1");
+    expect(controller.getState().recap?.recap.voice_session_id).toBe("voice-session-1");
 
     socket.close();
 
     expect(controller.getState().status).toBe("closed");
-    expect(controller.getState().recap?.voice_session_id).toBe("voice-session-1");
+    expect(controller.getState().recap?.recap.voice_session_id).toBe("voice-session-1");
     expect(controller.getState().phase).toBe("recap");
   });
 
@@ -405,7 +414,7 @@ describe("Viva agent browser client", () => {
       state = vivaAgentReducer(state, frame);
     }
 
-    expect(state.recap?.voice_session_id).toBe("voice-session-1");
+    expect(state.recap?.recap.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
 
     const stalePhase = parseVivaServerFrame({
@@ -416,7 +425,7 @@ describe("Viva agent browser client", () => {
     const afterStalePhase = vivaAgentReducer(state, stalePhase);
 
     expect(afterStalePhase.phase).toBe("recap");
-    expect(afterStalePhase.recap?.voice_session_id).toBe("voice-session-1");
+    expect(afterStalePhase.recap?.recap.voice_session_id).toBe("voice-session-1");
   });
 
   test("reducer suppresses stale recap_ready for a superseded response", () => {
@@ -596,55 +605,99 @@ describe("Viva agent browser client", () => {
     expect(state.terminalReason).toBe("drained");
   });
 
-  test("reducer sanitizes server error frames before projection can render them", () => {
-    const rawProviderMessage =
-      "provider prompt transcript with bearer viva1.secret-token and raw answer text";
-    const state = vivaAgentReducer(initialVivaAgentSessionState(), {
-      type: "error",
-      version: VIVA_VOICE_PROTOCOL_VERSION,
-      message: rawProviderMessage,
-    });
-
-    expect(state.errors).toEqual(["sanitized provider error"]);
-    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
-    expect(JSON.stringify(state)).not.toContain("raw answer text");
-  });
-
-  test("reducer normalizes legacy auth errors to the coarse recovery reason", () => {
-    for (const message of [
-      "invalid session token",
-      "invalid session identity",
-      "study set access denied",
-    ]) {
-      const state = vivaAgentReducer(initialVivaAgentSessionState(), {
-        type: "error",
-        version: VIVA_VOICE_PROTOCOL_VERSION,
-        message,
-      });
-
-      expect(state.errors).toEqual(["session auth failed"]);
-    }
-  });
-
-  test("reducer sanitizes structured provider errors before projection can render them", () => {
-    const rawProviderMessage =
-      "structured_error prompt transcript with CARTESIA_API_KEY and source excerpt";
-    const state = vivaAgentReducer(initialVivaAgentSessionState(), {
+  /**
+   * WSC-M08 characterization. The deleted `session_phase` branch
+   * (`event.terminal_reason && event.phase === "recap" && !state.recap`) returned
+   * an object identical by effect to the general return, so this pins the WHOLE
+   * public state for that sequence: it was captured before the deletion and must
+   * be byte-identical after it.
+   */
+  test("reducer terminal-phase reduction is unchanged by the WSC-M08 branch deletion", () => {
+    const terminalPhase = parseVivaServerFrame({
       type: "event",
       version: VIVA_VOICE_PROTOCOL_VERSION,
-      event: {
-        type: "structured_error",
-        source: "cartesia_gemini",
-        message: rawProviderMessage,
-      },
+      event: { type: "session_phase", phase: "recap", terminal_reason: "drained" },
     });
 
-    expect(state.errors).toEqual(["sanitized provider error"]);
-    expect(JSON.stringify(state)).not.toContain("CARTESIA_API_KEY");
-    expect(JSON.stringify(state)).not.toContain("source excerpt");
+    expect(vivaAgentReducer(initialVivaAgentSessionState(), terminalPhase)).toEqual({
+      audio: [],
+      cancelledResponseIds: [],
+      conceptStatusEvents: [],
+      conceptStatuses: {},
+      diagnostics: [],
+      manuscriptIntents: [],
+      phase: "recap",
+      sources: [],
+      staleEvents: 0,
+      status: "idle",
+      structuredErrors: [],
+      terminalReason: "drained",
+      termination: {
+        closeCode: 1000,
+        kind: "terminal",
+        retryable: false,
+        terminalReason: "drained",
+      },
+      transcript: "",
+    });
+
+    // A second, IDENTICAL terminal phase is idempotent, not an invariant breach.
+    const twice = vivaAgentReducer(
+      vivaAgentReducer(initialVivaAgentSessionState(), terminalPhase),
+      terminalPhase,
+    );
+    expect(twice).toEqual(vivaAgentReducer(initialVivaAgentSessionState(), terminalPhase));
   });
 
-  test("controller records sanitized close diagnostics when the server closes the socket", () => {
+  test("reducer stores only the typed server error pair and never its free-form message", () => {
+    const sentinel =
+      "provider prompt transcript with bearer viva1.secret-token and raw answer text";
+    const state = vivaAgentReducer(
+      initialVivaAgentSessionState(),
+      parseVivaServerFrame({
+        type: "error",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        error: { code: "VOICE_CLIENT_FRAME_MALFORMED", message: sentinel, retryable: false },
+      }),
+    );
+
+    expect(state.lastServerError).toEqual({
+      code: "VOICE_CLIENT_FRAME_MALFORMED",
+      retryable: false,
+    });
+    expect(state.diagnostics).toEqual([{ code: "VOICE_CLIENT_FRAME_MALFORMED", path: "$.error" }]);
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("raw answer text");
+    expect(JSON.stringify(state)).not.toContain(sentinel);
+  });
+
+  test("reducer keeps a recoverable structured error nonterminal and drops its free-form fields", () => {
+    const sentinel = "structured_error prompt transcript with CARTESIA_API_KEY and source excerpt";
+    const state = vivaAgentReducer(
+      { ...initialVivaAgentSessionState(), status: "open" },
+      parseVivaServerFrame({
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+        event: {
+          type: "structured_error",
+          source: "cartesia_gemini",
+          code: "provider_stream_hiccup",
+          message: sentinel,
+          terminality: "recoverable",
+        },
+      }),
+    );
+
+    expect(state.structuredErrors).toEqual([{ terminality: "recoverable" }]);
+    expect(state.status).toBe("open");
+    expect(state.terminalReason).toBeUndefined();
+    expect(JSON.stringify(state)).not.toContain("CARTESIA_API_KEY");
+    expect(JSON.stringify(state)).not.toContain("source excerpt");
+    expect(JSON.stringify(state)).not.toContain("cartesia_gemini");
+    expect(JSON.stringify(state)).not.toContain("provider_stream_hiccup");
+  });
+
+  test("controller records close diagnostics that carry no server close-reason text", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
       sessionToken: SIGNED_SESSION_CREDENTIAL,
@@ -662,67 +715,21 @@ describe("Viva agent browser client", () => {
       wasClean: false,
     });
 
-    expect(controller.getState().status).toBe("closed");
-    expect(controller.getState().close).toEqual({
-      code: 1008,
-      reason: "[redacted close reason]",
-      wasClean: false,
-    });
+    const state = controller.getState();
+    expect(state.status).toBe("closed");
+    expect(state.close).toEqual({ code: 1008, wasClean: false });
+    expect(Object.keys(state.close ?? {})).toEqual(["code", "wasClean"]);
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("redacted");
   });
 
-  test("controller only displays allowlisted close reasons", () => {
-    FakeWebSocket.instances = [];
-    const controller = createVivaAgentSessionController({
-      sessionToken: SIGNED_SESSION_CREDENTIAL,
-      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
-      session: sessionFixture as AgentSessionConfig,
-      url: "ws://localhost:4318/ws",
-    });
-
-    const socket = controller.connect() as unknown as FakeWebSocket;
-    socket.open();
-    socket.close({
-      code: 1008,
-      reason: "NADH donates electrons before the exam answer key is shown",
-      wasClean: false,
-    });
-
-    expect(controller.getState().close).toEqual({
-      code: 1008,
-      reason: "[redacted close reason]",
-      wasClean: false,
-    });
-  });
-
-  test("controller preserves standardized auth close reasons for recovery classification", () => {
-    FakeWebSocket.instances = [];
-    const controller = createVivaAgentSessionController({
-      sessionToken: SIGNED_SESSION_CREDENTIAL,
-      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
-      session: sessionFixture as AgentSessionConfig,
-      url: "ws://localhost:4318/ws",
-    });
-
-    const socket = controller.connect() as unknown as FakeWebSocket;
-    socket.open();
-    socket.close({
-      code: 1008,
-      reason: "session auth failed",
-      wasClean: false,
-    });
-
-    expect(controller.getState().close).toEqual({
-      code: 1008,
-      reason: "session auth failed",
-      wasClean: false,
-    });
-  });
-
-  test("controller normalizes legacy auth close reasons before projection", () => {
+  test("close-reason text is never parsed into a classification, not even the former allowlist", () => {
     for (const reason of [
+      "session auth failed",
       "invalid session token",
       "invalid session identity",
       "study set access denied",
+      "idle timeout",
     ]) {
       FakeWebSocket.instances = [];
       const controller = createVivaAgentSessionController({
@@ -734,20 +741,16 @@ describe("Viva agent browser client", () => {
 
       const socket = controller.connect() as unknown as FakeWebSocket;
       socket.open();
-      socket.close({
-        code: 1008,
-        reason,
-        wasClean: false,
-      });
+      socket.close({ code: 1008, reason, wasClean: false });
 
-      expect(controller.getState().close).toEqual({
-        code: 1008,
-        reason: "session auth failed",
-        wasClean: false,
-      });
+      const state = controller.getState();
+      // Not `auth`: no typed server error preceded the close, so the ONLY honest
+      // classification of an unclean 1008 is transport, whatever the peer wrote.
+      expect(state.termination).toEqual({ closeCode: 1008, kind: "transport", retryable: true });
+      expect(state.close).toEqual({ code: 1008, wasClean: false });
+      expect(JSON.stringify(state)).not.toContain(reason);
     }
   });
-
   test("controller reconnect closes the previous socket before opening a replacement", () => {
     FakeWebSocket.instances = [];
     const controller = createVivaAgentSessionController({
@@ -884,7 +887,12 @@ describe("Viva agent browser client", () => {
     socket.error();
 
     expect(controller.getState().status).toBe("error");
-    expect(controller.getState().errors.at(-1)).toBe("WebSocket session token preflight failed");
+    // A transport-level browser error is ONE fixed internal diagnostic: nothing
+    // about the local exception (or the credential) reaches client state.
+    expect(controller.getState().diagnostics.at(-1)).toEqual({
+      code: "WEB_VOICE_INTERNAL",
+      path: null,
+    });
   });
 
   test("controller drops duplicate answer submits while a provider turn is pending", () => {
@@ -906,13 +914,11 @@ describe("Viva agent browser client", () => {
 
     expect(
       socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)).type),
-    ).toEqual(["text"]);
-    expect(parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"))).toEqual({
-      client_generation_id: "session_bootstrap-1",
-      text: "first typed response",
-      type: "text",
-      version: VIVA_VOICE_PROTOCOL_VERSION,
-    });
+    ).toEqual(["turn_intent"]);
+    const firstIntent = parseVivaClientFrame(JSON.parse(socket.sent[1] ?? "{}"));
+    if (firstIntent.type !== "turn_intent") throw new Error("Expected a turn intent");
+    expect(firstIntent.client_generation_id).toBe("session_bootstrap-1");
+    expect(firstIntent.intent).toEqual({ kind: "answer_text", text: "first typed response" });
     expect(controller.getState().pendingSubmission).toEqual({
       generationId: "session_bootstrap-1",
       kind: "text",
@@ -943,7 +949,7 @@ describe("Viva agent browser client", () => {
     expect(controller.sendText("followup typed response")).toBe(true);
     expect(
       socket.sent.slice(1).map((frame) => parseVivaClientFrame(JSON.parse(frame)).type),
-    ).toEqual(["text", "text"]);
+    ).toEqual(["turn_intent", "turn_intent"]);
   });
 
   test("reducer keeps pending submissions when stale cancellations arrive", () => {
@@ -996,7 +1002,7 @@ describe("Viva agent browser client", () => {
       "scene_intent",
       "entity_intent",
     ]);
-    expect(state.recap?.voice_session_id).toBe("voice-session-1");
+    expect(state.recap?.recap.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
     expect(state.cancelledResponseIds).toContain("response-2-generation-1");
 
@@ -1112,7 +1118,7 @@ describe("Viva agent browser client", () => {
       "NADH donates electrons to the electron transport chain.",
     );
     expect(state.sources[0]?.source_id).toBe("src-lecture-5-slide-18");
-    expect(state.recap?.voice_session_id).toBe("voice-session-1");
+    expect(state.recap?.recap.voice_session_id).toBe("voice-session-1");
     expect(state.phase).toBe("recap");
     expect(state.cancelledResponseIds).toContain("response-2-generation-1");
     expect(state.staleEvents).toBe(0);
@@ -2300,3 +2306,510 @@ describe("authenticated study projection client", () => {
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
   });
 });
+
+/**
+ * `WEBSESSION-PROTOCOL-01` / `WEBSESSION-RECAP-01` / `WEBSESSION-DEFERRED-01`.
+ *
+ * Every case here consumes Plan 05's published v5 contract — its parser, its
+ * diagnostics, its typed termination classifier, and its own fixture manifest.
+ * Nothing in this block re-encodes a second web-only parser, a close-reason
+ * allowlist, or a hand-copied expectation table.
+ */
+describe("v5 protocol consumption", () => {
+  function openTypedController(options: { ready?: boolean } = {}) {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+      url: "ws://localhost:4318/ws",
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    if (options.ready !== false) socket.message(JSON.stringify(readyFixture));
+    return { controller, socket };
+  }
+
+  test("a malformed frame records only a sanitized diagnostic code and JSON path", () => {
+    const { controller, socket } = openTypedController();
+    const sentinel =
+      '{"type":"event","transcript":"NADH donates electrons","url":"https://leak.example/auth",' +
+      '"session_token":"viva1.leaked-token","note":"auth token"';
+
+    socket.message(sentinel);
+
+    const state = controller.getState();
+    expect(state.diagnostics).toEqual([{ code: "VOICE_PROTOCOL_MALFORMED_JSON", path: "$" }]);
+    const serialized = JSON.stringify(state);
+    expect(serialized).not.toContain("NADH donates electrons");
+    expect(serialized).not.toContain("leak.example");
+    expect(serialized).not.toContain("viva1.leaked-token");
+    expect(serialized.toLowerCase()).not.toContain("auth");
+    expect(serialized.toLowerCase()).not.toContain("token");
+  });
+
+  test("every invalid Plan 05 server-differential case yields its exact diagnostic code and path", () => {
+    const invalidCases = serverDifferentialCases.cases.filter((entry) => !entry.valid);
+    expect(invalidCases.length).toBeGreaterThan(50);
+
+    for (const entry of invalidCases) {
+      const { controller, socket } = openTypedController();
+      socket.message(entry.wire_json);
+      const state = controller.getState();
+      expect({ code: state.diagnostics.at(-1)?.code, id: entry.id }).toEqual({
+        code: entry.diagnostic_code,
+        id: entry.id,
+      });
+      expect({ id: entry.id, path: state.diagnostics.at(-1)?.path }).toEqual({
+        id: entry.id,
+        path: entry.path,
+      });
+      expect(state.diagnostics).toHaveLength(1);
+      // No rejected value is retained: the frame body is absent from state.
+      expect(JSON.stringify(state)).not.toContain("Fixture excerpt.");
+    }
+  });
+
+  test("the invalid families the plan names are all present in the Plan 05 fixture manifest", () => {
+    expect(manifestFixture.fixtures.map((entry) => entry.id)).toContain(
+      "VOICE-SERVER-DIFFERENTIAL-CASES",
+    );
+    const ids = new Set(
+      serverDifferentialCases.cases.filter((entry) => !entry.valid).map((entry) => entry.id),
+    );
+    for (const required of [
+      "VOICE-SERVER-REJECT-NON-OBJECT",
+      "VOICE-SERVER-REJECT-UNKNOWN-FRAME",
+      "VOICE-SERVER-REJECT-UNKNOWN-EVENT",
+      "VOICE-SERVER-REJECT-V4",
+      "VOICE-SERVER-REJECT-FUTURE-VERSION",
+      "VOICE-SERVER-REJECT-UNKNOWN-FRAME-KEY",
+      "VOICE-SERVER-REJECT-UNKNOWN-EVENT-KEY",
+      "VOICE-SERVER-REJECT-UNKNOWN-QUESTION-KEY",
+      "VOICE-SERVER-REJECT-MISSING-QUESTION-CONCEPT",
+      "VOICE-SERVER-REJECT-UNKNOWN-RUBRIC-CRITERION-KEY",
+      "VOICE-SERVER-REJECT-EVALUATION-LABEL",
+      "VOICE-SERVER-REJECT-DEFERRED-UNKNOWN-REASON",
+      "VOICE-SERVER-REJECT-DEFERRED-RETRYABLE",
+      "VOICE-SERVER-REJECT-DEFERRED-TERMINAL-REASON",
+      "VOICE-SERVER-REJECT-DEFERRED-LEARNER-FACT",
+      "VOICE-SERVER-REJECT-RECAP-COMPLETE-WITH-REASON",
+      "VOICE-SERVER-REJECT-RECAP-PARTIAL-WITHOUT-REASON",
+      "VOICE-SERVER-REJECT-STRUCTURED-ERROR-RECOVERABLE-WITH-REASON",
+      "VOICE-SERVER-REJECT-STRUCTURED-ERROR-TERMINAL-WITHOUT-REASON",
+      "VOICE-SERVER-REJECT-ERROR-MESSAGE-TYPE",
+      "VOICE-SERVER-REJECT-ERROR-RETRYABILITY",
+    ]) {
+      expect({ id: required, present: ids.has(required) }).toEqual({ id: required, present: true });
+    }
+  });
+
+  test("a local browser exception becomes one fixed internal diagnostic, never a stringified error", () => {
+    const { controller, socket } = openTypedController();
+    // `Object.defineProperty`, not `Object.assign`: assign would INVOKE the
+    // getter while copying and throw inside the test instead of inside the
+    // controller's own message handler.
+    const hostile = new Event("message");
+    Object.defineProperty(hostile, "data", {
+      get(): string {
+        throw new Error("browser internal: viva1.secret-token transcript leak");
+      },
+    });
+    for (const listener of socket.listeners.get("message") ?? []) listener(hostile);
+
+    const state = controller.getState();
+    expect(state.diagnostics).toEqual([{ code: "WEB_VOICE_INTERNAL", path: null }]);
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("browser internal");
+  });
+
+  test("every Plan 05 transport outcome classifies exactly as the fixture pins it", () => {
+    for (const entry of transportOutcomes.cases) {
+      const { controller, socket } = openTypedController();
+      if (entry.input.terminalReason) {
+        socket.message(
+          JSON.stringify({
+            event: {
+              phase: "recap",
+              terminal_reason: entry.input.terminalReason,
+              type: "session_phase",
+            },
+            type: "event",
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+          }),
+        );
+      }
+      if (entry.input.error) {
+        socket.message(
+          JSON.stringify({
+            error: entry.input.error,
+            type: "error",
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+          }),
+        );
+      }
+      socket.close({ code: entry.input.closeCode, reason: "", wasClean: entry.input.wasClean });
+
+      const state = controller.getState();
+      expect({ id: entry.id, termination: state.termination }).toEqual({
+        id: entry.id,
+        termination: entry.expected,
+      });
+      if (entry.input.error) {
+        expect(JSON.stringify(state)).not.toContain(entry.input.error.message);
+      }
+    }
+  });
+
+  test("a hostile typed-error message never reaches classification, state, or copy", () => {
+    const { controller, socket } = openTypedController();
+    const sentinel = "viva1.secret-token NADH donates electrons";
+
+    socket.message(
+      JSON.stringify({
+        error: { code: "VOICE_AUTH_EXPIRED", message: sentinel, retryable: true },
+        type: "error",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+    socket.close({ code: 1008, reason: sentinel, wasClean: true });
+
+    const state = controller.getState();
+    expect(state.lastServerError).toEqual({ code: "VOICE_AUTH_EXPIRED", retryable: true });
+    expect(state.termination).toEqual({
+      closeCode: 1008,
+      errorCode: "VOICE_AUTH_EXPIRED",
+      kind: "auth",
+      retryable: true,
+    });
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("NADH donates electrons");
+  });
+
+  test("only VOICE_AUTH_EXPIRED is a retryable auth termination", () => {
+    const authOutcomes = transportOutcomes.cases.filter((entry) => entry.expected.kind === "auth");
+    expect(authOutcomes.map((entry) => entry.expected.errorCode)).toEqual([
+      "VOICE_AUTH_EXPIRED",
+      "VOICE_AUTH_INVALID",
+      "VOICE_AUTH_IDENTITY_MISMATCH",
+      "VOICE_AUTH_REPLAYED",
+    ]);
+    for (const entry of authOutcomes) {
+      expect({ code: entry.expected.errorCode, retryable: entry.expected.retryable }).toEqual({
+        code: entry.expected.errorCode,
+        retryable: entry.expected.errorCode === "VOICE_AUTH_EXPIRED",
+      });
+    }
+    for (const entry of transportOutcomes.cases.filter(
+      (outcome) => outcome.expected.kind === "protocol",
+    )) {
+      expect(entry.expected.retryable).toBe(false);
+    }
+    for (const entry of transportOutcomes.cases.filter((outcome) =>
+      ["service", "transport"].includes(outcome.expected.kind),
+    )) {
+      expect(entry.expected.retryable).toBe(true);
+    }
+  });
+
+  test("a complete recap folds to terminal success and closes further submission", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(completeRecapSequence?.wire_sequence_json[0] ?? "");
+
+    const state = controller.getState();
+    expect(state.recap?.kind).toBe("complete");
+    if (state.recap?.kind !== "complete") throw new Error("Expected a complete recap");
+    expect(state.recap.recap.schema).toBe("viva.study_session_recap.v2");
+    expect(state.recap.recap.review_schedule.length).toBeGreaterThan(0);
+    expect(state.terminalReason).toBeUndefined();
+    expect(state.pendingSubmission).toBeUndefined();
+    expect(controller.sendText("late answer after a complete recap")).toBe(false);
+  });
+
+  test("a partial recap is terminal immediately, with its reason and typed termination", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(JSON.stringify(recapFrame({ partial: true, partialReason: "turn_cap" })));
+
+    const state = controller.getState();
+    expect(state.recap?.kind).toBe("partial");
+    if (state.recap?.kind !== "partial") throw new Error("Expected a partial recap");
+    expect(state.recap.partialReason).toBe("turn_cap");
+    expect(state.terminalReason).toBe("turn_cap");
+    expect(state.termination?.kind).toBe("terminal");
+    expect(state.pendingSubmission).toBeUndefined();
+    expect(controller.sendText("late answer after a partial recap")).toBe(false);
+  });
+
+  test("a trailing terminal phase that disagrees with the partial reason is a sanitized invariant", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(JSON.stringify(recapFrame({ partial: true, partialReason: "turn_cap" })));
+    socket.message(
+      JSON.stringify({
+        event: { phase: "recap", terminal_reason: "cost_budget", type: "session_phase" },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+
+    const state = controller.getState();
+    expect(state.diagnostics).toEqual([
+      { code: "VOICE_PROTOCOL_INVARIANT", path: "$.event.terminal_reason" },
+    ]);
+    expect(state.terminalReason).toBe("turn_cap");
+  });
+
+  test("every Plan 05 terminal sequence folds to its pinned terminal reason", () => {
+    for (const sequence of terminalSequences.sequences) {
+      const { controller, socket } = openTypedController();
+      for (const wire of sequence.wire_sequence_json) socket.message(wire);
+      expect({ id: sequence.id, reason: controller.getState().terminalReason ?? null }).toEqual({
+        id: sequence.id,
+        reason: sequence.terminal_reason ?? null,
+      });
+    }
+  });
+
+  test("a terminal structured error closes input immediately without a free-form field", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(
+      JSON.stringify({
+        event: {
+          code: "provider_stream_broken",
+          message: "raw provider transcript viva1.secret-token",
+          source: "cartesia_gemini",
+          terminal_reason: "provider_malformed_stream",
+          terminality: "terminal",
+          type: "structured_error",
+        },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+
+    const state = controller.getState();
+    expect(state.structuredErrors).toEqual([
+      { terminalReason: "provider_malformed_stream", terminality: "terminal" },
+    ]);
+    expect(state.terminalReason).toBe("provider_malformed_stream");
+    expect(state.termination?.kind).toBe("terminal");
+    expect(state.pendingSubmission).toBeUndefined();
+    expect(controller.sendText("late answer after a terminal structured error")).toBe(false);
+    expect(JSON.stringify(state)).not.toContain("viva1.secret-token");
+    expect(JSON.stringify(state)).not.toContain("provider_stream_broken");
+  });
+
+  test("a recoverable structured error leaves the socket open and the next submit legal", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(
+      JSON.stringify({
+        event: {
+          code: "provider_stream_hiccup",
+          message: "raw provider transcript",
+          source: "cartesia_gemini",
+          terminality: "recoverable",
+          type: "structured_error",
+        },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+
+    const state = controller.getState();
+    expect(state.structuredErrors).toEqual([{ terminality: "recoverable" }]);
+    expect(state.status).toBe("open");
+    expect(state.terminalReason).toBeUndefined();
+    expect(state.termination).toBeUndefined();
+    expect(controller.sendText("the next legal submit")).toBe(true);
+  });
+
+  test("a recoverable structured error never resolves a pending turn it does not name", () => {
+    const { controller, socket } = openTypedController();
+    expect(controller.sendText("first typed response")).toBe(true);
+    socket.message(
+      JSON.stringify({
+        event: {
+          code: "provider_stream_hiccup",
+          message: "raw provider transcript",
+          source: "cartesia_gemini",
+          terminality: "recoverable",
+          type: "structured_error",
+        },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+
+    expect(controller.getState().pendingSubmission).toEqual({
+      generationId: "session_bootstrap-1",
+      kind: "text",
+    });
+  });
+
+  test("all six deferral reasons stay ungraded, nonterminal, and retryable only from the server boolean", () => {
+    for (const reason of VIVA_VOICE_DEFERRAL_REASONS) {
+      for (const canRetry of [true, false]) {
+        const { controller, socket } = openTypedController();
+        socket.message(JSON.stringify(questionStartedFrame("turn-1", "response-1", "q-fixture-1")));
+        expect(controller.sendText("a spoken-equivalent typed answer")).toBe(true);
+        socket.message(
+          JSON.stringify({
+            event: {
+              can_retry_same_question: canRetry,
+              question_id: "q-fixture-1",
+              reason,
+              response_id: "response-1",
+              turn_id: "turn-1",
+              type: "turn_deferred",
+            },
+            type: "event",
+            version: VIVA_VOICE_PROTOCOL_VERSION,
+          }),
+        );
+
+        const state = controller.getState();
+        expect({ canRetry, deferred: state.deferredTurn, reason }).toEqual({
+          canRetry,
+          deferred: {
+            canRetrySameQuestion: canRetry,
+            questionId: "q-fixture-1",
+            reason,
+            responseId: "response-1",
+            turnId: "turn-1",
+          },
+          reason,
+        });
+        expect(state.status).toBe("open");
+        expect(state.terminalReason).toBeUndefined();
+        expect(state.termination).toBeUndefined();
+        expect(state.evaluation).toBeUndefined();
+        expect(state.recap).toBeUndefined();
+        expect(state.currentConceptStatus).toBeUndefined();
+        expect(state.conceptStatuses).toEqual({});
+        expect(state.conceptStatusEvents).toEqual([]);
+        expect(state.structuredErrors).toEqual([]);
+        expect(state.pendingSubmission).toBeUndefined();
+      }
+    }
+  });
+
+  test("a later question progression clears the matching deferred turn", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(JSON.stringify(questionStartedFrame("turn-1", "response-1", "q-fixture-1")));
+    socket.message(
+      JSON.stringify({
+        event: {
+          can_retry_same_question: true,
+          question_id: "q-fixture-1",
+          reason: "transcript_uncertain",
+          response_id: "response-1",
+          turn_id: "turn-1",
+          type: "turn_deferred",
+        },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+    expect(controller.getState().deferredTurn?.questionId).toBe("q-fixture-1");
+
+    socket.message(JSON.stringify(questionStartedFrame("turn-2", "response-2", "q-fixture-2")));
+    expect(controller.getState().deferredTurn).toBeUndefined();
+  });
+
+  test("a stale deferred turn is counted, never allowed to replace the current question", () => {
+    const { controller, socket } = openTypedController();
+    socket.message(JSON.stringify(questionStartedFrame("turn-2", "response-2", "q-fixture-2")));
+    socket.message(
+      JSON.stringify({
+        event: {
+          can_retry_same_question: true,
+          question_id: "q-fixture-1",
+          reason: "empty_answer",
+          response_id: "response-1",
+          turn_id: "turn-1",
+          type: "turn_deferred",
+        },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+
+    const state = controller.getState();
+    expect(state.staleEvents).toBe(1);
+    expect(state.deferredTurn).toBeUndefined();
+    expect(state.question?.question_id).toBe("q-fixture-2");
+  });
+});
+
+const completeRecapSequence = terminalSequences.sequences.find(
+  (sequence) => sequence.id === "VOICE-NONTERMINAL-COMPLETE-RECAP",
+);
+
+function questionStartedFrame(turnId: string, responseId: string, questionId: string) {
+  return {
+    event: {
+      question: {
+        concept_id: "concept-fixture-1",
+        expected_terms: ["fixture term"],
+        follow_up: "Fixture follow up.",
+        prompt: "Fixture prompt.",
+        question_id: questionId,
+        rubric: {
+          criteria: [
+            {
+              claim: "Fixture claim.",
+              concept_id: "concept-fixture-1",
+              criterion_id: "crit-fixture-1",
+              required: true,
+              source_id: "src-lecture-5-slide-18",
+            },
+          ],
+          policy_version: "viva.semantic-rubric.v1",
+        },
+        source: {
+          confidence: "high" as const,
+          document_id: "lec-5",
+          excerpt: "Fixture excerpt.",
+          retrieval_reason: "server fixture source",
+          source_id: "src-lecture-5-slide-18",
+          span: "slide:18",
+        },
+      },
+      response_id: responseId,
+      turn_id: turnId,
+      type: "question_started",
+    },
+    type: "event",
+    version: VIVA_VOICE_PROTOCOL_VERSION,
+  };
+}
+
+function recapFrame(input: { partial: boolean; partialReason?: string }) {
+  return {
+    event: {
+      partial: input.partial,
+      ...(input.partialReason ? { partial_reason: input.partialReason } : {}),
+      recap: {
+        concepts: [{ concept_id: "concept-fixture-1", label: "Fixture concept", status: "shaky" }],
+        deferred_turns: 1,
+        headline: "Fixture headline.",
+        next_action: "Fixture next action.",
+        review_schedule: [
+          {
+            authority: "server_persisted_fsrs",
+            concept_id: "concept-fixture-1",
+            due_at: "2026-09-01T00:00:00Z",
+          },
+        ],
+        schema: "viva.study_session_recap.v2",
+        source_moments: [{ response_id: "response-1", source_id: "src-lecture-5-slide-18" }],
+        summary: "Fixture summary.",
+        voice_session_id: "voice-session-fixture",
+      },
+      response_id: "response-1",
+      type: "recap_ready",
+    },
+    type: "event",
+    version: VIVA_VOICE_PROTOCOL_VERSION,
+  };
+}

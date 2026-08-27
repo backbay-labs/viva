@@ -715,8 +715,9 @@ describe("LiveSessionPage recap cleanup", () => {
     const derived: VivaAgentDerivedState = {
       canSubmitAnswer: true,
       conceptStatuses: {},
-      errors: [],
+      diagnostics: [],
       manuscriptIntents: [],
+      structuredErrors: [],
       phase: "recap",
       recap: staleRawRecap,
       sources: [],

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type {
+  AgentStudySessionRecap,
   AgentStudySetReadiness,
   AgentTerminalSessionReason,
   AnswerEvaluation,
@@ -7,6 +8,7 @@ import type {
   SessionQuestion,
   SourceReference,
   VivaReadyFrame,
+  VivaVoiceTermination,
 } from "@viva/core";
 import {
   VIVA_AGENT_TERMINAL_SESSION_REASONS,
@@ -30,6 +32,7 @@ import {
   projectSourceFolio,
   projectTrace,
   projectTurnTakingState,
+  projectVoiceOutcomeCopy,
   transcriptionWasUncertain,
 } from "./viva-session-projection";
 
@@ -77,7 +80,8 @@ function derived(overrides: Partial<VivaAgentDerivedState> = {}): VivaAgentDeriv
     conceptStatuses: {},
     sources: [],
     manuscriptIntents: [],
-    errors: [],
+    diagnostics: [],
+    structuredErrors: [],
     canSubmitAnswer: true,
     ...overrides,
   };
@@ -207,10 +211,15 @@ describe("projectRuntimeCopy", () => {
       status: "open",
     });
     const auth = projectRuntimeCopy({
-      errors: ["session token claim mismatch"],
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "error",
+      termination: {
+        closeCode: 1008,
+        errorCode: "VOICE_AUTH_EXPIRED",
+        kind: "auth",
+        retryable: true,
+      },
     });
 
     expect(ingestion.cause).toBe("ingestion_pending");
@@ -227,9 +236,10 @@ describe("projectRuntimeCopy", () => {
     expect(auth.primaryActionIntent).toBe("refresh_session");
   });
 
-  test("treats post-ready server rejections as unavailable instead of provider copy", () => {
+  test("treats a typed protocol rejection as unavailable instead of provider copy", () => {
     const copy = projectRuntimeCopy({
-      errors: ["study set access denied"],
+      diagnostics: [{ code: "VOICE_CLIENT_AUTHORITY_FORBIDDEN", path: "$.error" }],
+      lastServerError: { code: "VOICE_CLIENT_AUTHORITY_FORBIDDEN", retryable: false },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "error",
@@ -238,22 +248,21 @@ describe("projectRuntimeCopy", () => {
     expect(copy.cause).toBe("agent_offline");
     expect(copy.capsuleLabel).toBe("Agent unavailable");
     expect(copy.marginaliaTitle).toBe("Agent unavailable: session rejected.");
-    expect(copy.marginaliaText).toContain("study set access denied");
     expect(copy.marginaliaText).not.toContain("Synthetic examiner");
   });
 
-  test("sanitizes raw-looking provider diagnostics before rendering unavailable copy", () => {
+  test("a protocol diagnostic never becomes auth copy, whatever words the frame carried", () => {
     const copy = projectRuntimeCopy({
-      errors: ["provider prompt transcript with bearer viva1.secret-token and raw answer text"],
+      diagnostics: [{ code: "VOICE_PROTOCOL_MALFORMED_JSON", path: "$" }],
       readiness: trustedReadiness,
       ready: ready("cartesia_gemini", { live_runtime: true }),
       status: "error",
     });
 
-    expect(copy.cause).toBe("auth_failed");
-    expect(copy.marginaliaText).not.toContain("viva1.secret-token");
-    expect(copy.marginaliaText).not.toContain("raw answer text");
-    expect(copy.marginaliaText).not.toContain("prompt transcript");
+    expect(copy.cause).toBe("agent_offline");
+    expect(copy.capsuleLabel).not.toBe("Auth failed");
+    expect(copy.primaryActionIntent).not.toBe("refresh_session");
+    expect(JSON.stringify(copy)).not.toContain("viva1");
   });
 
   test("uses readiness facts before provider names for generic live runtimes", () => {
@@ -536,7 +545,6 @@ describe("projectRuntimeCopy", () => {
     const copy = projectRuntimeCopy({
       close: {
         code: 1006,
-        reason: "proxy closed before terminal phase",
         wasClean: false,
       },
       readiness: trustedReadiness,
@@ -548,7 +556,8 @@ describe("projectRuntimeCopy", () => {
     expect(copy.capsuleLabel).toBe("Session interrupted");
     expect(copy.marginaliaTitle).toBe("Session interrupted before the manuscript closed.");
     expect(copy.marginaliaText).toContain("code 1006");
-    expect(copy.marginaliaText).toContain("proxy closed before terminal phase");
+    expect(copy.marginaliaText).not.toContain("proxy closed");
+    expect(copy.marginaliaText).not.toContain("Reason:");
     expect(copy.marginaliaText).not.toContain("Synthetic examiner is listening");
     expect(copy.primaryActionIntent).toBe("retry_agent");
     expect(copy.nextActionLabel).toBe("Retry agent");
@@ -559,7 +568,6 @@ describe("projectRuntimeCopy", () => {
     const copy = projectRuntimeCopy({
       close: {
         code: 1000,
-        reason: "client stop",
         wasClean: true,
       },
       readiness: trustedReadiness,
@@ -571,19 +579,19 @@ describe("projectRuntimeCopy", () => {
     expect(copy.capsuleLabel).toBe("Session not connected");
     expect(copy.marginaliaTitle).not.toContain("interrupted");
     expect(copy.marginaliaText).not.toContain("terminal phase");
-    expect(copy.readinessNotes.some((note) => note.text.includes("client stop"))).toBe(true);
+    expect(copy.readinessNotes.every((note) => !note.text.includes("client stop"))).toBe(true);
   });
 
   test("maps controlled terminal phase reasons to honest closed manuscript copy", () => {
     const sessionCap = projectRuntimeCopy({
-      close: { code: 1008, reason: "session cap", wasClean: true },
+      close: { code: 1008, wasClean: true },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "closed",
       terminalReason: "session_cap",
     });
     const drained = projectRuntimeCopy({
-      close: { code: 1000, reason: "drained", wasClean: true },
+      close: { code: 1000, wasClean: true },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "closed",
@@ -641,7 +649,7 @@ describe("projectRuntimeCopy", () => {
 
     for (const [terminalReason, cause, capsuleLabel, nextActionLabel] of cases) {
       const copy = projectRuntimeCopy({
-        close: { code: 1011, reason: terminalReason, wasClean: true },
+        close: { code: 1011, wasClean: true },
         readiness: trustedReadiness,
         ready: ready("cartesia_gemini", { live_runtime: true }),
         status: "closed",
@@ -674,7 +682,7 @@ describe("projectRuntimeCopy", () => {
       const terminalReason = state.terminal_reason;
 
       const copy = projectRuntimeCopy({
-        close: { code: 1011, reason: terminalReason, wasClean: true },
+        close: { code: 1011, wasClean: true },
         readiness: trustedReadiness,
         ready: ready("cartesia_gemini", { live_runtime: true }),
         status: "closed",
@@ -693,24 +701,75 @@ describe("projectRuntimeCopy", () => {
     }
   });
 
-  test("classifies close-only auth failures before generic interruption recovery", () => {
-    const copy = projectRuntimeCopy({
-      close: {
-        code: 1008,
-        reason: "session auth failed",
-        wasClean: false,
-      },
+  test("classifies auth recovery from the typed termination, never from a close code alone", () => {
+    const untyped = projectRuntimeCopy({
+      close: { code: 1008, wasClean: false },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "closed",
+      termination: { closeCode: 1008, kind: "transport", retryable: true },
+    });
+    const typed = projectRuntimeCopy({
+      close: { code: 1008, wasClean: false },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+      termination: {
+        closeCode: 1008,
+        errorCode: "VOICE_AUTH_EXPIRED",
+        kind: "auth",
+        retryable: true,
+      },
     });
 
-    expect(copy.cause).toBe("auth_failed");
-    expect(copy.capsuleLabel).toBe("Auth failed");
-    expect(copy.nextActionLabel).toBe("Refresh session");
-    expect(copy.primaryActionDisabled).toBe(false);
-    expect(copy.primaryActionIntent).toBe("refresh_session");
-    expect(copy.marginaliaText).not.toContain("terminal phase");
+    expect(untyped.cause).toBe("unexpected_close");
+    expect(untyped.capsuleLabel).not.toBe("Auth failed");
+    expect(typed.cause).toBe("auth_failed");
+    expect(typed.capsuleLabel).toBe("Auth failed");
+    expect(typed.nextActionLabel).toBe("Refresh session");
+    expect(typed.primaryActionDisabled).toBe(false);
+    expect(typed.primaryActionIntent).toBe("refresh_session");
+  });
+
+  test("a nonretryable auth termination never offers the refresh action", () => {
+    for (const errorCode of [
+      "VOICE_AUTH_INVALID",
+      "VOICE_AUTH_IDENTITY_MISMATCH",
+      "VOICE_AUTH_REPLAYED",
+    ] as const) {
+      const copy = projectRuntimeCopy({
+        close: { code: 1008, wasClean: false },
+        readiness: trustedReadiness,
+        ready: ready("synthetic"),
+        status: "closed",
+        termination: { closeCode: 1008, errorCode, kind: "auth", retryable: false },
+      });
+
+      expect({ errorCode, intent: copy.primaryActionIntent }).toEqual({
+        errorCode,
+        intent: "retry_agent",
+      });
+      expect(copy.cause).toBe("auth_failed");
+    }
+  });
+
+  test("a protocol termination is never retried and never claims auth", () => {
+    const copy = projectRuntimeCopy({
+      close: { code: 1008, wasClean: false },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "closed",
+      termination: {
+        closeCode: 1008,
+        errorCode: "VOICE_CLIENT_FRAME_TOO_LARGE",
+        kind: "protocol",
+        retryable: false,
+      },
+    });
+
+    expect(copy.cause).toBe("agent_offline");
+    expect(copy.capsuleLabel).not.toBe("Auth failed");
+    expect(copy.primaryActionIntent).toBe("retry_agent");
   });
 
   test("distinguishes API missing and agent offline before flattening unavailable states", () => {
@@ -906,7 +965,7 @@ describe("projectTurnTakingState", () => {
       const terminalReason = state.terminal_reason;
 
       const runtime = projectRuntimeCopy({
-        close: { code: 1011, reason: terminalReason, wasClean: true },
+        close: { code: 1011, wasClean: true },
         readiness: trustedReadiness,
         ready: ready("cartesia_gemini", { live_runtime: true }),
         status: "closed",
@@ -1061,7 +1120,7 @@ describe("projectSessionQuestion", () => {
     // and NO terminal reason and NO recap (e.g. ending during warm-up). That is a
     // deliberate end, not an interruption — the close cleanliness is the signal.
     const ended = projectSessionQuestion(
-      derived({ phase: "ready", close: { code: 1000, reason: "client_stop", wasClean: true } }),
+      derived({ phase: "ready", close: { code: 1000, wasClean: true } }),
       "closed",
       NOW,
     );
@@ -1476,3 +1535,198 @@ describe("projectConceptNodes", () => {
     expect(projectConceptNodes([], {})).toEqual([]);
   });
 });
+
+/**
+ * `WEBSESSION-PROTOCOL-01` Step 5: one total switch over the typed voice outcome.
+ * Every branch returns safe copy derived from a CODE, never from a message, a
+ * close-reason string, or a socket status guess.
+ */
+describe("projectVoiceOutcomeCopy", () => {
+  test("returns null when nothing typed has happened yet", () => {
+    expect(projectVoiceOutcomeCopy({})).toBeNull();
+    expect(projectVoiceOutcomeCopy({ diagnostics: [], structuredErrors: [] })).toBeNull();
+  });
+
+  test("covers every VivaVoiceTermination kind with safe copy", () => {
+    const terminations: VivaVoiceTermination[] = [
+      { closeCode: 1011, kind: "terminal", retryable: false, terminalReason: "provider_timeout" },
+      { closeCode: 1008, errorCode: "VOICE_AUTH_EXPIRED", kind: "auth", retryable: true },
+      {
+        closeCode: 1008,
+        errorCode: "VOICE_CLIENT_TURN_TOO_LARGE",
+        kind: "protocol",
+        retryable: false,
+      },
+      {
+        closeCode: 1011,
+        errorCode: "VOICE_INTERNAL_SERIALIZATION",
+        kind: "service",
+        retryable: true,
+      },
+      { closeCode: 1000, kind: "normal", retryable: false },
+      { closeCode: 1006, kind: "transport", retryable: true },
+    ];
+
+    for (const termination of terminations) {
+      const copy = projectVoiceOutcomeCopy({ termination });
+      expect({ copy: copy !== null, kind: termination.kind }).toEqual({
+        copy: true,
+        kind: termination.kind,
+      });
+      if (!copy) throw new Error("Expected copy");
+      expect(copy.capsuleLabel.length).toBeGreaterThan(0);
+      expect(copy.statusLabel.length).toBeGreaterThan(0);
+      expect(copy.action.nextActionLabel.length).toBeGreaterThan(0);
+      expect(copy.scope).toBe("session");
+      expect(/payload|prompt|transcript|pcm16|secret|viva1\./i.test(JSON.stringify(copy))).toBe(
+        false,
+      );
+    }
+  });
+
+  test("a complete recap is success copy, never a disconnect", () => {
+    const copy = projectVoiceOutcomeCopy({
+      recap: { kind: "complete", recap: recapPayload() },
+      termination: { closeCode: 1000, kind: "normal", retryable: false },
+    });
+
+    if (!copy) throw new Error("Expected copy");
+    expect(copy.cause).toBe("recap_success");
+    expect(copy.capsuleLabel).toBe("Session complete");
+    expect(copy.marginaliaTitle).toBe("Session recap ready.");
+    expect(copy.action.intent).toBe("start_session");
+    expect(copy.marginaliaText).not.toContain("closed");
+    expect(copy.marginaliaText).not.toContain("interrupted");
+  });
+
+  test("a partial recap names only approved terminal-reason copy", () => {
+    const copy = projectVoiceOutcomeCopy({
+      recap: { kind: "partial", partialReason: "turn_cap", recap: recapPayload() },
+    });
+
+    if (!copy) throw new Error("Expected copy");
+    expect(copy.cause).toBe("turn_cap");
+    expect(copy.marginaliaText).toContain("recap");
+    expect(copy.marginaliaText).not.toContain("provider said");
+  });
+
+  test("a recoverable structured error is visible but never replaces the live capsule", () => {
+    const copy = projectVoiceOutcomeCopy({ structuredErrors: [{ terminality: "recoverable" }] });
+    expect(copy).toBeNull();
+  });
+
+  test("a terminal structured error uses its terminal reason's contract copy", () => {
+    const copy = projectVoiceOutcomeCopy({
+      structuredErrors: [{ terminalReason: "provider_malformed_stream", terminality: "terminal" }],
+    });
+
+    if (!copy) throw new Error("Expected copy");
+    expect(copy.cause).toBe("provider_malformed_stream");
+    expect(copy.capsuleLabel.length).toBeGreaterThan(0);
+  });
+
+  test("a retryable deferred turn projects one neutral retry action bound to the question", () => {
+    const copy = projectVoiceOutcomeCopy({
+      deferredTurn: {
+        canRetrySameQuestion: true,
+        questionId: "q-fixture-1",
+        reason: "transcript_uncertain",
+        responseId: "response-1",
+        turnId: "turn-1",
+      },
+    });
+
+    if (!copy) throw new Error("Expected copy");
+    expect(copy.action.nextActionLabel).toBe("Retry this question");
+    expect(copy.action.disabled).toBe(false);
+    expect(copy.retryQuestionId).toBe("q-fixture-1");
+    // A deferral is a TURN-scoped affordance, not a session capsule: it must not
+    // be able to masquerade as one of the contract's session runtime causes.
+    expect(copy.cause).toBe("turn_deferred");
+    expect(copy.scope).toBe("turn");
+  });
+
+  test("a nonretryable deferred turn offers no retry-current action", () => {
+    for (const reason of [
+      "empty_answer",
+      "transcript_uncertain",
+      "evaluator_unavailable",
+      "invalid_evaluator_output",
+      "insufficient_semantic_evidence",
+      "contradictory_evidence",
+    ] as const) {
+      const copy = projectVoiceOutcomeCopy({
+        deferredTurn: {
+          canRetrySameQuestion: false,
+          questionId: "q-fixture-1",
+          reason,
+          responseId: "response-1",
+          turnId: "turn-1",
+        },
+      });
+
+      if (!copy) throw new Error("Expected copy");
+      expect({ label: copy.action.nextActionLabel, reason }).not.toEqual({
+        label: "Retry this question",
+        reason,
+      });
+      expect(copy.retryQuestionId).toBeUndefined();
+      expect(copy.scope).toBe("turn");
+      // Retryability is NEVER inferred from the reason string.
+      expect(JSON.stringify(copy)).not.toContain(reason);
+    }
+  });
+
+  test("a protocol diagnostic projects a protocol failure, never an auth failure", () => {
+    for (const code of [
+      "VOICE_PROTOCOL_MALFORMED_JSON",
+      "VOICE_PROTOCOL_UNKNOWN_FRAME",
+      "VOICE_PROTOCOL_INVARIANT",
+      "WEB_VOICE_INTERNAL",
+    ] as const) {
+      const copy = projectVoiceOutcomeCopy({ diagnostics: [{ code, path: "$" }] });
+      if (!copy) throw new Error("Expected copy");
+      expect({ code, intent: copy.action.intent }).toEqual({ code, intent: "retry_agent" });
+      expect(copy.capsuleLabel).not.toBe("Auth failed");
+      expect(JSON.stringify(copy)).not.toContain("$");
+    }
+  });
+
+  test("terminal and recap copy outrank a transport termination", () => {
+    const recapWins = projectVoiceOutcomeCopy({
+      recap: { kind: "complete", recap: recapPayload() },
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+    const terminalWins = projectVoiceOutcomeCopy({
+      termination: {
+        closeCode: 1006,
+        kind: "terminal",
+        retryable: false,
+        terminalReason: "session_cap",
+      },
+    });
+
+    expect(recapWins?.cause).toBe("recap_success");
+    expect(terminalWins?.cause).toBe("session_cap");
+  });
+});
+
+function recapPayload(): AgentStudySessionRecap {
+  return {
+    concepts: [{ concept_id: "concept-fixture-1", label: "Fixture concept", status: "strong" }],
+    deferred_turns: 0,
+    headline: "Fixture headline.",
+    next_action: "Fixture next action.",
+    review_schedule: [
+      {
+        authority: "server_persisted_fsrs",
+        concept_id: "concept-fixture-1",
+        due_at: "2026-09-01T00:00:00Z",
+      },
+    ],
+    schema: "viva.study_session_recap.v2",
+    source_moments: [],
+    summary: "Fixture summary.",
+    voice_session_id: "voice-session-fixture",
+  };
+}

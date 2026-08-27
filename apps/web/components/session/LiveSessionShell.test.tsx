@@ -956,7 +956,7 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
     const runtimeCopy = projectRuntimeCopy({
-      close: { code: 1008, reason: "session cap", wasClean: true },
+      close: { code: 1008, wasClean: true },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "closed",
@@ -1206,13 +1206,11 @@ describe("LiveSessionShell scene intent wiring", () => {
       projectRuntimeCopy({
         readiness: trustedReadiness,
         status: "closed",
-        errors: ["WebSocket error"],
       }),
     );
 
     expect(markup).toContain("Agent offline");
     expect(markup).toContain("Agent unavailable: service offline.");
-    expect(markup).toContain("WebSocket error");
     expect(markup).toContain("Retry agent");
   });
 

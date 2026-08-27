@@ -183,7 +183,12 @@ describe("useVivaAgentSession adapter", () => {
     expect(derived.currentSource?.sourceId).toBe("src-lecture-5-slide-18");
     expect(derived.currentConceptStatus).toBe("strong");
     expect(derived.recap?.sourceMoments[0]?.source.documentId).toBe("lec-5");
-    expect(derived.canSubmitAnswer).toBe(true);
+    expect(derived.recapState?.kind).toBe("complete");
+    // `WEBSESSION-RECAP-01`: the session already produced its recap, so it is
+    // terminal-success and no further answer can be submitted into it. The old
+    // `true` here was the defect — an open socket alone was treated as an open
+    // turn even after the last word of the session had been said.
+    expect(derived.canSubmitAnswer).toBe(false);
   });
 
   test("renders the v2 recap as emitted and fabricates no study plan", () => {

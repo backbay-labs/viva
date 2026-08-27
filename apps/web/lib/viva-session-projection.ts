@@ -8,6 +8,8 @@ import {
   type SourceReference,
   VIVA_LEARNER_LOOP_CONTRACT,
   type VivaReadyFrame,
+  type VivaServerError,
+  type VivaVoiceTermination,
 } from "@viva/core";
 import type {
   ChecklistItem,
@@ -20,8 +22,12 @@ import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import type {
   VivaAgentCloseDiagnostics,
   VivaAgentConnectionStatus,
+  VivaAgentDeferredTurn,
+  VivaAgentDiagnostic,
   VivaAgentReadinessProbe,
   VivaAgentReadyEndpoint,
+  VivaAgentRecapState,
+  VivaAgentStructuredError,
 } from "./viva-agent-client";
 
 /**
@@ -196,27 +202,31 @@ export function projectRuntimeCopy({
   readiness,
   ready,
   status,
-  errors = [],
+  deferredTurn,
+  diagnostics = [],
+  lastServerError,
   mic = "unknown",
   close,
   readinessProbe,
+  recap,
+  structuredErrors = [],
+  termination,
   terminalReason,
 }: {
   readiness: AgentStudySetReadiness;
   ready?: VivaReadyFrame;
   readinessProbe?: VivaAgentReadinessProbe;
   status: VivaAgentConnectionStatus;
-  errors?: string[];
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
   mic?: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  recap?: VivaAgentRecapState;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  termination?: VivaVoiceTermination;
   terminalReason?: AgentTerminalSessionReason;
 }): RuntimeCopy {
-  const rawNewestError = errors.at(-1) ?? "";
-  const rawCloseReason = close?.reason ?? "";
-  const newestError = sanitizeRuntimeDiagnostic(rawNewestError);
-  const closeReason = sanitizeRuntimeDiagnostic(rawCloseReason);
-  const diagnosticText = `${rawNewestError} ${rawCloseReason}`;
-  const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(diagnosticText);
   const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
   const readinessFacts = ready ?? endpointReady;
   const context: RuntimeProjectionContext = {
@@ -234,18 +244,28 @@ export function projectRuntimeCopy({
     return controlledTerminalCopy(terminalReason, context);
   }
 
-  if (authFailed) {
+  // The ONE typed outcome switch. Auth, protocol, service, and transport copy is
+  // derived from Plan 05's codes — never from a regex over diagnostic text, and
+  // never from a close-reason string (there is no longer one to read).
+  const outcome = projectVoiceOutcomeCopy({
+    deferredTurn,
+    diagnostics,
+    lastServerError,
+    recap,
+    structuredErrors,
+    termination,
+  });
+  if (outcome && outcome.scope === "session" && outcome.cause !== "turn_deferred") {
     return runtimeCopy(
       {
-        capsuleLabel: "Auth failed",
-        marginaliaTitle: "Agent unavailable: auth failed.",
-        marginaliaText:
-          "The Conductor auth failed for this session identity; refresh the signed session before the manuscript opens another question.",
-        statusLabel: "Auth failed",
-        cause: "auth_failed",
+        capsuleLabel: outcome.capsuleLabel,
+        cause: outcome.cause,
+        marginaliaText: outcome.marginaliaText,
+        marginaliaTitle: outcome.marginaliaTitle,
+        statusLabel: outcome.statusLabel,
       },
       context,
-      { disabled: false, intent: "refresh_session", nextActionLabel: "Refresh session" },
+      outcome.action,
     );
   }
 
@@ -308,8 +328,7 @@ export function projectRuntimeCopy({
           : "Agent unavailable: service offline.",
         marginaliaText: connecting
           ? "The manuscript has not received provider readiness from the Conductor yet."
-          : newestError ||
-            "The `/ws` stream closed before provider readiness reached the manuscript.",
+          : "The `/ws` stream closed before provider readiness reached the manuscript.",
         statusLabel: connecting ? "connecting" : "agent offline",
         cause: "agent_offline",
       },
@@ -318,27 +337,12 @@ export function projectRuntimeCopy({
     );
   }
 
-  if (newestError && (status === "error" || status === "closed")) {
-    return runtimeCopy(
-      {
-        capsuleLabel: "Agent unavailable",
-        marginaliaTitle: "Agent unavailable: session rejected.",
-        marginaliaText: newestError,
-        statusLabel: "session rejected",
-        cause: "agent_offline",
-      },
-      context,
-      retryAgentAction(),
-    );
-  }
-
   if (status === "closed" && close && !context.websocketReady && isUnexpectedClose(close)) {
-    const reason = closeReason ? ` Reason: ${closeReason}.` : "";
     return runtimeCopy(
       {
         capsuleLabel: "Session interrupted",
         marginaliaTitle: "Session interrupted before the manuscript closed.",
-        marginaliaText: `The WebSocket closed with code ${close.code} before the Conductor sent a terminal phase.${reason} Retry the agent or share the close details with a developer.`,
+        marginaliaText: `The WebSocket closed with code ${close.code} before the Conductor sent a terminal phase. Retry the agent or share the close code with a developer.`,
         statusLabel: "unexpected close",
         cause: "unexpected_close",
       },
@@ -496,6 +500,260 @@ export function projectRuntimeCopy({
   );
 }
 
+/**
+ * `WEBSESSION-PROTOCOL-01` / `WEBSESSION-RECAP-01` / `WEBSESSION-DEFERRED-01`:
+ * the ONE total switch from Plan 05's typed voice outcome onto safe learner copy.
+ *
+ * Every branch derives its words from a CODE — a `VivaVoiceTermination.kind`, a
+ * diagnostic code, a typed server-error code, a recap discriminant, or a
+ * deferral's own boolean. Nothing here reads a message, a close-reason string, a
+ * socket status, or a provider name, so no peer-authored text can steer copy.
+ *
+ * `scope` separates a SESSION capsule (which replaces the live runtime capsule)
+ * from a TURN affordance (which sits beside it): a deferred turn is not a
+ * session outcome, and `turn_deferred` is deliberately a local literal rather
+ * than a fabricated `RuntimeCopyCause`.
+ */
+export type VoiceOutcomeCopy = Readonly<{
+  scope: "session" | "turn";
+  capsuleLabel: string;
+  marginaliaTitle: string;
+  marginaliaText: string;
+  statusLabel: string;
+  cause: RuntimeCopyCause | "turn_deferred";
+  action: Readonly<{
+    disabled: boolean;
+    intent: RuntimePrimaryActionIntent;
+    nextActionLabel: string;
+    primaryActionLabel?: string;
+  }>;
+  retryQuestionId?: string;
+}>;
+
+export function projectVoiceOutcomeCopy(input: {
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  recap?: VivaAgentRecapState;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  termination?: VivaVoiceTermination;
+}): VoiceOutcomeCopy | null {
+  // 1. A recap is the session's own last word and outranks every transport fact.
+  if (input.recap?.kind === "complete") return completedSessionOutcome();
+  if (input.recap?.kind === "partial") return partialRecapOutcome(input.recap.partialReason);
+
+  // 2. A terminal structured error states its reason; a recoverable one is
+  //    deliberately NOT a session outcome and never replaces the live capsule.
+  const terminalStructured = (input.structuredErrors ?? [])
+    .filter((entry) => entry.terminality === "terminal")
+    .at(-1);
+  if (terminalStructured?.terminality === "terminal") {
+    return terminalOutcome(terminalStructured.terminalReason);
+  }
+
+  if (input.termination) return terminationOutcome(input.termination);
+  if (input.lastServerError) return serverErrorOutcome(input.lastServerError);
+
+  // 3. A deferral is a turn affordance. Retryability comes from the server's
+  //    boolean; the reason string is never read to decide it and never shown.
+  if (input.deferredTurn) return deferredTurnOutcome(input.deferredTurn);
+
+  const diagnostic = (input.diagnostics ?? []).at(-1);
+  if (diagnostic) return rejectedFrameOutcome();
+  return null;
+}
+
+function terminationOutcome(termination: VivaVoiceTermination): VoiceOutcomeCopy {
+  switch (termination.kind) {
+    case "terminal":
+      return terminalOutcome(termination.terminalReason);
+    case "auth":
+      return authOutcome(termination.retryable);
+    case "protocol":
+    case "service":
+      return rejectedFrameOutcome();
+    case "normal":
+      return cleanCloseOutcome();
+    case "transport":
+      return interruptedOutcome();
+    default: {
+      // Adding a `VivaVoiceTermination.kind` without adding copy for it is a
+      // compile error, not a silent fall-through to generic wording.
+      const exhaustive: never = termination;
+      return exhaustive;
+    }
+  }
+}
+
+function serverErrorOutcome(error: Pick<VivaServerError, "code" | "retryable">): VoiceOutcomeCopy {
+  if (error.code === "VOICE_AUTH_EXPIRED") return authOutcome(true);
+  if (
+    error.code === "VOICE_AUTH_INVALID" ||
+    error.code === "VOICE_AUTH_IDENTITY_MISMATCH" ||
+    error.code === "VOICE_AUTH_REPLAYED"
+  ) {
+    return authOutcome(false);
+  }
+  return rejectedFrameOutcome();
+}
+
+function completedSessionOutcome(): VoiceOutcomeCopy {
+  const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+    (candidate) => candidate.id === "session_completed",
+  );
+  if (!state) {
+    return {
+      action: {
+        disabled: false,
+        intent: "start_session",
+        nextActionLabel: "Start a new session",
+      },
+      capsuleLabel: "Session complete",
+      cause: "recap_success",
+      marginaliaText: "Viva saved the recap for this session.",
+      marginaliaTitle: "Session recap ready.",
+      scope: "session",
+      statusLabel: "session complete",
+    };
+  }
+  return {
+    action: {
+      disabled: state.copy.primary_action_intent === "disabled",
+      intent: state.copy.primary_action_intent,
+      nextActionLabel: state.copy.next_action_label,
+      primaryActionLabel: state.copy.primary_action_label,
+    },
+    capsuleLabel: state.copy.capsule_label,
+    cause: state.runtime_copy_causes[0] ?? "recap_success",
+    marginaliaText: state.copy.marginalia_text,
+    marginaliaTitle: state.copy.marginalia_title,
+    scope: "session",
+    statusLabel: state.copy.status_label,
+  };
+}
+
+/**
+ * A partial recap ends the session for the reason the server named AND leaves a
+ * usable artifact behind. The terminal reason's approved contract copy is used
+ * verbatim; the one added sentence is this lane's own fixed text, never anything
+ * the server wrote.
+ */
+function partialRecapOutcome(reason: AgentTerminalSessionReason): VoiceOutcomeCopy {
+  const terminal = terminalOutcome(reason);
+  return {
+    ...terminal,
+    marginaliaText: `${terminal.marginaliaText} The session ended with a usable partial recap you can still review.`,
+  };
+}
+
+function terminalOutcome(reason: AgentTerminalSessionReason): VoiceOutcomeCopy {
+  const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+    (candidate) => candidate.terminal_reason === reason,
+  );
+  if (!state) {
+    return {
+      action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+      capsuleLabel: "Session closed",
+      cause: reason as RuntimeCopyCause,
+      marginaliaText: "The Conductor emitted a terminal phase for this manuscript.",
+      marginaliaTitle: "The session closed.",
+      scope: "session",
+      statusLabel: reason.replaceAll("_", " "),
+    };
+  }
+  return {
+    action: {
+      disabled: state.copy.primary_action_intent === "disabled",
+      intent: state.copy.primary_action_intent,
+      nextActionLabel: state.copy.next_action_label,
+      primaryActionLabel: state.copy.primary_action_label,
+    },
+    capsuleLabel: state.copy.capsule_label,
+    cause: state.runtime_copy_causes[0] ?? (reason as RuntimeCopyCause),
+    marginaliaText: state.copy.marginalia_text,
+    marginaliaTitle: state.copy.marginalia_title,
+    scope: "session",
+    statusLabel: state.copy.status_label,
+  };
+}
+
+/**
+ * Only `VOICE_AUTH_EXPIRED` is renewable, so only it offers the renewal action.
+ * Invalid, identity-mismatched, and replayed credentials are not refreshable and
+ * must never present a button that pretends they are.
+ */
+function authOutcome(renewable: boolean): VoiceOutcomeCopy {
+  return {
+    action: renewable
+      ? { disabled: false, intent: "refresh_session", nextActionLabel: "Refresh session" }
+      : { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Auth failed",
+    cause: "auth_failed",
+    marginaliaText: renewable
+      ? "The signed session auth failed for this identity; renew it before the manuscript opens another question."
+      : "The signed session auth failed for this identity and cannot be renewed; start the session again.",
+    marginaliaTitle: "Agent unavailable: auth failed.",
+    scope: "session",
+    statusLabel: "Auth failed",
+  };
+}
+
+function rejectedFrameOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Agent unavailable",
+    cause: "agent_offline",
+    marginaliaText:
+      "The Conductor and the manuscript disagreed about a frame on this session, so the manuscript stopped rather than render an unverified turn.",
+    marginaliaTitle: "Agent unavailable: session rejected.",
+    scope: "session",
+    statusLabel: "session rejected",
+  };
+}
+
+function cleanCloseOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Session closed",
+    cause: "session_disconnected",
+    marginaliaText:
+      "The Conductor closed this session cleanly without a recap; reconnect to open a new one.",
+    marginaliaTitle: "The session closed.",
+    scope: "session",
+    statusLabel: "session closed",
+  };
+}
+
+function interruptedOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Session interrupted",
+    cause: "unexpected_close",
+    marginaliaText:
+      "The connection dropped before the Conductor sent a terminal phase. Retry the agent; nothing was graded from the interrupted turn.",
+    marginaliaTitle: "Session interrupted before the manuscript closed.",
+    scope: "session",
+    statusLabel: "unexpected close",
+  };
+}
+
+function deferredTurnOutcome(deferred: VivaAgentDeferredTurn): VoiceOutcomeCopy {
+  return {
+    action: deferred.canRetrySameQuestion
+      ? { disabled: false, intent: "submit_turn", nextActionLabel: "Retry this question" }
+      : { disabled: true, intent: "disabled", nextActionLabel: "Wait for the next question" },
+    capsuleLabel: "Turn not graded",
+    cause: "turn_deferred",
+    marginaliaText: deferred.canRetrySameQuestion
+      ? "Viva could not grade that turn, so nothing was recorded against this concept. Answer the same question again when you are ready."
+      : "Viva could not grade that turn, so nothing was recorded against this concept. The Conductor will move on.",
+    marginaliaTitle: "That turn was not graded.",
+    retryQuestionId: deferred.canRetrySameQuestion ? deferred.questionId : undefined,
+    scope: "turn",
+    statusLabel: "turn not graded",
+  };
+}
+
 function controlledTerminalCopy(
   reason: AgentTerminalSessionReason,
   context: RuntimeProjectionContext,
@@ -561,17 +819,6 @@ function runtimeCopy(
     primaryActionLabel: action.primaryActionLabel ?? action.nextActionLabel,
     readinessNotes: runtimeReadinessNotes(context, copy.cause),
   };
-}
-
-function sanitizeRuntimeDiagnostic(value: string): string {
-  if (
-    /pcm16_base64|answer_text|transcript|prompt|source_context|pasted_text|session_token|viva1\.|bearer|cartesia_api_key|gemini_api_key|secret|raw answer|source excerpt/i.test(
-      value,
-    )
-  ) {
-    return "sanitized provider error";
-  }
-  return value;
 }
 
 function isUnexpectedClose(close: VivaAgentCloseDiagnostics): boolean {
@@ -669,10 +916,12 @@ function runtimeReadinessNotes(
   }
 
   if (context.close) {
+    // Code and cleanliness only. The peer's close-reason string is not part of
+    // `VivaAgentCloseDiagnostics` any more, so there is nothing here to leak.
     notes.push({
       label: "Close",
       state: context.close.wasClean ? "blocked" : "unavailable",
-      text: `code ${context.close.code}; ${context.close.wasClean ? "clean" : "unclean"}${context.close.reason ? `; ${context.close.reason}` : ""}.`,
+      text: `code ${context.close.code}; ${context.close.wasClean ? "clean" : "unclean"}.`,
     });
   }
 

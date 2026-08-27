@@ -17,6 +17,7 @@ import type {
   SessionQuestion,
   SessionRecap,
   SourceReference,
+  VivaVoiceTermination,
 } from "@viva/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -26,9 +27,13 @@ import {
   type VivaAgentClientOptions,
   type VivaAgentCloseDiagnostics,
   type VivaAgentConceptStatusEvent,
+  type VivaAgentDeferredTurn,
+  type VivaAgentDiagnostic,
   type VivaAgentGenerationReason,
+  type VivaAgentRecapState,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
+  type VivaAgentStructuredError,
   type VivaAudioChunkInput,
   type VivaAudioSendResult,
 } from "./viva-agent-client";
@@ -436,7 +441,17 @@ export type VivaAgentDerivedState = {
   sources: SourceReference[];
   manuscriptIntents: ManuscriptIntent[];
   recap?: SessionRecap;
-  errors: string[];
+  /**
+   * `WEBSESSION-PROTOCOL-01`: the typed protocol surface, forwarded unchanged.
+   * There is deliberately no `errors: string[]` here — a free-form array is
+   * exactly the member arbitrary provider payload used to travel through.
+   */
+  recapState?: VivaAgentRecapState;
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics: VivaAgentDiagnostic[];
+  structuredErrors: VivaAgentStructuredError[];
+  lastServerError?: VivaAgentSessionState["lastServerError"];
+  termination?: VivaVoiceTermination;
   canSubmitAnswer: boolean;
 };
 
@@ -547,9 +562,16 @@ export function studyProjectionToAgentSessionConfig(
 export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentDerivedState {
   const question = state.question ? agentQuestionToSessionQuestion(state.question) : undefined;
   return {
-    canSubmitAnswer: state.status === "open" && !state.pendingSubmission,
+    // A recap or a terminal reason closes submission for good: after either, the
+    // wire turn an answer would belong to no longer exists.
+    canSubmitAnswer:
+      state.status === "open" &&
+      !state.pendingSubmission &&
+      !state.recap &&
+      state.terminalReason === undefined,
     close: state.close,
-    errors: state.errors,
+    deferredTurn: state.deferredTurn,
+    diagnostics: state.diagnostics,
     evaluation: state.evaluation
       ? agentAnswerEvaluationToUiEvaluation(state.evaluation)
       : undefined,
@@ -558,14 +580,18 @@ export function deriveVivaAgentUiState(state: VivaAgentSessionState): VivaAgentD
     conceptStatuses: state.conceptStatuses,
     finalTranscript: state.finalTranscript,
     generationId: state.generation?.id,
+    lastServerError: state.lastServerError,
     transcriptConfidence: state.transcriptConfidence,
     manuscriptIntents: state.manuscriptIntents.map((event) => event.intent),
     phase: state.question && state.phase === "ready" ? "listening" : state.phase,
     question,
     recap: state.recap
-      ? agentRecapToSessionRecap(state.recap, state.sources, state.conceptStatusEvents)
+      ? agentRecapToSessionRecap(state.recap.recap, state.sources, state.conceptStatusEvents)
       : undefined,
+    recapState: state.recap,
     sources: state.sources.map(agentSourceToUiSource),
+    structuredErrors: state.structuredErrors,
+    termination: state.termination,
     terminalReason: state.terminalReason,
     transcript: state.finalTranscript ?? state.transcript,
   };

@@ -14,22 +14,32 @@ import {
   type AuthenticatedStudyProjectionV1,
   audioChunkClientFrame,
   audioEndClientFrame,
+  classifyVivaVoiceTermination,
   type ManuscriptIntent,
   type PasteIngestionResponse,
-  parseVivaServerFrame,
+  parseVivaServerFrameJson,
   type StudySet,
   sessionConfigFrame,
   studySetFromPasteIngestionResponse,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+  VIVA_VOICE_NORMAL_CLOSE_CODE,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaCancelClientFrame,
   type VivaClientFrame,
+  type VivaClientTurnIntent,
   type VivaReadyFrame,
+  type VivaServerError,
   type VivaServerEvent,
   type VivaServerFrame,
   type VivaStopClientFrame,
+  type VivaTurnIntentClientFrame,
+  type VivaVoiceDeferralReason,
+  type VivaVoiceDiagnosticCode,
+  VivaVoiceProtocolError,
+  type VivaVoiceServerErrorCode,
+  type VivaVoiceTermination,
   validateAuthenticatedStudyProjectionV1,
 } from "@viva/core";
 import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
@@ -113,9 +123,15 @@ export type VivaAgentReadinessProbe =
 
 export type VivaAgentConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
+/**
+ * `WEBSESSION-PROTOCOL-01`: a close carries a CODE and a cleanliness flag and
+ * nothing else. The peer-authored `reason` string is deliberately absent from
+ * this type: under Plan 05's typed-termination contract it is never parsed for
+ * classification and never displayed, so retaining it at all would only create a
+ * path for provider text to reach a learner surface.
+ */
 export type VivaAgentCloseDiagnostics = {
   code: number;
-  reason: string;
   wasClean: boolean;
 };
 
@@ -210,6 +226,71 @@ export type VivaAgentConceptStatusEvent = {
   status: AgentConceptStatus;
 };
 
+/**
+ * `WEBSESSION-PROTOCOL-01`: the ONLY shape a rejected frame may leave behind — a
+ * closed-vocabulary code and the JSON path it was raised at. Never an excerpt,
+ * never a parser message, never `String(error)`. `WEB_VOICE_INTERNAL` is the one
+ * fixed browser-local code; a local exception is mapped to it without reading
+ * the exception at all.
+ */
+export type VivaAgentDiagnostic = Readonly<{
+  code: VivaVoiceDiagnosticCode | VivaVoiceServerErrorCode | "WEB_VOICE_INTERNAL";
+  path: string | null;
+}>;
+
+/**
+ * `WEBSESSION-RECAP-01`: a structured error's terminality is the server's typed
+ * discriminant, kept as a discriminant. Its free-form `source`, `code`, and
+ * `message` are dropped at the boundary — terminality is never inferred from
+ * them, from socket status, or from a message regex.
+ */
+export type VivaAgentStructuredError =
+  | Readonly<{ terminality: "recoverable" }>
+  | Readonly<{
+      terminality: "terminal";
+      terminalReason: AgentTerminalSessionReason;
+    }>;
+
+/**
+ * `WEBSESSION-RECAP-01`: the v2 recap arrives ONCE, and whether it is complete
+ * or partial is a discriminant, not an optional flag a consumer may forget.
+ */
+export type VivaAgentRecapState =
+  | { kind: "complete"; recap: AgentStudySessionRecap }
+  | {
+      kind: "partial";
+      recap: AgentStudySessionRecap;
+      partialReason: AgentTerminalSessionReason;
+    };
+
+/**
+ * `WEBSESSION-DEFERRED-01`: a within-session recovery fact. It is never a
+ * terminal, never a grade, and never a mastery or schedule change, and
+ * `canRetrySameQuestion` is the server's authoritative affordance — retryability
+ * is never derived from `reason`.
+ */
+export type VivaAgentDeferredTurn = Readonly<{
+  turnId: string;
+  responseId: string;
+  questionId: string;
+  reason: VivaVoiceDeferralReason;
+  canRetrySameQuestion: boolean;
+}>;
+
+/**
+ * The complete typed protocol surface of `VivaAgentSessionState`. It replaces
+ * the former free-form `errors: string[]` and bare `recap`: there is deliberately
+ * no member that can carry arbitrary payload text.
+ */
+export type VivaAgentProtocolStateFields = {
+  diagnostics: VivaAgentDiagnostic[];
+  structuredErrors: VivaAgentStructuredError[];
+  deferredTurn?: VivaAgentDeferredTurn;
+  recap?: VivaAgentRecapState;
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  termination?: VivaVoiceTermination;
+};
+
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
   close?: VivaAgentCloseDiagnostics;
@@ -243,12 +324,10 @@ export type VivaAgentSessionState = {
    */
   conceptStatusEvents: VivaAgentConceptStatusEvent[];
   manuscriptIntents: VivaAgentManuscriptIntent[];
-  recap?: AgentStudySessionRecap;
   audio: VivaAgentAudioOutput[];
   cancelledResponseIds: string[];
-  errors: string[];
   staleEvents: number;
-};
+} & VivaAgentProtocolStateFields;
 
 export type VivaAgentSessionControllerOptions = VivaAgentClientOptions & {
   generationIdFactory?: (input: { reason: VivaAgentGenerationReason; sequence: number }) => string;
@@ -780,8 +859,14 @@ function vivaLibraryAuthHeaders(options: VivaLibrarySnapshotOptions): HeadersIni
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+/**
+ * Plan 05's own JSON entry point, not a local `JSON.parse`: a malformed body is
+ * its typed `VOICE_PROTOCOL_MALFORMED_JSON` at `$`, and an oversized one is
+ * `VOICE_PROTOCOL_FRAME_TOO_LARGE`, rather than a browser `SyntaxError` whose
+ * message would have to be sanitized.
+ */
 export function parseVivaAgentMessage(data: string): VivaServerFrame {
-  return parseVivaServerFrame(JSON.parse(data));
+  return parseVivaServerFrameJson(data);
 }
 
 export function agentProtocolVersion(): number {
@@ -799,7 +884,8 @@ export function initialVivaAgentSessionState(): VivaAgentSessionState {
     manuscriptIntents: [],
     audio: [],
     cancelledResponseIds: [],
-    errors: [],
+    diagnostics: [],
+    structuredErrors: [],
     staleEvents: 0,
   };
 }
@@ -818,12 +904,16 @@ export function vivaAgentReducer(
   if (frame.type === "audio_turn_accepted") {
     return state;
   }
+  // `VOICE-ERROR-001`: only the typed pair survives. The frame's `message` is a
+  // free-form peer string and is discarded here, at the boundary, so no later
+  // consumer can be tempted to read it.
   if (frame.type === "error") {
     return {
       ...state,
       status: "error",
       pendingSubmission: undefined,
-      errors: [...state.errors, sanitizeAgentError(frame.message)],
+      lastServerError: { code: frame.error.code, retryable: frame.error.retryable },
+      diagnostics: [...state.diagnostics, { code: frame.error.code, path: "$.error" }],
     };
   }
 
@@ -850,12 +940,24 @@ export function vivaAgentReducer(
         state.pendingSubmission,
       );
       if (state.recap && event.phase !== "recap") return state;
-      if (event.terminal_reason && event.phase === "recap" && !state.recap) {
+      // A trailing terminal phase that CONTRADICTS an already-recorded terminal
+      // reason is a cross-frame invariant violation. Plan 05's parser is
+      // per-frame and cannot see it, so it is recorded here with Plan 05's own
+      // sanitized invariant code and the recorded reason is kept: a session does
+      // not end twice, for two different reasons.
+      if (
+        event.terminal_reason &&
+        state.terminalReason &&
+        event.terminal_reason !== state.terminalReason
+      ) {
         return {
           ...state,
-          phase: event.phase,
+          diagnostics: [
+            ...state.diagnostics,
+            { code: "VOICE_PROTOCOL_INVARIANT", path: "$.event.terminal_reason" },
+          ],
           pendingSubmission,
-          terminalReason: event.terminal_reason,
+          phase: event.phase,
         };
       }
       return {
@@ -863,6 +965,9 @@ export function vivaAgentReducer(
         phase: event.phase,
         pendingSubmission,
         terminalReason: event.terminal_reason ?? state.terminalReason,
+        termination: event.terminal_reason
+          ? inBandTerminalTermination(event.terminal_reason)
+          : state.termination,
       };
     }
     case "question_started":
@@ -882,6 +987,10 @@ export function vivaAgentReducer(
         currentConceptStatus: undefined,
         manuscriptIntents: [],
         recap: undefined,
+        // A valid question progression is what clears a deferred turn: the
+        // learner is being asked something again, so the previous deferral is
+        // no longer the state to act on.
+        deferredTurn: undefined,
       };
     case "transcript_delta":
       return { ...state, transcript: state.transcript + event.text };
@@ -893,7 +1002,30 @@ export function vivaAgentReducer(
         transcriptConfidence: event.confidence ?? undefined,
       };
     case "answer_evaluated":
-      return { ...state, evaluation: event.evaluation, pendingSubmission: undefined };
+      return {
+        ...state,
+        evaluation: event.evaluation,
+        pendingSubmission: undefined,
+        deferredTurn:
+          state.deferredTurn?.responseId === event.response_id ? undefined : state.deferredTurn,
+      };
+    case "turn_deferred":
+      // `VOICE-TURN-002`: an ungraded, nonterminal turn outcome. It changes NO
+      // learner fact — no evaluation, no concept status, no recap, no schedule —
+      // and it never becomes a terminal reason or a reconnect trigger. The
+      // pending slot is released so the learner can act on the server's own
+      // `can_retry_same_question` affordance.
+      return {
+        ...state,
+        deferredTurn: {
+          canRetrySameQuestion: event.can_retry_same_question,
+          questionId: event.question_id,
+          reason: event.reason,
+          responseId: event.response_id,
+          turnId: event.turn_id,
+        },
+        pendingSubmission: undefined,
+      };
     case "source_reference":
       return { ...state, currentSource: event.source, sources: [...state.sources, event.source] };
     case "concept_status":
@@ -919,7 +1051,25 @@ export function vivaAgentReducer(
         ],
       };
     case "recap_ready":
-      return { ...state, phase: "recap", pendingSubmission: undefined, recap: event.recap };
+      // `VOICE-TERMINAL-001`: `partial` is a discriminant. A partial recap is
+      // terminal the instant it arrives, WITHOUT waiting for a trailing phase
+      // that the transport may never deliver; a complete recap is a success and
+      // is not a terminal reason at all.
+      return event.partial
+        ? {
+            ...state,
+            phase: "recap",
+            pendingSubmission: undefined,
+            recap: { kind: "partial", partialReason: event.partial_reason, recap: event.recap },
+            terminalReason: event.partial_reason,
+            termination: inBandTerminalTermination(event.partial_reason),
+          }
+        : {
+            ...state,
+            phase: "recap",
+            pendingSubmission: undefined,
+            recap: { kind: "complete", recap: event.recap },
+          };
     case "audio_delta":
       return {
         ...state,
@@ -959,16 +1109,46 @@ export function vivaAgentReducer(
         cancelledResponseIds,
       };
     }
-    case "structured_error":
+    case "structured_error": {
+      // `VOICE-TERMINAL-002`: terminality is read off the discriminant and
+      // nothing else. A recoverable one leaves the socket, the phase, and the
+      // pending turn exactly as they were — it names no turn, so it resolves
+      // none. A terminal one closes input immediately.
+      if (event.terminality === "recoverable") {
+        return {
+          ...state,
+          structuredErrors: [...state.structuredErrors, { terminality: "recoverable" }],
+        };
+      }
       return {
         ...state,
-        status: "error",
         pendingSubmission: undefined,
-        errors: [...state.errors, sanitizeAgentError(event.message)],
+        structuredErrors: [
+          ...state.structuredErrors,
+          { terminalReason: event.terminal_reason, terminality: "terminal" },
+        ],
+        terminalReason: event.terminal_reason,
+        termination: inBandTerminalTermination(event.terminal_reason),
       };
+    }
     default:
       return state;
   }
+}
+
+/**
+ * The provisional termination for a terminal fact stated IN BAND, before the
+ * socket has actually closed. The classifier's `closeCode` is informational for
+ * a `terminal` kind (retryability is fixed at `false` by the reason), so the
+ * normal close code stands in until the real close arrives and the controller
+ * reclassifies with the true code. The kind and the reason never change.
+ */
+function inBandTerminalTermination(reason: AgentTerminalSessionReason): VivaVoiceTermination {
+  return classifyVivaVoiceTermination({
+    closeCode: VIVA_VOICE_NORMAL_CLOSE_CODE,
+    terminalReason: reason,
+    wasClean: true,
+  });
 }
 
 function pendingSubmissionForSessionPhase(
@@ -980,22 +1160,22 @@ function pendingSubmissionForSessionPhase(
     : undefined;
 }
 
-function sanitizeAgentError(message: string): string {
-  if (!message) return "agent error";
-  const normalized = message.replace(/\s+/g, " ").trim().toLowerCase();
-  if (legacyAgentAuthReasons.has(normalized)) return "session auth failed";
-  const redacted = redactForVivaLog({ message });
-  if (isRecord(redacted) && isRedactedVivaLogValue(redacted.message)) {
-    return "sanitized provider error";
-  }
-  return String(isRecord(redacted) ? redacted.message : message)
-    .replace(/\s+/g, " ")
-    .slice(0, 160);
-}
+/**
+ * The one browser-local diagnostic. Nothing about the local exception is read —
+ * not its message, not its name, not `String(error)` — so no browser, provider,
+ * or transcript text can reach client state through a thrown value.
+ */
+const WEB_INTERNAL_DIAGNOSTIC: VivaAgentDiagnostic = { code: "WEB_VOICE_INTERNAL", path: null };
 
-function webSocketErrorMessage(token?: string | null): string {
-  if (token) return "WebSocket session token preflight failed";
-  return "WebSocket error";
+/**
+ * Catches ONLY `VivaVoiceProtocolError`'s `{code, path}`. Any other local
+ * exception collapses to the fixed internal diagnostic above.
+ */
+function diagnosticForCaughtError(error: unknown): VivaAgentDiagnostic {
+  if (error instanceof VivaVoiceProtocolError) {
+    return { code: error.code, path: error.path };
+  }
+  return WEB_INTERNAL_DIAGNOSTIC;
 }
 
 export function createVivaAgentSessionController(
@@ -1161,7 +1341,7 @@ export function createVivaAgentSessionController(
         ...state,
         status: "error",
         pendingSubmission: undefined,
-        errors: [...state.errors, "WebSocket is not open"],
+        diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
       });
       return false;
     }
@@ -1169,12 +1349,27 @@ export function createVivaAgentSessionController(
     return true;
   }
 
+  function sendTurnIntentFrame(intent: VivaClientTurnIntent): boolean {
+    return sendSubmissionFrame("text", {
+      intent,
+      turn_id: createTurnIntentId(),
+      type: "turn_intent",
+      version: VIVA_VOICE_PROTOCOL_VERSION,
+    });
+  }
+
+  /**
+   * A submission is refused once the session has a terminal fact or a recap:
+   * after either, the wire turn the answer would belong to no longer exists, and
+   * an optimistic send would be a false promise to the learner.
+   */
   function sendSubmissionFrame(
     kind: VivaAgentPendingSubmission["kind"],
     frame: VivaClientFrameDraft,
   ): boolean {
     const generationId = activeGeneration?.id;
     if (!generationId || state.pendingSubmission) return false;
+    if (state.recap || state.terminalReason) return false;
     if (sendFrame(frame)) {
       setState({ ...state, pendingSubmission: { generationId, kind } });
       return true;
@@ -1206,7 +1401,7 @@ export function createVivaAgentSessionController(
         // reject — the browser already knows it has no authority.
         setState({
           ...state,
-          errors: [...state.errors, "Viva voice session has no signed credential"],
+          diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
           pendingSubmission: undefined,
           status: "error",
         });
@@ -1216,8 +1411,8 @@ export function createVivaAgentSessionController(
     });
     setSocketHandler(nextSocket, "message", (event) => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
-      if (typeof event.data !== "string") return;
       try {
+        if (typeof event.data !== "string") return;
         const frame = parseVivaAgentMessage(event.data);
         if (frame.type === "audio_turn_accepted") {
           applyAudioTurnAccepted(frame);
@@ -1225,22 +1420,32 @@ export function createVivaAgentSessionController(
         }
         setState(vivaAgentReducer(state, frame));
       } catch (error) {
+        // The frame is rejected, not repaired: only Plan 05's typed `{code, path}`
+        // (or the fixed internal code) is recorded. A rejected frame never
+        // changes phase, question, transcript, or terminality.
         setState({
           ...state,
-          status: "error",
-          pendingSubmission: undefined,
-          errors: [...state.errors, error instanceof Error ? error.message : String(error)],
+          diagnostics: [...state.diagnostics, diagnosticForCaughtError(error)],
         });
       }
     });
     setSocketHandler(nextSocket, "close", (event) => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      const close = closeDiagnosticsForEvent(event);
       setState({
         ...state,
+        close,
         generation,
         pendingSubmission: undefined,
         status: "closed",
-        close: closeDiagnosticsForEvent(event),
+        // The ONLY close classifier. The peer's close-reason string is not an
+        // input to it and is not retained anywhere in this state.
+        termination: classifyVivaVoiceTermination({
+          closeCode: close.code,
+          error: state.lastServerError ? { ...state.lastServerError, message: "" } : undefined,
+          terminalReason: state.terminalReason,
+          wasClean: close.wasClean,
+        }),
       });
     });
     setSocketHandler(nextSocket, "error", () => {
@@ -1249,7 +1454,7 @@ export function createVivaAgentSessionController(
         ...state,
         pendingSubmission: undefined,
         status: "error",
-        errors: [...state.errors, webSocketErrorMessage(currentSessionToken)],
+        diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
       });
     });
     return nextSocket;
@@ -1283,11 +1488,10 @@ export function createVivaAgentSessionController(
       setState(initialVivaAgentSessionState());
     },
     sendText(text: string) {
-      return sendSubmissionFrame("text", {
-        type: "text",
-        version: VIVA_VOICE_PROTOCOL_VERSION,
-        text,
-      });
+      // `VOICE-TURN-001`: there is no v5 plain text frame. A typed answer is a
+      // typed INTENT, bound to its own wire turn, so a citation challenge can
+      // never be smuggled through the same channel as an answer.
+      return sendTurnIntentFrame({ kind: "answer_text", text });
     },
     sendAudioChunk(input: VivaAudioChunkInput) {
       const bytes = input.pcm16Bytes;
@@ -1486,11 +1690,24 @@ function requireAudioTurnId(turnId: string): string {
  */
 type VivaClientFrameDraft =
   | VivaClientFrame
+  | Omit<VivaTurnIntentClientFrame, "client_generation_id">
   | Omit<VivaCancelClientFrame, "client_generation_id">
   | Omit<VivaStopClientFrame, "client_generation_id">;
 
 function withClientGeneration(frame: VivaClientFrameDraft, generationId: string): VivaClientFrame {
   return { ...frame, client_generation_id: generationId } as VivaClientFrame;
+}
+
+/**
+ * An opaque per-turn identifier for a typed intent. It carries no learner text,
+ * no transcript, and no identity — a turn id is a correlation handle, not a
+ * description of what the learner said.
+ */
+function createTurnIntentId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `intent-${crypto.randomUUID()}`;
+  }
+  return `intent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function defaultVivaAgentGenerationId(input: {
@@ -1510,6 +1727,7 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
     case "transcript_delta":
     case "transcript_final":
     case "answer_evaluated":
+    case "turn_deferred":
     case "source_reference":
     case "concept_status":
     case "manuscript_intent":
@@ -1523,45 +1741,23 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
   }
 }
 
+/**
+ * `event.reason` is deliberately NOT read. Under Plan 05's typed-termination
+ * contract the close-reason string is never parsed for classification and never
+ * displayed, so the former safe-string allowlist (which drifted against the
+ * server's own wording and turned every unlisted reason into a redaction
+ * placeholder) is gone rather than maintained.
+ */
 function closeDiagnosticsForEvent(event: VivaSocketEvent): VivaAgentCloseDiagnostics {
   return {
     code: typeof event.code === "number" ? event.code : 1005,
-    reason: safeCloseReasonForDisplay(typeof event.reason === "string" ? event.reason : ""),
     wasClean: typeof event.wasClean === "boolean" ? event.wasClean : false,
   };
-}
-
-const safeAgentCloseReasons = new Set([
-  "agent input closed",
-  "binary frame too large",
-  "client stop",
-  "first frame timeout",
-  "idle timeout",
-  "invalid client frame",
-  "provider source authority rejected",
-  "session config required",
-  "session auth failed",
-  "text frame too large",
-  "untrusted tool_result",
-]);
-const legacyAgentAuthReasons = new Set([
-  "invalid session identity",
-  "invalid session token",
-  "study set access denied",
-]);
-
-function safeCloseReasonForDisplay(reason: string): string {
-  const normalized = reason.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const lower = normalized.toLowerCase();
-  if (legacyAgentAuthReasons.has(lower)) return "session auth failed";
-  return safeAgentCloseReasons.has(lower) ? lower : "[redacted close reason]";
 }
 
 type VivaSocketEvent = Event & {
   code?: number;
   data?: unknown;
-  reason?: string;
   wasClean?: boolean;
 };
 
