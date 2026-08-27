@@ -3,11 +3,20 @@
 import { type SessionRecap, seedStudySets, VIVA_AUDIO_MAX_TURN_SAMPLES } from "@viva/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrefersReducedMotion } from "../../lib/use-prefers-reduced-motion";
-import { useVivaAgentSession, type VivaAgentDerivedState } from "../../lib/use-viva-agent-session";
 import {
+  type BrowserSessionCredential,
+  type RenewBrowserSessionCredential,
+  type RenewBrowserSessionCredentialResult,
+  readBrowserSessionCredential,
+  renewBrowserSessionCredential,
+  replaceBrowserSessionCredential,
+  useVivaAgentSession,
+  type VivaAgentDerivedState,
+} from "../../lib/use-viva-agent-session";
+import {
+  createVivaAgentSessionController,
   fetchVivaAgentReadinessProbe,
   isVivaAudioSendRejectedError,
-  refreshVivaSessionToken,
   type VivaAgentAudioOutput,
   type VivaAgentGenerationReason,
   type VivaAgentReadinessProbe,
@@ -35,7 +44,6 @@ import {
   canonicalizeSessionBrowserUrl,
   type SessionRouteIdentity,
   sessionRouteIdentityFromLocationParts,
-  sessionRouteIdentityFromSearch,
 } from "../../lib/viva-session-entry";
 import {
   projectConceptNodes,
@@ -76,24 +84,116 @@ type WindowWithWebkitAudioContext = Window &
     webkitAudioContext?: typeof AudioContext;
   };
 
-export function LiveSessionPage() {
+/**
+ * The page's one scheduling seam. Every deferred/bounded timer this component
+ * arms goes through it, so a mounted test drives them deterministically instead
+ * of racing the real event loop.
+ */
+export type VivaAgentReconnectClock = Readonly<{
+  random: () => number;
+  setTimeout: typeof globalThis.setTimeout;
+  clearTimeout: typeof globalThis.clearTimeout;
+}>;
+
+export const defaultVivaAgentReconnectClock: VivaAgentReconnectClock = {
+  clearTimeout: (...args) => globalThis.clearTimeout(...args),
+  random: () => Math.random(),
+  setTimeout: ((...args: Parameters<typeof globalThis.setTimeout>) =>
+    globalThis.setTimeout(...args)) as typeof globalThis.setTimeout,
+};
+
+/**
+ * A production dependency seam, not a test-only global: every default below is a
+ * fixed module import, and a caller may replace any subset. It is what lets the
+ * mounted suite prove the real component's bootstrap ordering without a socket,
+ * a microphone, or a network.
+ */
+export type LiveSessionPageDependencies = Readonly<{
+  createAgentController: typeof createVivaAgentSessionController;
+  createAudioCaptureSource: typeof createBrowserVivaAudioCaptureSource;
+  createAudioPlaybackSink: typeof createVivaAudioPlaybackSink;
+  fetchReadiness: typeof fetchVivaAgentReadinessProbe;
+  readCredential: typeof readBrowserSessionCredential;
+  replaceCredential: typeof replaceBrowserSessionCredential;
+  renewCredential: RenewBrowserSessionCredential;
+  reconnectClock: VivaAgentReconnectClock;
+}>;
+
+export const defaultLiveSessionPageDependencies: LiveSessionPageDependencies = {
+  createAgentController: createVivaAgentSessionController,
+  createAudioCaptureSource: createBrowserVivaAudioCaptureSource,
+  createAudioPlaybackSink: createVivaAudioPlaybackSink,
+  fetchReadiness: fetchVivaAgentReadinessProbe,
+  reconnectClock: defaultVivaAgentReconnectClock,
+  readCredential: readBrowserSessionCredential,
+  renewCredential: renewBrowserSessionCredential,
+  replaceCredential: replaceBrowserSessionCredential,
+};
+
+export type LiveSessionPageProps = {
+  dependencies?: Partial<LiveSessionPageDependencies>;
+};
+
+/**
+ * The bootstrap gate. `connect` is eligible only at `ready`, and every failure
+ * is a sanitized pre-loop cause — never a fetch message, a close reason, or a
+ * credential fragment.
+ */
+export type SessionCredentialStage =
+  | { kind: "resolving" }
+  | { kind: "renewing" }
+  | { kind: "ready" }
+  | {
+      kind: "failed";
+      cause: "missing_identity" | "missing_credential" | "auth_terminal" | "renewal_unavailable";
+    };
+
+/** The all-null identity both the server render and the first client render use. */
+export const NEUTRAL_SESSION_ROUTE_IDENTITY: SessionRouteIdentity = {
+  sessionId: null,
+  sessionToken: null,
+  studySetId: null,
+  userId: null,
+};
+
+export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
+  const depsRef = useRef<LiveSessionPageDependencies>(defaultLiveSessionPageDependencies);
+  depsRef.current = dependencies
+    ? { ...defaultLiveSessionPageDependencies, ...dependencies }
+    : defaultLiveSessionPageDependencies;
+
   const reducedMotion = usePrefersReducedMotion();
-  const [routeIdentity] = useState(readBrowserSessionRouteIdentity);
-  const [sessionToken, setSessionToken] = useState(routeIdentity.sessionToken ?? null);
-  const [routeSessionTokenRefreshReady, setRouteSessionTokenRefreshReady] = useState(
-    () => !shouldRefreshBrowserSessionToken(routeIdentity),
+  // `WEBSESSION-ROUTE-01`: the first render — server and browser alike — reads no
+  // browser state at all. Route identity, the credential, and the URL
+  // canonicalization all happen in the mount effect, so the two renders produce
+  // byte-identical markup and hydration has nothing to reconcile.
+  const [routeIdentity, setRouteIdentity] = useState<SessionRouteIdentity>(
+    NEUTRAL_SESSION_ROUTE_IDENTITY,
   );
+  const [credential, setCredentialState] = useState<BrowserSessionCredential | null>(null);
+  const [credentialStage, setCredentialStage] = useState<SessionCredentialStage>({
+    kind: "resolving",
+  });
+  // The token the controller is CREATED with. It is seeded exactly once, when
+  // the entry credential first becomes eligible; later rotations reach the same
+  // controller through `refreshSession` so Plan 03's retained audio ledger
+  // survives a credential renewal instead of being thrown away with the
+  // controller.
+  const [bootstrapAccessToken, setBootstrapAccessToken] = useState<string | null>(null);
+  const credentialRef = useRef<BrowserSessionCredential | null>(null);
+  const mountAttemptRef = useRef(0);
+  const renewalAbortRef = useRef<AbortController | null>(null);
   const activeStudySet = useMemo(
     () => ({
       ...STUDY_SET,
       id: routeIdentity.studySetId ?? STUDY_SET.id,
       userId: routeIdentity.userId ?? STUDY_SET.userId,
       sessionId: routeIdentity.sessionId ?? STUDY_SET.sessionId,
-      sessionToken: sessionToken ?? STUDY_SET.sessionToken,
+      sessionToken: bootstrapAccessToken ?? STUDY_SET.sessionToken,
       serverOwned: routeIdentity.studySetId ? true : STUDY_SET.serverOwned,
       ingestionStatus: routeIdentity.studySetId ? ("ready" as const) : STUDY_SET.ingestionStatus,
     }),
-    [routeIdentity, sessionToken],
+    [routeIdentity, bootstrapAccessToken],
   );
   const [elapsed, setElapsed] = useState(0);
   const [hintShown, setHintShown] = useState(false);
@@ -109,15 +209,15 @@ export function LiveSessionPage() {
   const [playbackSpeaking, setPlaybackSpeaking] = useState(false);
   const [interruptAcknowledged, setInterruptAcknowledged] = useState(false);
   const routeIdentityRef = useRef(routeIdentity);
-  const sessionTokenRef = useRef(routeIdentity.sessionToken ?? STUDY_SET.sessionToken ?? null);
   const browserLifecycleAttemptRef = useRef(0);
 
   const agent = useVivaAgentSession({
+    controllerFactory: depsRef.current.createAgentController,
     mode: "quiz",
     sessionId: routeIdentity.sessionId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_SESSION_ID,
-    sessionToken,
+    sessionToken: bootstrapAccessToken,
     studySet: activeStudySet,
-    token: sessionRouteWsAccessToken({ sessionToken }),
+    token: sessionRouteWsAccessToken({ sessionToken: bootstrapAccessToken }),
     trustedStudySetId: process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_STUDY_SET_ID,
     userId: routeIdentity.userId ?? process.env.NEXT_PUBLIC_VIVA_VOICE_TRUSTED_USER_ID,
   });
@@ -177,7 +277,7 @@ export function LiveSessionPage() {
 
   const getPlayback = useCallback(() => {
     if (playbackRef.current) return playbackRef.current;
-    const sink = createVivaAudioPlaybackSink({
+    const sink = depsRef.current.createAudioPlaybackSink({
       contextFactory: () => {
         const audioWindow = window as WindowWithWebkitAudioContext;
         const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
@@ -201,45 +301,204 @@ export function LiveSessionPage() {
     });
   }, []);
 
-  useEffect(() => {
-    if (!shouldRefreshBrowserSessionToken(routeIdentity)) {
-      setRouteSessionTokenRefreshReady(true);
-      return;
-    }
-    let cancelled = false;
-    setRouteSessionTokenRefreshReady(false);
-    void refreshBrowserSessionToken(routeIdentity).then((refreshedToken) => {
-      if (cancelled) return;
-      if (refreshedToken) setSessionToken(refreshedToken);
-      setRouteSessionTokenRefreshReady(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [routeIdentity]);
+  /**
+   * The single authoritative credential write. Every browser lifecycle callback
+   * reads `credentialRef` — never a captured `sessionToken` closure — so a
+   * rotation is visible to an in-flight callback the moment it commits, and no
+   * caller can observe half a rotated pair.
+   */
+  const commitCredential = useCallback((next: BrowserSessionCredential | null) => {
+    credentialRef.current = next;
+    setCredentialState(next);
+  }, []);
 
-  // Connect once, deferred to the next tick so the dev StrictMode
-  // mount→unmount→mount cycle settles first. The throwaway first mount schedules
-  // a timer that its own cleanup clears; only the final, stable mount's connect
-  // actually runs — so we open exactly one socket on the live controller instead
-  // of opening then immediately closing a throwaway one.
+  /**
+   * One bounded renewal. `isCurrent` is the supersession guard (mount attempt
+   * for entry, browser-lifecycle attempt afterwards); the abort signal is the
+   * unmount guard. A superseded or aborted renewal updates nothing.
+   */
+  const runCredentialRenewal = useCallback(
+    async (input: {
+      entry: boolean;
+      isCurrent: () => boolean;
+      reason: Parameters<RenewBrowserSessionCredential>[0]["reason"];
+      signal: AbortSignal;
+    }): Promise<RenewBrowserSessionCredentialResult | null> => {
+      const current = credentialRef.current;
+      if (!current) return null;
+      const deps = depsRef.current;
+      let result: RenewBrowserSessionCredentialResult;
+      try {
+        result = await deps.renewCredential({
+          credential: current,
+          reason: input.reason,
+          signal: input.signal,
+        });
+      } catch {
+        // A thrown renewal is never a UI message; it is a retained credential.
+        result = { credential: current, reason: "unavailable", status: "retained" };
+      }
+      if (input.signal.aborted || !input.isCurrent()) return null;
+
+      if (result.status === "renewed") {
+        commitCredential(result.credential);
+        deps.replaceCredential(result.credential);
+        if (input.entry) {
+          setBootstrapAccessToken(result.credential.accessToken);
+          setCredentialStage({ kind: "ready" });
+        }
+        return result;
+      }
+      if (result.status === "terminal") {
+        commitCredential(null);
+        deps.replaceCredential(null);
+        setCredentialStage({ cause: "auth_terminal", kind: "failed" });
+        return result;
+      }
+      // `retained`: before any socket has consumed it, the entry credential may
+      // still be tried once rather than hanging the learner. After a generation
+      // has opened, a retained credential is not eligible for a new one — the
+      // page stays fail-closed and keeps the Plan 03 ledger for manual recovery.
+      if (input.entry) {
+        setBootstrapAccessToken(result.credential.accessToken);
+        setCredentialStage({ kind: "ready" });
+      } else {
+        setCredentialStage({ cause: "renewal_unavailable", kind: "failed" });
+      }
+      return result;
+    },
+    [commitCredential],
+  );
+
+  // Mount effect: read the browser identity WITHOUT mutating history, merge only
+  // an identity-matched in-memory credential (or a nonrenewable direct entry),
+  // commit it, then canonicalize the URL exactly once.
   useEffect(() => {
-    if (!routeSessionTokenRefreshReady) return;
-    const id = window.setTimeout(() => agentRef.current.connect(), 0);
-    return () => window.clearTimeout(id);
-  }, [routeSessionTokenRefreshReady]);
+    const attempt = mountAttemptRef.current + 1;
+    mountAttemptRef.current = attempt;
+    const identity = sessionRouteIdentityFromLocationParts(
+      window.location.search,
+      window.location.hash,
+    );
+    const deps = depsRef.current;
+    const entry = resolveEntrySessionCredential({
+      envAccessToken: process.env.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN?.trim() || null,
+      identity,
+      vaultCredential: deps.readCredential(),
+    });
+    routeIdentityRef.current = identity;
+    setRouteIdentity(identity);
+    // The credential is committed to the in-memory vault BEFORE the URL is
+    // canonicalized, because canonicalization destroys the only other copy of a
+    // direct-entry access token. Without this, a StrictMode remount (or any
+    // later re-read) would find a stripped URL, an empty vault, and no
+    // credential at all — the entry would silently become unauthenticated.
+    if (entry) deps.replaceCredential(entry);
+    commitCredential(entry ? (deps.readCredential() ?? entry) : null);
+    setCredentialStage(
+      entry
+        ? { kind: "renewing" }
+        : {
+            cause: completeSessionRouteIdentity(identity)
+              ? "missing_credential"
+              : "missing_identity",
+            kind: "failed",
+          },
+    );
+    canonicalizeSessionBrowserUrl(window);
+  }, [commitCredential]);
+
+  // Entry renewal, deferred by one tick so the dev StrictMode
+  // mount→unmount→mount cycle settles before a ONE-TIME rotating credential is
+  // spent. The attempt guard below is the correctness mechanism; the deferral is
+  // what keeps the throwaway mount from consuming R1.
+  useEffect(() => {
+    if (credentialStage.kind !== "renewing") return;
+    const clock = depsRef.current.reconnectClock;
+    const controller = new AbortController();
+    renewalAbortRef.current = controller;
+    const attempt = mountAttemptRef.current;
+    const timer = clock.setTimeout(() => {
+      void runCredentialRenewal({
+        entry: true,
+        isCurrent: () => attempt === mountAttemptRef.current && mountedRef.current,
+        reason: "session_entry",
+        signal: controller.signal,
+      });
+    }, 0);
+    return () => {
+      clock.clearTimeout(timer);
+      controller.abort();
+      if (renewalAbortRef.current === controller) renewalAbortRef.current = null;
+    };
+  }, [credentialStage.kind, runCredentialRenewal]);
+
+  // Connect once, and only once the selected D-07 branch's renewal has settled
+  // for this attempt. The zero-delay deferral survives from the StrictMode fix,
+  // but eligibility — not the timer — is what makes exactly one socket open.
+  useEffect(() => {
+    if (credentialStage.kind !== "ready") return;
+    const clock = depsRef.current.reconnectClock;
+    const id = clock.setTimeout(() => agentRef.current.connect(), 0);
+    return () => clock.clearTimeout(id);
+  }, [credentialStage.kind]);
+
+  /**
+   * Opens the next generation with the CURRENT credential, through the existing
+   * controller so the retained audio ledger survives the rotation.
+   */
+  const openGenerationWithCurrentCredential = useCallback((reason: VivaAgentGenerationReason) => {
+    const current = credentialRef.current;
+    if (!current) return;
+    agentRef.current.refreshSession({ reason, sessionToken: current.accessToken });
+  }, []);
+
+  const renewAndReopen = useCallback(
+    (reason: VivaAgentGenerationReason, renewalReason: "browser_restore" | "auth_expired") => {
+      const attempt = browserLifecycleAttemptRef.current;
+      const controller = new AbortController();
+      renewalAbortRef.current?.abort();
+      renewalAbortRef.current = controller;
+      void runCredentialRenewal({
+        entry: false,
+        isCurrent: () =>
+          mountedRef.current &&
+          isCurrentBrowserLifecycleAttempt({
+            activeAttempt: browserLifecycleAttemptRef.current,
+            attempt,
+          }),
+        reason: renewalReason,
+        signal: controller.signal,
+      }).then((result) => {
+        if (result?.status !== "renewed") return;
+        if (
+          !mountedRef.current ||
+          !isCurrentBrowserLifecycleAttempt({
+            activeAttempt: browserLifecycleAttemptRef.current,
+            attempt,
+          })
+        ) {
+          return;
+        }
+        openGenerationWithCurrentCredential(reason);
+      });
+    },
+    [openGenerationWithCurrentCredential, runCredentialRenewal],
+  );
 
   const reconnectForBrowserLifecycle = useCallback(
     (reason: VivaAgentGenerationReason) => {
-      const nextRouteIdentity = readBrowserSessionRouteIdentity();
+      const nextRouteIdentity = sessionRouteIdentityFromLocationParts(
+        window.location.search,
+        window.location.hash,
+      );
+      const current = credentialRef.current;
       const plan = browserLifecycleReconnectPlan({
         currentRouteIdentity: routeIdentityRef.current,
         nextRouteIdentity,
         recap: agentRef.current.derived.recap,
-        sessionId: activeStudySet.sessionId,
-        sessionToken: sessionTokenRef.current,
+        renewable: isRenewableBrowserSessionCredential(current),
         status: agentRef.current.status,
-        userId: activeStudySet.userId,
       });
       const attempt = browserLifecycleAttemptRef.current + 1;
       browserLifecycleAttemptRef.current = attempt;
@@ -254,48 +513,14 @@ export function LiveSessionPage() {
       setSubmittedTextAnswer(undefined);
       stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
       resetPlaybackForGeneration();
-      if (plan.action === "refresh_session_token") {
-        void refreshVivaSessionToken({
-          sessionId: plan.sessionId,
-          sessionToken: plan.sessionToken,
-          studySetId: activeStudySet.id,
-          userId: plan.userId,
-        })
-          .then((result) => {
-            if (
-              !isCurrentBrowserLifecycleAttempt({
-                activeAttempt: browserLifecycleAttemptRef.current,
-                attempt,
-              })
-            ) {
-              return;
-            }
-            sessionTokenRef.current = result.session_token;
-            agentRef.current.refreshSession({ reason, sessionToken: result.session_token });
-          })
-          .catch(() => {
-            if (
-              isCurrentBrowserLifecycleAttempt({
-                activeAttempt: browserLifecycleAttemptRef.current,
-                attempt,
-              })
-            ) {
-              agentRef.current.reset();
-              agentRef.current.connect(reason);
-            }
-          });
+      if (plan.action === "renew_credential") {
+        renewAndReopen(reason, "browser_restore");
         return;
       }
       agentRef.current.reset();
       agentRef.current.connect(reason);
     },
-    [
-      activeStudySet.id,
-      activeStudySet.sessionId,
-      activeStudySet.userId,
-      cancelActiveAudioTurn,
-      resetPlaybackForGeneration,
-    ],
+    [cancelActiveAudioTurn, renewAndReopen, resetPlaybackForGeneration],
   );
 
   useEffect(() => {
@@ -336,7 +561,7 @@ export function LiveSessionPage() {
     if (stopReadinessPolling) return;
     let cancelled = false;
     const refreshReadiness = async () => {
-      const next = await fetchVivaAgentReadinessProbe();
+      const next = await depsRef.current.fetchReadiness();
       if (!cancelled) setReadinessProbe(next);
     };
     void refreshReadiness();
@@ -416,7 +641,7 @@ export function LiveSessionPage() {
     captureStartedRef.current = true;
     const startGeneration = ++micStartGenerationRef.current;
     try {
-      const source = await createBrowserVivaAudioCaptureSource({
+      const source = await depsRef.current.createAudioCaptureSource({
         AudioContextCtor,
         mediaDevices: navigator.mediaDevices,
         sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
@@ -577,53 +802,18 @@ export function LiveSessionPage() {
     agentRef.current.connect("socket_retry");
   }, [resetPlaybackForGeneration]);
   const refreshSession = useCallback(() => {
-    const attempt = browserLifecycleAttemptRef.current + 1;
-    browserLifecycleAttemptRef.current = attempt;
+    browserLifecycleAttemptRef.current += 1;
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
     setSubmittedTextAnswer(undefined);
     resetPlaybackForGeneration();
-    const sessionToken = sessionTokenRef.current;
-    if (!sessionToken || !activeStudySet.userId || !activeStudySet.sessionId) {
+    if (!isRenewableBrowserSessionCredential(credentialRef.current)) {
       retryAgent();
       return;
     }
-    void refreshVivaSessionToken({
-      sessionId: activeStudySet.sessionId,
-      sessionToken,
-      studySetId: activeStudySet.id,
-      userId: activeStudySet.userId,
-    })
-      .then((result) => {
-        if (
-          !isCurrentBrowserLifecycleAttempt({
-            activeAttempt: browserLifecycleAttemptRef.current,
-            attempt,
-          })
-        ) {
-          return;
-        }
-        sessionTokenRef.current = result.session_token;
-        agentRef.current.refreshSession({ sessionToken: result.session_token });
-      })
-      .catch(() => {
-        if (
-          isCurrentBrowserLifecycleAttempt({
-            activeAttempt: browserLifecycleAttemptRef.current,
-            attempt,
-          })
-        ) {
-          retryAgent();
-        }
-      });
-  }, [
-    activeStudySet.id,
-    activeStudySet.sessionId,
-    activeStudySet.userId,
-    resetPlaybackForGeneration,
-    retryAgent,
-  ]);
+    renewAndReopen("token_refresh", "auth_expired");
+  }, [renewAndReopen, resetPlaybackForGeneration, retryAgent]);
   const startNewSession = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
@@ -844,8 +1034,12 @@ export function LiveSessionPage() {
     activateTextAnswerMode();
   }, [activateTextAnswerMode]);
 
-  const sessionContextLabel =
-    agent.readiness.reason === "trusted"
+  // Before the mount effect has resolved a credential — which is exactly the
+  // server render and the first client render — the header states the neutral
+  // truth rather than naming a study set the page has not been authorized for.
+  const sessionContextLabel = !credential
+    ? "Preparing your session"
+    : agent.readiness.reason === "trusted"
       ? `Trusted server set: ${activeStudySet.title}`
       : `Local demo set: ${activeStudySet.title}`;
 
@@ -955,21 +1149,22 @@ export type BrowserLifecycleReconnectPlan =
   | { action: "skip_session_over" }
   | { action: "reload" }
   | { action: "socket_retry" }
-  | {
-      action: "refresh_session_token";
-      sessionId: string;
-      sessionToken: string;
-      userId: string;
-    };
+  | { action: "renew_credential" };
 
+/**
+ * The plan carries NO credential material at all.
+ *
+ * Under D-07 Branch A the renewal authority is the rotating one-time refresh
+ * credential held in the vault, never an access token, so the only thing a plan
+ * needs to say is whether one exists. Passing the token through here is what let
+ * a spent token be replayed as renewal authority; a boolean cannot.
+ */
 export function browserLifecycleReconnectPlan(input: {
   currentRouteIdentity: SessionRouteIdentity;
   nextRouteIdentity: SessionRouteIdentity;
   recap: unknown;
-  sessionId?: string | null;
-  sessionToken?: string | null;
+  renewable: boolean;
   status: string;
-  userId?: string | null;
 }): BrowserLifecycleReconnectPlan {
   if (!sameBrowserSessionRouteIdentity(input.currentRouteIdentity, input.nextRouteIdentity)) {
     return { action: "reload" };
@@ -980,18 +1175,63 @@ export function browserLifecycleReconnectPlan(input: {
   if (input.status === "closed") {
     return { action: "reload" };
   }
-  const sessionToken = input.sessionToken?.trim();
-  const userId = input.userId?.trim();
-  const sessionId = input.sessionId?.trim();
-  if (sessionToken && userId && sessionId) {
-    return {
-      action: "refresh_session_token",
-      sessionId,
-      sessionToken,
-      userId,
-    };
+  return input.renewable ? { action: "renew_credential" } : { action: "socket_retry" };
+}
+
+/** A credential is renewable only when it carries a rotating refresh credential. */
+export function isRenewableBrowserSessionCredential(
+  credential: BrowserSessionCredential | null,
+): boolean {
+  return credential?.mode === "retain-token-only" && Boolean(credential.refreshToken);
+}
+
+/** Every route identity member the authenticated session needs, all present. */
+export function completeSessionRouteIdentity(identity: SessionRouteIdentity): boolean {
+  return Boolean(
+    identity.userId?.trim() && identity.studySetId?.trim() && identity.sessionId?.trim(),
+  );
+}
+
+/**
+ * `WEBSESSION-AUTH-01` — the one entry credential, resolved once at mount.
+ *
+ * Precedence under D-07 Branch A: an identity-matched in-memory credential wins,
+ * because only it carries the rotating refresh credential a renewal needs. A URL
+ * (or bundled env) access token is accepted only as a NONRENEWABLE direct entry
+ * — it can open one generation and can never be renewed, so a full reload may
+ * legitimately require a fresh authenticated start rather than a replayed token.
+ */
+export function resolveEntrySessionCredential(input: {
+  envAccessToken?: string | null;
+  identity: SessionRouteIdentity;
+  vaultCredential: BrowserSessionCredential | null;
+}): BrowserSessionCredential | null {
+  const userId = input.identity.userId?.trim();
+  const studySetId = input.identity.studySetId?.trim();
+  const sessionId = input.identity.sessionId?.trim();
+  if (!userId || !studySetId || !sessionId) return null;
+
+  const vault = input.vaultCredential;
+  if (
+    vault &&
+    vault.identity.userId === userId &&
+    vault.identity.studySetId === studySetId &&
+    vault.identity.sessionId === sessionId
+  ) {
+    return vault;
   }
-  return { action: "socket_retry" };
+
+  const directToken = input.identity.sessionToken?.trim() || input.envAccessToken?.trim();
+  if (!directToken) return null;
+  return {
+    accessToken: directToken,
+    identity: { sessionId, studySetId, userId },
+    mode: "retain-token-only",
+    refreshExpiresAt: null,
+    refreshToken: null,
+    revision: 0,
+    sessionAbsoluteExpiresAt: null,
+  };
 }
 
 /**
@@ -1347,34 +1587,6 @@ export function derivedStateWithProjectedRecap(
   return recap ? { ...derived, recap } : derived;
 }
 
-function readBrowserSessionRouteIdentity() {
-  const envToken = process.env.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN?.trim() || null;
-  if (typeof window === "undefined") {
-    return {
-      ...sessionRouteIdentityFromSearch(""),
-      sessionToken: envToken,
-    };
-  }
-
-  const routeIdentity = sessionRouteIdentityFromLocationParts(
-    window.location.search,
-    window.location.hash,
-  );
-  canonicalizeSessionBrowserUrl(window);
-  if (
-    routeIdentity.userId ||
-    routeIdentity.studySetId ||
-    routeIdentity.sessionId ||
-    routeIdentity.sessionToken
-  ) {
-    return routeIdentity;
-  }
-  return {
-    ...routeIdentity,
-    sessionToken: envToken,
-  };
-}
-
 export function sessionRouteWsAccessToken(routeIdentity: { sessionToken?: string | null }) {
   return routeIdentity.sessionToken?.trim() || undefined;
 }
@@ -1386,44 +1598,9 @@ type BrowserSessionRouteIdentity = {
   userId?: string | null;
 };
 
-export function shouldRefreshBrowserSessionToken(identity: BrowserSessionRouteIdentity): boolean {
-  return Boolean(
-    identity.sessionId?.trim() &&
-      identity.sessionToken?.trim() &&
-      identity.studySetId?.trim() &&
-      identity.userId?.trim(),
-  );
-}
-
-export async function refreshBrowserSessionToken(
-  identity: BrowserSessionRouteIdentity,
-  fetchImpl: typeof fetch = fetch,
-): Promise<string | null> {
-  const fallbackToken = identity.sessionToken?.trim() || null;
-  if (!shouldRefreshBrowserSessionToken(identity)) return fallbackToken;
-  try {
-    const response = await fetchImpl("/api/viva-session/refresh", {
-      body: JSON.stringify({
-        session_id: identity.sessionId?.trim(),
-        session_token: fallbackToken,
-        study_set_id: identity.studySetId?.trim(),
-        user_id: identity.userId?.trim(),
-      }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    });
-    if (!response.ok) return fallbackToken;
-    const body = (await response.json()) as { session_token?: unknown };
-    const refreshedToken = typeof body.session_token === "string" ? body.session_token.trim() : "";
-    return refreshedToken || fallbackToken;
-  } catch {
-    return fallbackToken;
-  }
-}
-
 export function sameBrowserSessionRouteIdentity(
-  left: ReturnType<typeof readBrowserSessionRouteIdentity>,
-  right: ReturnType<typeof readBrowserSessionRouteIdentity>,
+  left: BrowserSessionRouteIdentity,
+  right: BrowserSessionRouteIdentity,
 ): boolean {
   return (
     left.userId === right.userId &&

@@ -28,15 +28,15 @@ import {
   drainAgentAudio,
   enterTextAnswerMode,
   isCurrentBrowserLifecycleAttempt,
+  isRenewableBrowserSessionCredential,
   isSessionOver,
   type LiveAudioTurnSeam,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
-  refreshBrowserSessionToken,
   resetPlaybackCancellationStateForGeneration,
+  resolveEntrySessionCredential,
   sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
-  shouldRefreshBrowserSessionToken,
   shouldShowNoSpeechNudge,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
@@ -219,10 +219,8 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: { headline: "done" },
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "open",
-        userId: "user-1",
       }),
     ).toEqual({ action: "skip_session_over" });
   });
@@ -243,15 +241,13 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: { headline: "done" },
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "closed",
-        userId: "user-1",
       }),
     ).toEqual({ action: "reload" });
   });
 
-  test("refreshes spent session tokens before same-identity lifecycle reconnects", () => {
+  test("renews the rotating credential before a same-identity lifecycle reconnect", () => {
     expect(
       browserLifecycleReconnectPlan({
         currentRouteIdentity: {
@@ -267,20 +263,60 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: undefined,
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "open",
-        userId: "user-1",
       }),
-    ).toEqual({
-      action: "refresh_session_token",
-      sessionId: "session-1",
-      sessionToken: "spent-token",
-      userId: "user-1",
-    });
+    ).toEqual({ action: "renew_credential" });
   });
 
-  test("reloads instead of refreshing a same-identity closed voice session", () => {
+  test("carries no credential material in the plan itself", () => {
+    const plan = browserLifecycleReconnectPlan({
+      currentRouteIdentity: {
+        sessionId: "session-1",
+        sessionToken: "viva1.spent-access-token",
+        studySetId: "study-set-1",
+        userId: "user-1",
+      },
+      nextRouteIdentity: {
+        sessionId: "session-1",
+        sessionToken: null,
+        studySetId: "study-set-1",
+        userId: "user-1",
+      },
+      recap: undefined,
+      renewable: true,
+      status: "open",
+    });
+
+    // A plan that cannot name a token cannot replay a spent one as renewal
+    // authority: D-07 Branch A's authority is the rotating refresh credential.
+    expect(JSON.stringify(plan)).not.toContain("viva1.");
+    expect(Object.keys(plan)).toEqual(["action"]);
+  });
+
+  test("falls back to a plain socket retry when no rotating credential exists", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "direct-entry-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        renewable: false,
+        status: "open",
+      }),
+    ).toEqual({ action: "socket_retry" });
+  });
+
+  test("reloads instead of renewing a same-identity closed voice session", () => {
     expect(
       browserLifecycleReconnectPlan({
         currentRouteIdentity: {
@@ -296,10 +332,8 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: undefined,
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "closed",
-        userId: "user-1",
       }),
     ).toEqual({ action: "reload" });
   });
@@ -320,7 +354,28 @@ describe("isSessionOver", () => {
   });
 });
 
-describe("sessionRouteWsAccessToken", () => {
+describe("entry credential precedence (WEBSESSION-AUTH-01)", () => {
+  const identity = {
+    sessionId: "voice-session-9",
+    sessionToken: "viva1.access-from-url",
+    studySetId: "thermo-401",
+    userId: "user-9",
+  } as const;
+
+  const vaultCredential = {
+    accessToken: "viva1.access-from-vault",
+    identity: {
+      sessionId: "voice-session-9",
+      studySetId: "thermo-401",
+      userId: "user-9",
+    },
+    mode: "retain-token-only",
+    refreshExpiresAt: Date.parse("2026-08-26T12:00:00Z"),
+    refreshToken: "viva-refresh1.credential-r1",
+    revision: 3,
+    sessionAbsoluteExpiresAt: Date.parse("2026-08-26T20:00:00Z"),
+  } as const;
+
   test("uses the signed route session token as the direct WebSocket access credential", () => {
     expect(sessionRouteWsAccessToken({ sessionToken: " viva1.signed-session-token " })).toBe(
       "viva1.signed-session-token",
@@ -328,62 +383,63 @@ describe("sessionRouteWsAccessToken", () => {
     expect(sessionRouteWsAccessToken({ sessionToken: null })).toBeUndefined();
   });
 
-  test("refreshes complete route session identities before socket connection", async () => {
-    const calls: Array<{ input: string; init?: RequestInit }> = [];
-    const token = await refreshBrowserSessionToken(
-      {
-        sessionId: "server-session",
-        sessionToken: "viva1.expired-route-token",
-        studySetId: "biology-midterm",
-        userId: "user-1",
-      },
-      (async (input: RequestInfo | URL, init?: RequestInit) => {
-        calls.push({ input: String(input), init });
-        return new Response(JSON.stringify({ session_token: "viva1.fresh-route-token" }), {
-          headers: { "content-type": "application/json" },
-          status: 200,
-        });
-      }) as typeof fetch,
-    );
-
-    expect(shouldRefreshBrowserSessionToken({ sessionToken: "viva1.only-token" })).toBe(false);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.input).toBe("/api/viva-session/refresh");
-    expect(new Headers(calls[0]?.init?.headers).get("content-type")).toBe("application/json");
-    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
-      session_id: "server-session",
-      session_token: "viva1.expired-route-token",
-      study_set_id: "biology-midterm",
-      user_id: "user-1",
-    });
-    expect(token).toBe("viva1.fresh-route-token");
+  test("an identity-matched vault credential outranks the URL access token", () => {
+    expect(resolveEntrySessionCredential({ identity, vaultCredential })).toBe(vaultCredential);
   });
 
-  test("falls back to the original route token when refresh cannot run", async () => {
-    const calls: string[] = [];
-    const missingIdentityToken = await refreshBrowserSessionToken(
-      { sessionToken: " viva1.route-token " },
-      (async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return new Response("{}", { status: 500 });
-      }) as typeof fetch,
-    );
-    const failedRefreshToken = await refreshBrowserSessionToken(
-      {
-        sessionId: "server-session",
-        sessionToken: "viva1.route-token",
-        studySetId: "biology-midterm",
-        userId: "user-1",
+  test("a vault credential for another session is ignored, not merged", () => {
+    const resolved = resolveEntrySessionCredential({
+      identity,
+      vaultCredential: {
+        ...vaultCredential,
+        identity: { ...vaultCredential.identity, sessionId: "voice-session-other" },
       },
-      (async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return new Response("{}", { status: 401 });
-      }) as typeof fetch,
-    );
+    });
 
-    expect(missingIdentityToken).toBe("viva1.route-token");
-    expect(failedRefreshToken).toBe("viva1.route-token");
-    expect(calls).toEqual(["/api/viva-session/refresh"]);
+    expect(resolved?.accessToken).toBe("viva1.access-from-url");
+    expect(isRenewableBrowserSessionCredential(resolved)).toBe(false);
+  });
+
+  test("a URL access token alone is a nonrenewable direct entry", () => {
+    const resolved = resolveEntrySessionCredential({ identity, vaultCredential: null });
+
+    expect(resolved).toEqual({
+      accessToken: "viva1.access-from-url",
+      identity: {
+        sessionId: "voice-session-9",
+        studySetId: "thermo-401",
+        userId: "user-9",
+      },
+      mode: "retain-token-only",
+      refreshExpiresAt: null,
+      refreshToken: null,
+      revision: 0,
+      sessionAbsoluteExpiresAt: null,
+    });
+    expect(isRenewableBrowserSessionCredential(resolved)).toBe(false);
+  });
+
+  test("an incomplete route identity resolves no credential at all", () => {
+    expect(
+      resolveEntrySessionCredential({
+        identity: { ...identity, studySetId: null },
+        vaultCredential,
+      }),
+    ).toBeNull();
+    expect(
+      resolveEntrySessionCredential({
+        identity: { ...identity, sessionToken: null },
+        vaultCredential: null,
+      }),
+    ).toBeNull();
+  });
+
+  test("only a rotating refresh credential makes a credential renewable", () => {
+    expect(isRenewableBrowserSessionCredential(vaultCredential)).toBe(true);
+    expect(isRenewableBrowserSessionCredential({ ...vaultCredential, refreshToken: null })).toBe(
+      false,
+    );
+    expect(isRenewableBrowserSessionCredential(null)).toBe(false);
   });
 });
 

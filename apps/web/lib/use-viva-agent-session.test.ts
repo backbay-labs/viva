@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   type AgentStudySourceReference,
   parseVivaServerFrame,
@@ -8,9 +8,17 @@ import {
 import fullSessionFixture from "../../../agent/fixtures/voice-protocol/v5/synthetic-runtime-session.json";
 import {
   agentSourceToUiSource,
+  type BrowserSessionCredential,
+  browserSessionCredentialVault,
+  clearBrowserSessionCredential,
   createVivaAgentAudioCommands,
   deriveVivaAgentUiState,
+  readBrowserSessionCredential,
+  refreshBrowserSessionToken,
+  renewBrowserSessionCredential,
+  replaceBrowserSessionCredential,
   studySetToAgentSessionConfig,
+  VIVA_SESSION_ENTRY_REFRESH_TIMEOUT_MS,
 } from "./use-viva-agent-session";
 import {
   initialVivaAgentSessionState,
@@ -242,5 +250,315 @@ describe("viva agent audio commands", () => {
       status: "socket_closed",
     });
     expect(() => commands.cancelAudioTurn("turn-hook")).not.toThrow();
+  });
+});
+
+/**
+ * `WEBSESSION-AUTH-01` / `WEBSESSION-AUTH-02` — D-07 Branch A
+ * (`retain-token-only`, recorded in
+ * `agent/fixtures/voice-protocol/v5/auth-decision.json`).
+ *
+ * One authoritative credential, rotated atomically, bounded at 6,000 ms, held in
+ * module memory only.
+ */
+describe("browser session credential vault (D-07 Branch A)", () => {
+  const identity = {
+    sessionId: "voice-session-9",
+    studySetId: "thermo-401",
+    userId: "user-9",
+  } as const;
+
+  function entryCredential(
+    overrides: Partial<Extract<BrowserSessionCredential, { mode: "retain-token-only" }>> = {},
+  ): Extract<BrowserSessionCredential, { mode: "retain-token-only" }> {
+    return {
+      accessToken: "viva1.access-a",
+      identity,
+      mode: "retain-token-only",
+      refreshExpiresAt: null,
+      refreshToken: "viva-refresh1.credential-r1",
+      revision: 1,
+      sessionAbsoluteExpiresAt: null,
+      ...overrides,
+    };
+  }
+
+  function rotationBody(overrides: Record<string, unknown> = {}) {
+    return {
+      failure_class: null,
+      refresh_expires_at: "2026-08-26T12:00:00Z",
+      refresh_token: "viva-refresh1.credential-r2",
+      session: {
+        session_id: identity.sessionId,
+        study_set_id: identity.studySetId,
+        user_id: identity.userId,
+      },
+      session_absolute_expires_at: "2026-08-26T20:00:00Z",
+      session_token: "viva1.access-b",
+      token_refresh_outcome: "refreshed",
+      ...overrides,
+    };
+  }
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+      status,
+    });
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+    clearBrowserSessionCredential();
+  });
+
+  test("the rotation POST carries exactly the four Plan 11 fields and never the access token", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const result = await refreshBrowserSessionToken(entryCredential(), {
+      fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ init, url: String(url) });
+        return jsonResponse(rotationBody());
+      }) as typeof fetch,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("/api/viva-session/refresh");
+    expect(calls[0]?.init?.method).toBe("POST");
+    const body = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>;
+    expect(body).toEqual({
+      refresh_token: "viva-refresh1.credential-r1",
+      session_id: identity.sessionId,
+      study_set_id: identity.studySetId,
+      user_id: identity.userId,
+    });
+    expect(Object.keys(body)).not.toContain("session_token");
+    expect(JSON.stringify(body)).not.toContain("viva1.access-a");
+    expect(result.status).toBe("renewed");
+  });
+
+  test("a rotation replaces access token, refresh credential, and both RFC3339 expiries atomically", async () => {
+    replaceBrowserSessionCredential(entryCredential());
+    const result = await refreshBrowserSessionToken(entryCredential(), {
+      fetchImpl: (async () => jsonResponse(rotationBody())) as typeof fetch,
+    });
+
+    expect(result.status).toBe("renewed");
+    const stored = readBrowserSessionCredential();
+    expect(stored?.mode).toBe("retain-token-only");
+    expect(stored?.accessToken).toBe("viva1.access-b");
+    if (stored?.mode !== "retain-token-only") throw new Error("expected a Branch A credential");
+    expect(stored.refreshToken).toBe("viva-refresh1.credential-r2");
+    expect(stored.refreshExpiresAt).toBe(Date.parse("2026-08-26T12:00:00Z"));
+    expect(stored.sessionAbsoluteExpiresAt).toBe(Date.parse("2026-08-26T20:00:00Z"));
+    expect(stored.identity).toEqual(identity);
+  });
+
+  test("a second rotation submits the rotated credential, never the spent one", async () => {
+    const submitted: string[] = [];
+    const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { refresh_token: string };
+      submitted.push(body.refresh_token);
+      return jsonResponse(
+        rotationBody({ refresh_token: `viva-refresh1.credential-after-${submitted.length}` }),
+      );
+    }) as typeof fetch;
+
+    const first = await refreshBrowserSessionToken(entryCredential(), { fetchImpl });
+    expect(first.status).toBe("renewed");
+    const rotated = readBrowserSessionCredential();
+    if (rotated?.mode !== "retain-token-only") throw new Error("expected a Branch A credential");
+    await refreshBrowserSessionToken(rotated, { fetchImpl });
+
+    expect(submitted).toEqual(["viva-refresh1.credential-r1", "viva-refresh1.credential-after-1"]);
+  });
+
+  const invalidRotations: Array<[string, Record<string, unknown>]> = [
+    [
+      "a missing field",
+      (() => {
+        const body = rotationBody() as Record<string, unknown>;
+        delete body.refresh_token;
+        return body;
+      })(),
+    ],
+    ["an extra field", rotationBody({ session_hint: "extra" })],
+    ["a wrong-typed instant", rotationBody({ refresh_expires_at: 1_800_000_000 })],
+    ["a non-RFC3339 instant", rotationBody({ session_absolute_expires_at: "tomorrow" })],
+    ["an unknown refresh outcome", rotationBody({ token_refresh_outcome: "rotated" })],
+    ["a non-null failure class", rotationBody({ failure_class: "session_auth_failure" })],
+    [
+      "a mismatched identity",
+      rotationBody({
+        session: {
+          session_id: "voice-session-other",
+          study_set_id: "thermo-401",
+          user_id: "user-9",
+        },
+      }),
+    ],
+  ];
+
+  for (const [label, body] of invalidRotations) {
+    test(`clears the vault and returns invalid_response for ${label}`, async () => {
+      replaceBrowserSessionCredential(entryCredential());
+      const result = await refreshBrowserSessionToken(entryCredential(), {
+        fetchImpl: (async () => jsonResponse(body)) as typeof fetch,
+      });
+
+      expect(result).toEqual({ reason: "invalid_response", status: "terminal" });
+      expect(readBrowserSessionCredential()).toBeNull();
+    });
+  }
+
+  test("a terminal 401 clears the vault and never retains half a credential pair", async () => {
+    replaceBrowserSessionCredential(entryCredential());
+    const result = await refreshBrowserSessionToken(entryCredential(), {
+      fetchImpl: (async () =>
+        jsonResponse({ error: "session_auth_terminal" }, 401)) as typeof fetch,
+    });
+
+    expect(result).toEqual({ reason: "auth_terminal", status: "terminal" });
+    expect(readBrowserSessionCredential()).toBeNull();
+  });
+
+  test("a 5xx retains the current credential rather than clearing it", async () => {
+    const credential = entryCredential();
+    const result = await refreshBrowserSessionToken(credential, {
+      fetchImpl: (async () => new Response("{}", { status: 503 })) as typeof fetch,
+    });
+
+    expect(result).toEqual({ credential, reason: "unavailable", status: "retained" });
+  });
+
+  test("the 6,000 ms deadline aborts the request and retains the current credential", async () => {
+    jest.useFakeTimers();
+    let observedSignal: AbortSignal | undefined;
+    const credential = entryCredential();
+    const pending = refreshBrowserSessionToken(credential, {
+      fetchImpl: ((_url: RequestInfo | URL, init?: RequestInit) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
+      }) as typeof fetch,
+    });
+
+    jest.advanceTimersByTime(VIVA_SESSION_ENTRY_REFRESH_TIMEOUT_MS - 1);
+    expect(observedSignal?.aborted).toBe(false);
+
+    jest.advanceTimersByTime(1);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(await pending).toEqual({
+      credential,
+      reason: "timeout",
+      status: "retained",
+    });
+  });
+
+  test("an outer abort before the deadline cancels the request and renews nothing", async () => {
+    replaceBrowserSessionCredential(entryCredential());
+    const outer = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    const credential = entryCredential();
+    const pending = refreshBrowserSessionToken(credential, {
+      fetchImpl: ((_url: RequestInfo | URL, init?: RequestInit) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
+      }) as typeof fetch,
+      signal: outer.signal,
+      // A deadline far past the unmount proves the abort — not the timer — is
+      // what releases the request.
+      timeoutMs: 600_000,
+    });
+
+    await Promise.resolve();
+    expect(observedSignal?.aborted).toBe(false);
+    outer.abort();
+    expect(observedSignal?.aborted).toBe(true);
+
+    expect(await pending).toEqual({
+      credential,
+      reason: "unavailable",
+      status: "retained",
+    });
+    // Neither half of the pair moved: the pre-abort credential is still the one
+    // the vault holds.
+    expect(readBrowserSessionCredential()?.accessToken).toBe("viva1.access-a");
+  });
+
+  test("a credential with no rotating refresh credential is not renewable and makes no request", async () => {
+    let called = 0;
+    const credential = entryCredential({ refreshToken: null });
+    const result = await renewBrowserSessionCredential({
+      credential,
+      reason: "session_entry",
+      signal: new AbortController().signal,
+    });
+    const direct = await refreshBrowserSessionToken(credential, {
+      fetchImpl: (async () => {
+        called += 1;
+        return jsonResponse(rotationBody());
+      }) as typeof fetch,
+    });
+
+    expect(result).toEqual({ credential, reason: "not_renewable", status: "retained" });
+    expect(direct).toEqual({ credential, reason: "not_renewable", status: "retained" });
+    expect(called).toBe(0);
+  });
+
+  test("the vault holds credentials in module memory only", () => {
+    // Whatever host surfaces exist in this process, none of them may end up
+    // holding the credential: the vault is module memory, full stop.
+    const host = globalThis as typeof globalThis & {
+      document?: { cookie?: string };
+      localStorage?: Storage;
+      location?: { href: string };
+      sessionStorage?: Storage;
+    };
+    const before = {
+      cookie: host.document?.cookie ?? "",
+      href: host.location?.href ?? "",
+      local: host.localStorage?.length ?? 0,
+      session: host.sessionStorage?.length ?? 0,
+    };
+
+    replaceBrowserSessionCredential(entryCredential());
+
+    expect(readBrowserSessionCredential()?.accessToken).toBe("viva1.access-a");
+    expect(host.document?.cookie ?? "").toBe(before.cookie);
+    expect(host.location?.href ?? "").toBe(before.href);
+    expect(host.localStorage?.length ?? 0).toBe(before.local);
+    expect(host.sessionStorage?.length ?? 0).toBe(before.session);
+
+    replaceBrowserSessionCredential(null);
+    expect(readBrowserSessionCredential()).toBeNull();
+  });
+
+  test("FRONTEND-011: the vault seam stores the complete start response", () => {
+    browserSessionCredentialVault.replaceBrowserSessionCredential({
+      mode: "retain-token-only",
+      refresh_expires_at: "2026-08-26T12:00:00Z",
+      refresh_token: "viva-refresh1.credential-from-start",
+      session_absolute_expires_at: "2026-08-26T20:00:00Z",
+      session_id: identity.sessionId,
+      session_token: "viva1.access-from-start",
+      study_set_id: identity.studySetId,
+      user_id: identity.userId,
+    });
+
+    const stored = readBrowserSessionCredential();
+    if (stored?.mode !== "retain-token-only") throw new Error("expected a Branch A credential");
+    expect(stored.accessToken).toBe("viva1.access-from-start");
+    expect(stored.refreshToken).toBe("viva-refresh1.credential-from-start");
+    expect(stored.refreshExpiresAt).toBe(Date.parse("2026-08-26T12:00:00Z"));
+    expect(stored.sessionAbsoluteExpiresAt).toBe(Date.parse("2026-08-26T20:00:00Z"));
+    expect(stored.identity).toEqual(identity);
+    expect(stored.revision).toBeGreaterThan(0);
   });
 });
