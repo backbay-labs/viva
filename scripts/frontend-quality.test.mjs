@@ -5,8 +5,11 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { vivaContrastPairs } from "../packages/tokens/src/index.ts";
 import {
+  checkDisclosureExpandedMatchesVisibility,
+  checkForcedColorsControlAffordance,
   checkMainLandmarkCount,
   checkNoPngDuringHealthyLoad,
+  checkStateIndicatorHasTextChannel,
   checkTranscriptButtonSemantics,
 } from "./frontend-accessibility.mjs";
 import {
@@ -1901,6 +1904,67 @@ test("checkNoPngDuringHealthyLoad rejects a single PNG transfer during a healthy
 
 test("checkNoPngDuringHealthyLoad accepts zero PNG transfers", () => {
   assert.equal(checkNoPngDuringHealthyLoad(0), true);
+});
+
+test("checkDisclosureExpandedMatchesVisibility rejects expanded=true with the region still hidden", () => {
+  assert.equal(
+    checkDisclosureExpandedMatchesVisibility({ expanded: true, regionHidden: true }),
+    false,
+  );
+});
+
+test("checkDisclosureExpandedMatchesVisibility rejects expanded=false with the region already shown", () => {
+  assert.equal(
+    checkDisclosureExpandedMatchesVisibility({ expanded: false, regionHidden: false }),
+    false,
+  );
+});
+
+test("checkDisclosureExpandedMatchesVisibility accepts expanded=true with the region shown", () => {
+  assert.equal(
+    checkDisclosureExpandedMatchesVisibility({ expanded: true, regionHidden: false }),
+    true,
+  );
+});
+
+test("checkDisclosureExpandedMatchesVisibility accepts expanded=false with the region hidden", () => {
+  assert.equal(
+    checkDisclosureExpandedMatchesVisibility({ expanded: false, regionHidden: true }),
+    true,
+  );
+});
+
+test("checkForcedColorsControlAffordance rejects an empty accessible name even at full size", () => {
+  assert.equal(
+    checkForcedColorsControlAffordance({ accessibleNameLength: 0, height: 44, width: 44 }),
+    false,
+  );
+});
+
+test("checkForcedColorsControlAffordance rejects a 43x44 control (just under the touch-target floor)", () => {
+  assert.equal(
+    checkForcedColorsControlAffordance({ accessibleNameLength: 5, height: 44, width: 43 }),
+    false,
+  );
+});
+
+test("checkForcedColorsControlAffordance accepts a named, exactly-44x44 control", () => {
+  assert.equal(
+    checkForcedColorsControlAffordance({ accessibleNameLength: 5, height: 44, width: 44 }),
+    true,
+  );
+});
+
+test("checkStateIndicatorHasTextChannel rejects an empty string (color-only state)", () => {
+  assert.equal(checkStateIndicatorHasTextChannel(""), false);
+});
+
+test("checkStateIndicatorHasTextChannel rejects whitespace-only text", () => {
+  assert.equal(checkStateIndicatorHasTextChannel("   \n\t"), false);
+});
+
+test("checkStateIndicatorHasTextChannel accepts real text naming the state", () => {
+  assert.equal(checkStateIndicatorHasTextChannel("Shaky"), true);
 });
 
 test("checkFrameIntervalP95 rejects 50.01ms, just over the 50ms budget", () => {

@@ -155,6 +155,43 @@ import {
  *   surfaces` and `--session-handoff --disclosure-scope all-live-content`
  *   together, the full item 1-5 contract this plan's acceptance criteria
  *   and `bun run validate` require.
+ *
+ * `A-31.4` (`docs/decisions/2026-08-23-plan-amendments.md`) closes four
+ * remaining acceptance loose ends, all inside `--owned-surfaces` and
+ * `--session-handoff` — no new mode flag:
+ *
+ * - (b) `checkSessionZoomSafety`: the 200%-zoom/320px overflow-clipping
+ *   story now also runs against the LIVE, agent-connected `/session`
+ *   surface (`checkZoomSafety` above still covers `/` alone), by resizing
+ *   the already-mounted session-handoff page rather than a fresh
+ *   navigation, so the real agent connection survives;
+ * - (c) a keyboard-only disclosure traversal on `/session`: Tab to the
+ *   "Show transcript" button, activate it with the keyboard, and assert
+ *   `aria-expanded` and the controlled region's `hidden` state flip
+ *   together, both ways (`checkDisclosureExpandedMatchesVisibility`). Since
+ *   that button is correctly `disabled` until a transcript exists, and this
+ *   no-secret harness's agent has no real audio/typed-answer round trip
+ *   that could ever produce one, `runSessionHandoffCheck` first injects one
+ *   wire-shape-valid `transcript_final` event directly onto the real,
+ *   already-open agent socket via a transparent `page.routeWebSocket`
+ *   passthrough (see its own doc comment for why, and for the separate,
+ *   out-of-scope `session_config` gap this works around);
+ * - (d) `sweepForcedColors`: the original single-`Tab` forced-colors outline
+ *   check is generalized into a bounded multi-stop sweep — under
+ *   `forced-colors: active`, every reached control keeps a visible focus
+ *   indicator AND its accessible name/44px touch-target footprint
+ *   (`checkForcedColorsControlAffordance`), and separately every visible
+ *   `[data-status]`/`[data-state]` element (concept mastery, the readiness
+ *   ladder, session status) keeps a non-empty text channel naming its state
+ *   (`checkStateIndicatorHasTextChannel`) — color alone must never be the
+ *   only carrier once forced-colors neutralizes a decorative distinction.
+ *   Runs on both `/` (from `checkKeyboardTraversal`) and `/session` (from
+ *   `runSessionHandoffCheck`);
+ * - (a)'s behavioral background-pause proof (drive `document.hidden` under
+ *   a fake rAF clock; assert both canvases' loops actually stop/resume
+ *   SCHEDULING frames) lives entirely in `apps/web/lib/viva-effects.test.ts`
+ *   and `apps/web/components/session/VoiceTraceCanvas.test.tsx` — no
+ *   change to this script.
  */
 
 /**
@@ -223,6 +260,45 @@ const ZOOM_TEXT_SCALE_VIEWPORT = { width: 320, height: 568, label: "320x568" };
 
 /** `FRONTEND-002` item 2's minimum actionable-target bounding box, in CSS px. */
 const TOUCH_TARGET_MIN_PX = 44;
+
+/**
+ * `A-31.4(c)`: the disclosure's `aria-expanded` state and its controlled
+ * region's `hidden` attribute must always disagree — expanded means shown,
+ * collapsed means hidden. Exclusive-or on the two booleans.
+ *
+ * @param {{ expanded: boolean, regionHidden: boolean }} input
+ */
+export function checkDisclosureExpandedMatchesVisibility(input) {
+  return input.expanded !== input.regionHidden;
+}
+
+/**
+ * `A-31.4(d)`: under forced-colors emulation, a reached focusable control
+ * must remain visible at the same touch-target floor and keep a real
+ * accessible name — proving neither a decorative icon nor a text label
+ * silently collapsed once forced-colors re-renders the page.
+ *
+ * @param {{ accessibleNameLength: number, width: number, height: number }} input
+ */
+export function checkForcedColorsControlAffordance(input) {
+  return (
+    input.accessibleNameLength > 0 &&
+    input.width >= TOUCH_TARGET_MIN_PX - 0.1 &&
+    input.height >= TOUCH_TARGET_MIN_PX - 0.1
+  );
+}
+
+/**
+ * `A-31.4(d)`: a status/state indicator whose meaning is carried in part by
+ * color must also carry a non-color channel — here, visible text naming
+ * that same state — so forced-colors (which can neutralize a purely
+ * decorative color distinction) never leaves the state silently unreadable.
+ *
+ * @param {string} accessibleText
+ */
+export function checkStateIndicatorHasTextChannel(accessibleText) {
+  return typeof accessibleText === "string" && accessibleText.trim().length > 0;
+}
 
 /**
  * The routes `--owned-surfaces` mounts. `/` is fully owned by this plan;
@@ -904,11 +980,219 @@ async function checkZoomSafety(browser, baseUrl) {
 }
 
 /**
+ * `A-31.4(b)`: the 200%-zoom/320px overflow-clipping story against the LIVE,
+ * agent-connected session surface — Frontend C3/C7's responsive-story matrix
+ * (rows 592/596/530) previously only ever ran against `/`. Resizes the
+ * ALREADY-MOUNTED `/session` page (never a fresh navigation, so the real
+ * agent connection survives) to 320x568, applies the same 200% root
+ * text-scale `checkZoomSafety` above uses, and asserts document horizontal
+ * overflow stays at most 1px and no visible session copy is clipped.
+ *
+ * @param {import("playwright").Page} page — an already-navigated, mounted /session page
+ */
+async function checkSessionZoomSafety(page) {
+  const failures = [];
+  await page.setViewportSize({
+    width: ZOOM_TEXT_SCALE_VIEWPORT.width,
+    height: ZOOM_TEXT_SCALE_VIEWPORT.height,
+  });
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("font-size", "200%", "important");
+  });
+  await page.waitForTimeout(100);
+  const report = await page.evaluate(() => {
+    const doc = document.documentElement;
+    const overflow = Math.max(0, doc.scrollWidth - doc.clientWidth);
+    const truncated = [];
+    const copyNodes = document.querySelectorAll(
+      ".session-consent__label, .session-consent__copy, .margin-note__title, .margin-note__text, " +
+        ".margin-note__next, .margin-note__hint, .written-answer__note, [aria-label]",
+    );
+    for (const el of copyNodes) {
+      const style = getComputedStyle(el);
+      const clippedHorizontally =
+        style.overflow === "hidden" ||
+        style.overflowX === "hidden" ||
+        style.textOverflow === "ellipsis";
+      if (clippedHorizontally && el.scrollWidth > el.clientWidth + 1) {
+        truncated.push(
+          (el.textContent ?? el.getAttribute("aria-label") ?? "").trim().slice(0, 80),
+        );
+      }
+    }
+    return { overflow, truncated };
+  });
+  if (report.overflow > 1) {
+    failures.push(
+      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] document horizontal ` +
+        `overflow is ${report.overflow}px, expected <= 1px`,
+    );
+  }
+  for (const text of report.truncated) {
+    failures.push(
+      `[/session @ ${ZOOM_TEXT_SCALE_VIEWPORT.label}, 200% text scale] copy is truncated: "${text}"`,
+    );
+  }
+  return failures;
+}
+
+/**
+ * `A-31.4(d)`: the forced-colors controls/meaningful-state sweep. The
+ * original Task 11 check only ever pressed one `Tab` and asserted the
+ * single resulting control kept an outline; this walks up to `maxTabs` real
+ * Tab presses under `forced-colors: active` emulation on an ALREADY-MOUNTED
+ * page (the caller navigates; this never does) and asserts, at every
+ * reached stop:
+ *
+ * 1. a visible focus indicator survives — the same settled outline/
+ *    box-shadow diff `checkKeyboardTraversal`'s normal-mode traversal below
+ *    uses, generalized from the first stop to every stop;
+ * 2. a real `button`/`[role=button]`/`a[href]` control keeps a non-empty
+ *    accessible name and its full 44px touch-target footprint, so neither a
+ *    decorative icon nor a text label silently collapsed once forced-colors
+ *    re-renders the page (`checkForcedColorsControlAffordance`).
+ *
+ * Separately, every visible element carrying meaning through
+ * `data-status`/`data-state` (concept mastery chips, the session readiness
+ * ladder, the pre-loop status line) must also carry a non-empty text
+ * channel naming that same state (`checkStateIndicatorHasTextChannel`) —
+ * forced-colors can neutralize a purely decorative color distinction, so a
+ * state that colour alone conveyed would otherwise go silently unreadable.
+ *
+ * Restores `forced-colors: none` before returning, whether or not
+ * any failure was found.
+ *
+ * @param {import("playwright").Page} page — an already-navigated, mounted page
+ * @param {string} routeLabel — for failure messages only, e.g. `"/"` or `"/session"`
+ * @param {{ maxTabs?: number }} [options]
+ */
+async function sweepForcedColors(page, routeLabel, { maxTabs = 20 } = {}) {
+  const failures = [];
+  await page.emulateMedia({ forcedColors: "active" });
+  try {
+    await page.evaluate(() => document.body.focus());
+    for (let i = 0; i < maxTabs; i++) {
+      await page.keyboard.press("Tab");
+      const info = await page.evaluate(async () => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return null;
+
+        // Same settled-snapshot technique as the normal-mode traversal
+        // below: a focus ring that changes on a CSS transition must not be
+        // read mid-transition, and an ambient decorative outline/box-shadow
+        // present regardless of focus must not count as "visible".
+        function snapshot(node) {
+          const style = getComputedStyle(node);
+          return {
+            outline:
+              style.outlineStyle === "none" ? "none" : `${style.outlineWidth}/${style.outlineStyle}`,
+            boxShadow: style.boxShadow,
+          };
+        }
+        async function settled() {
+          let previous = snapshot(el);
+          for (let attempt = 0; attempt < 32; attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 16));
+            const next = snapshot(el);
+            if (JSON.stringify(next) === JSON.stringify(previous)) return next;
+            previous = next;
+          }
+          return previous;
+        }
+        const focused = await settled();
+        el.blur();
+        const blurred = await settled();
+        el.focus();
+        const hasVisibleFocus = focused.outline !== blurred.outline || focused.boxShadow !== blurred.boxShadow;
+
+        const isControl = el.matches('button, [role="button"], a[href]');
+        const ariaLabel = el.getAttribute("aria-label");
+        const text = (el.textContent ?? "").trim();
+        const accessibleNameLength = (ariaLabel?.trim() || text).length;
+        const rect = el.getBoundingClientRect();
+
+        return {
+          tag: el.tagName.toLowerCase(),
+          className: typeof el.className === "string" ? el.className : "",
+          ariaLabel,
+          text: text.slice(0, 60),
+          hasVisibleFocus,
+          isControl,
+          accessibleNameLength,
+          width: rect.width,
+          height: rect.height,
+        };
+      });
+      if (!info) break;
+      const name = info.ariaLabel ?? info.text;
+      const selector = info.className ? `${info.tag}.${info.className.split(/\s+/).join(".")}` : info.tag;
+      if (!info.hasVisibleFocus) {
+        failures.push(
+          `[${routeLabel} keyboard, forced-colors: active] <${selector}> "${name}" has no visible ` +
+            "focus indicator under forced-colors emulation",
+        );
+      }
+      if (
+        info.isControl &&
+        !checkForcedColorsControlAffordance({
+          accessibleNameLength: info.accessibleNameLength,
+          width: info.width,
+          height: info.height,
+        })
+      ) {
+        failures.push(
+          `[${routeLabel} keyboard, forced-colors: active] <${selector}> "${name}" lost its control ` +
+            `affordance under forced-colors (accessible name length ${info.accessibleNameLength}, ` +
+            `measured ${Math.round(info.width * 100) / 100}x${Math.round(info.height * 100) / 100}px, ` +
+            `need a name and >= ${TOUCH_TARGET_MIN_PX}x${TOUCH_TARGET_MIN_PX}px)`,
+        );
+      }
+    }
+
+    const stateIndicators = await page.evaluate(() => {
+      function isVisible(el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const style = getComputedStyle(el);
+        if (style.visibility === "hidden" || style.display === "none") return false;
+        if (el.closest('[aria-hidden="true"], [hidden]')) return false;
+        return true;
+      }
+      const found = [];
+      for (const el of document.querySelectorAll("[data-status], [data-state]")) {
+        if (!isVisible(el)) continue;
+        found.push({
+          tag: el.tagName.toLowerCase(),
+          className: typeof el.className === "string" ? el.className : "",
+          state: el.getAttribute("data-status") ?? el.getAttribute("data-state"),
+          text: (el.textContent ?? "").trim(),
+        });
+      }
+      return found;
+    });
+    for (const item of stateIndicators) {
+      if (!checkStateIndicatorHasTextChannel(item.text)) {
+        const selector = item.className
+          ? `${item.tag}.${item.className.split(/\s+/).join(".")}`
+          : item.tag;
+        failures.push(
+          `[${routeLabel}, forced-colors: active] state indicator <${selector}> data-state="${item.state}" ` +
+            "has no text naming its state (color-only, unreadable once forced-colors neutralizes it)",
+        );
+      }
+    }
+  } finally {
+    await page.emulateMedia({ forcedColors: "none" });
+  }
+  return failures;
+}
+
+/**
  * `FRONTEND-002` item 5: keyboard `Tab` traversal from a fresh page reaches
  * the main hero action, a library Start/Resume action, and a delete
  * decision control, each with a visible `:focus` indicator (a non-`none`
- * outline or a `box-shadow`); under `forced-colors: active` emulation the
- * first focused control still carries an outline.
+ * outline or a `box-shadow`); `sweepForcedColors` then reruns the traversal
+ * under `forced-colors: active` emulation (`A-31.4(d)`).
  *
  * @param {import("playwright").Browser} browser
  * @param {string} baseUrl
@@ -1035,20 +1319,7 @@ async function checkKeyboardTraversal(browser, baseUrl) {
       );
     }
 
-    await page.emulateMedia({ forcedColors: "active" });
-    await page.evaluate(() => document.body.focus());
-    await page.keyboard.press("Tab");
-    const forcedColorsHasOutline = await page.evaluate(() => {
-      const el = document.activeElement;
-      if (!el || el === document.body) return false;
-      const style = getComputedStyle(el);
-      return style.outlineStyle !== "none" && style.outlineWidth !== "0px";
-    });
-    if (!forcedColorsHasOutline) {
-      failures.push(
-        "[/ keyboard, forced-colors: active] the first focused control has no outline under forced-colors emulation",
-      );
-    }
+    failures.push(...(await sweepForcedColors(page, "/")));
   } finally {
     await context.close();
   }
@@ -1093,6 +1364,13 @@ async function checkKeyboardTraversal(browser, baseUrl) {
  * evidence over `providerInputAllowed`, consumed at Task 12; this script
  * never re-derives a live-provider claim it cannot actually exercise.
  *
+ * `A-31.4` additions (see this file's own header doc comment for the full
+ * account): after the checks above, this same mounted, agent-connected page
+ * also runs (b) `checkSessionZoomSafety`, (c) a keyboard-only Tab-to/
+ * activate-with-Enter disclosure traversal (backed by one injected
+ * `transcript_final` event over `sessionSocketRoute`), and (d)
+ * `sweepForcedColors("/session")`.
+ *
  * @param {{ disclosureScope: "all-live-content" }} options
  */
 async function runSessionHandoffCheck({ disclosureScope }) {
@@ -1116,6 +1394,26 @@ async function runSessionHandoffCheck({ disclosureScope }) {
           const page = await context.newPage();
           try {
             await bypassCsp(page);
+            // `A-31.4(c)`: a transparent WS route so the keyboard-disclosure
+            // check below can inject one synthetic `transcript_final` event
+            // straight onto the real, already-open agent connection —
+            // `webSocketRoute.connectToServer()` with no `.onMessage`
+            // override on either side forwards every real frame in both
+            // directions unmodified, so this changes nothing about the rest
+            // of this check's real, agent-connected traffic. It exists
+            // because Plan 10's Transcript disclosure button is genuinely
+            // `disabled` (correctly — there is nothing yet to disclose)
+            // until a transcript exists, and this no-secret synthetic
+            // harness has no real audio/typed-answer round trip that can
+            // produce one (its first-frame `session_config` credential
+            // requirement is a separate, pre-existing, out-of-scope gap —
+            // confirmed empirically, not fixed here). `sessionSocketRoute`
+            // is populated once the page actually opens the agent socket.
+            let sessionSocketRoute;
+            await page.routeWebSocket(agent.wsUrl, (ws) => {
+              ws.connectToServer();
+              sessionSocketRoute = ws;
+            });
             const openedWebSocketUrls = [];
             let liveRuntimeObserved = null;
             page.on("websocket", (socket) => {
@@ -1278,6 +1576,110 @@ async function runSessionHandoffCheck({ disclosureScope }) {
                   "over providerInputAllowed for that closure.",
               );
             }
+
+            // `A-31.4(c)`: keyboard disclosure traversal on /session, in
+            // this same agent-connected mode. Plan 10's Transcript button is
+            // correctly `disabled` until a transcript exists, so this first
+            // injects one wire-shape-valid `transcript_final` event directly
+            // onto the real, already-open agent socket via
+            // `sessionSocketRoute` (see its declaration above for why: this
+            // harness has no real audio/typed-answer round trip that could
+            // produce one, and driving that round trip is blocked on a
+            // separate, pre-existing, out-of-scope gap in how this harness's
+            // unsigned fragment token reaches `session_config`, confirmed
+            // empirically, not fixed here). The reducer applies the injected
+            // event unconditionally: no real `question_started` ever set
+            // `activeResponseId` in this harness, so there is nothing for it
+            // to be stale against.
+            if (sessionSocketRoute) {
+              sessionSocketRoute.send(
+                JSON.stringify({
+                  type: "event",
+                  version: 5,
+                  event: {
+                    type: "transcript_final",
+                    response_id: "frontend-harness-transcript-probe",
+                    text: "Synthesized for the A-31.4(c) keyboard-disclosure proof.",
+                    confidence: null,
+                  },
+                }),
+              );
+            } else {
+              failures.push(
+                "expected a routed WebSocket to the real synthetic agent so the keyboard-disclosure " +
+                  "check could inject a transcript, but the page never opened one to route",
+              );
+            }
+
+            let reachedDisclosure = false;
+            for (let attempt = 0; attempt < 40 && !reachedDisclosure; attempt++) {
+              await page.keyboard.press("Tab");
+              reachedDisclosure = await page.evaluate(() => {
+                const el = document.activeElement;
+                return Boolean(
+                  el &&
+                    el.tagName === "BUTTON" &&
+                    (el.textContent ?? "").trim() === "Show transcript" &&
+                    el.hasAttribute("aria-controls"),
+                );
+              });
+              if (!reachedDisclosure) await page.waitForTimeout(50);
+            }
+            if (!reachedDisclosure) {
+              failures.push(
+                "/session keyboard: Tab order never reached an enabled 'Show transcript' " +
+                  "disclosure button within 40 presses (Plan 10 handoff, FRONTEND-002 item 5/" +
+                  "FRONTEND-006)",
+              );
+            } else {
+              const readDisclosureState = () =>
+                page.evaluate(() => {
+                  const el = document.activeElement;
+                  const region = document.getElementById(el.getAttribute("aria-controls"));
+                  return {
+                    expanded: el.getAttribute("aria-expanded") === "true",
+                    regionHidden: region ? region.hasAttribute("hidden") : true,
+                  };
+                });
+              const before = await readDisclosureState();
+              if (!checkDisclosureExpandedMatchesVisibility(before)) {
+                failures.push(
+                  `/session keyboard: before activation, aria-expanded=${before.expanded} but the ` +
+                    `controlled region hidden=${before.regionHidden} (they must disagree)`,
+                );
+              }
+              await page.keyboard.press("Enter");
+              await page.waitForTimeout(100);
+              const afterOpen = await readDisclosureState();
+              if (!afterOpen.expanded || !checkDisclosureExpandedMatchesVisibility(afterOpen)) {
+                failures.push(
+                  "/session keyboard: activating the disclosure with the keyboard did not expand " +
+                    `it (aria-expanded=${afterOpen.expanded}, region hidden=${afterOpen.regionHidden})`,
+                );
+              }
+              await page.keyboard.press("Enter");
+              await page.waitForTimeout(100);
+              const afterClose = await readDisclosureState();
+              if (afterClose.expanded || !checkDisclosureExpandedMatchesVisibility(afterClose)) {
+                failures.push(
+                  "/session keyboard: activating the disclosure a second time with the keyboard " +
+                    `did not collapse it again (aria-expanded=${afterClose.expanded}, region ` +
+                    `hidden=${afterClose.regionHidden})`,
+                );
+              }
+            }
+
+            // `A-31.4(d)`: forced-colors controls/meaningful-state sweep on
+            // the live session surface (the owned-surfaces half runs on `/`
+            // from `checkKeyboardTraversal`).
+            failures.push(...(await sweepForcedColors(page, "/session")));
+
+            // `A-31.4(b)`: the 200%-zoom/320px overflow-clipping story
+            // against the LIVE session surface, not just `/`. Resizes and
+            // reflows this same mounted page; must run last in this
+            // function since nothing after it depends on the 1280x720
+            // viewport or the disclosure's collapsed state.
+            failures.push(...(await checkSessionZoomSafety(page)));
           } finally {
             await context.close();
           }
