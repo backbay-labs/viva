@@ -659,6 +659,26 @@ describe("VoiceTraceCanvas effects budget", () => {
     expect(drawn).toBeLessThanOrEqual(66);
   });
 
+  // The test above drives 64 callbacks across two seconds — a 32 Hz stream
+  // against a 32 fps cap — so a loop with no budget at all also draws 64 and
+  // also passes. It pins the full-mode number the policy publishes, but it
+  // cannot see the gate. This sibling doubles the callback rate so the cap has
+  // something to cut: ungated the loop draws all 128. Mutation control M5
+  // deletes the gate; this test and the reduced-mode one fail, the test above
+  // does not.
+  test("holds the full-mode budget when callbacks arrive twice as fast as it", () => {
+    harness = createHarness();
+    harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
+    const baseline = harness.drawCount();
+
+    // 128 rAF callbacks across the same two seconds: 64 Hz in, 32 fps out.
+    harness.drainFrames(128, 2000 / 128);
+
+    const drawn = harness.drawCount() - baseline;
+    expect(drawn).toBeGreaterThanOrEqual(60);
+    expect(drawn).toBeLessThanOrEqual(68);
+  });
+
   test("caps drawing at the reduced-mode 24 fps budget", () => {
     harness = createHarness({ hardwareConcurrency: 2 });
     harness.mount(<VoiceTraceCanvas conceptNodes={[...conceptNodes]} state="listening" />);
