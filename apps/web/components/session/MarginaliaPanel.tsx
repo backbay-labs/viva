@@ -416,7 +416,7 @@ function RecapFold({
                 <span>
                   {item.intervalLabel} · {formatRecapDueDate(item.dueAt)} ·{" "}
                   <span className="recap-fold__authority" data-authority={item.authority}>
-                    {item.authority}
+                    {recapAuthorityLabel(item.authority)}
                   </span>
                 </span>
               </li>
@@ -569,6 +569,29 @@ function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["s
  * client-side scheduler that produced it: the authority rendered beside the date
  * is the projection's own.
  */
+/**
+ * The schedule authority the learner READS.
+ *
+ * `authority` is the projection's own display field and the raw D-01 identifier
+ * stays on `data-authority`, machine-readable, for any surface that needs to key
+ * off it. What sits beside the date is prose: `server_persisted_fsrs` is an
+ * engineering identifier, and a learner deciding whether to trust "Due Aug 29"
+ * needs to know it is Viva's SAVED plan rather than something recomputed while
+ * the page was being drawn. Same shape as the confidence and status labels above
+ * — a total switch over a closed union, no fallback string to drift.
+ *
+ * D-01 selected SERVER_PERSISTED_FSRS, so `ReviewScheduleAuthority` spells one
+ * authority and this switch has one arm. A second arm would be an artifact of a
+ * branch the program did not select; when another authority is ever selected,
+ * this stops compiling — which is the point.
+ */
+function recapAuthorityLabel(authority: SessionReviewPlanItem["authority"]): string {
+  switch (authority) {
+    case "server_persisted_fsrs":
+      return "Saved review schedule";
+  }
+}
+
 function formatRecapDueDate(dueAt: string): string {
   const parsed = new Date(dueAt);
   if (Number.isNaN(parsed.getTime())) return "Review date unavailable";

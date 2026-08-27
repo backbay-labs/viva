@@ -1450,6 +1450,18 @@ describe("local review dates and schedule authority (WEBSESSION-TASK10-LOCAL-DAT
     expect(markup).not.toContain("core FSRS");
     expect(markup).not.toContain("core_fsrs_read_time");
   });
+
+  test("the authority a learner READS is a label, not the D-01 enum identifier", () => {
+    const markup = renderReviewPlan("2026-08-29T09:00:00.000Z");
+
+    // The identifier stays machine-readable on the element that carries it…
+    expect(markup).toContain('data-authority="server_persisted_fsrs"');
+    // …and the text between the tags is prose a learner can act on. Stripping
+    // every tag is what proves the enum is not ALSO the visible label.
+    const visible = markup.replace(/<[^>]*>/g, " ");
+    expect(visible).not.toContain("server_persisted_fsrs");
+    expect(visible).toContain("Saved review schedule");
+  });
 });
 
 /**

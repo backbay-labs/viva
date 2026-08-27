@@ -2261,6 +2261,34 @@ describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-
     return toggle as HTMLButtonElement;
   }
 
+  /**
+   * Keyboard activation with the platform's OWN rule, because happy-dom does not
+   * synthesize it: on a native, enabled `<button>` the engine activates on
+   * `Enter` keydown and on `Space` keyup, and a handler that calls
+   * `preventDefault` on the keydown suppresses it.
+   *
+   * The precondition is ASSERTED, never assumed. That is what stops this helper
+   * from being a click in disguise: a control that regressed to
+   * `<details>`/`<summary>`, to a `div[role="button"]`, or to a disabled button
+   * gets no synthetic activation here, so the test that drives it fails instead
+   * of passing on an activation the real key would never have produced.
+   */
+  function pressKey(element: Element, key: "Enter" | " "): void {
+    if (element.tagName !== "BUTTON") {
+      throw new Error(
+        `Enter/Space activation is native to <button>; this control is <${element.tagName.toLowerCase()}>`,
+      );
+    }
+    const button = element as HTMLButtonElement;
+    if (button.disabled) return;
+    const down = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key });
+    button.dispatchEvent(down);
+    const up = new KeyboardEvent("keyup", { bubbles: true, cancelable: true, key });
+    button.dispatchEvent(up);
+    if (down.defaultPrevented) return;
+    button.click();
+  }
+
   test("renders exactly one main landmark and one skip link into the turn stage", async () => {
     const controller = programmableController();
     const clock = createFakeReconnectClock(0);
@@ -2365,6 +2393,125 @@ describe("LiveSessionPage terminal recap, landmarks, and transcript (WEBSESSION-
     expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("false");
     // Focus stays on the control that was activated, never lost to the document.
     expect(document.activeElement === transcriptToggle(container)).toBe(true);
+  });
+
+  test("the transcript disclosure opens on Enter and closes on Space", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountSession(controller, clock);
+
+    await act(async () => {
+      controller.push({
+        ready: READY_FRAME,
+        status: "open",
+        transcript: "NADH donates electrons.",
+      });
+    });
+    await step(clock);
+
+    const region = () => container.querySelector("#live-session-transcript");
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("false");
+
+    // Enter, on the keyboard path a screen-reader user actually takes.
+    await act(async () => {
+      transcriptToggle(container).focus();
+      pressKey(transcriptToggle(container), "Enter");
+    });
+    expect(transcriptToggle(container).textContent).toContain("Hide transcript");
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("true");
+    expect(region()?.hasAttribute("hidden")).toBe(false);
+    expect(region()?.textContent).toContain("NADH donates electrons.");
+
+    // Space, which activates on key-UP rather than key-down.
+    await act(async () => {
+      pressKey(transcriptToggle(container), " ");
+    });
+    expect(transcriptToggle(container).textContent).toContain("Show transcript");
+    expect(transcriptToggle(container).getAttribute("aria-expanded")).toBe("false");
+    expect(region()?.hasAttribute("hidden")).toBe(true);
+    // The keyboard never loses its place: focus is still on the control.
+    expect(document.activeElement === transcriptToggle(container)).toBe(true);
+  });
+
+  /**
+   * A DOM that can actually capture.
+   *
+   * Without these two capabilities `startMic` short-circuits at its
+   * "unsupported" guard before it ever asks for a capture source, which makes
+   * "no capture happened" true for a reason that has nothing to do with the
+   * session being over. Installing them is what puts the terminal gate on the
+   * only path that can stop a post-recap gesture.
+   */
+  function installCaptureCapableDom(): () => void {
+    const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    const audioWindow = window as unknown as { AudioContext?: unknown };
+    const hadAudioContext = "AudioContext" in audioWindow;
+    const originalAudioContext = audioWindow.AudioContext;
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: async () => ({}) },
+    });
+    audioWindow.AudioContext = class {};
+    return () => {
+      if (originalMediaDevices) {
+        Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+      } else {
+        Reflect.deleteProperty(navigator, "mediaDevices");
+      }
+      if (hadAudioContext) {
+        audioWindow.AudioContext = originalAudioContext;
+      } else {
+        Reflect.deleteProperty(audioWindow, "AudioContext");
+      }
+    };
+  }
+
+  test("no gesture reopens the microphone once the recap has landed", async () => {
+    const restoreDom = installCaptureCapableDom();
+    try {
+      const controller = programmableController();
+      const clock = createFakeReconnectClock(0);
+      const captures: number[] = [];
+      const { container } = await mountSession(controller, clock, {
+        createAudioCaptureSource: (async () => {
+          captures.push(1);
+          throw new Error("no capture device in this test DOM");
+        }) as LiveSessionPageDependencies["createAudioCaptureSource"],
+        createAudioPlaybackSink: recordingPlayback().factory,
+      });
+
+      await act(async () => {
+        controller.push({ ready: READY_FRAME, status: "open" });
+      });
+      await step(clock);
+
+      // Acknowledging the disclosure is itself the gesture, and BEFORE the recap
+      // it reaches the capture source. That is the control: the gate this test
+      // is about is the only thing that closes afterwards.
+      const acknowledge = [...container.querySelectorAll("button")].find(
+        (button) => button.textContent?.trim() === "Acknowledge",
+      );
+      await act(async () => {
+        acknowledge?.click();
+      });
+      await step(clock);
+      expect(captures).toEqual([1]);
+
+      await act(async () => {
+        controller.push({ recap: COMPLETE_RECAP_STATE, ready: READY_FRAME, status: "open" });
+      });
+      await step(clock);
+
+      // The recap released the capture, so nothing but the terminal state stands
+      // between a later gesture and a live microphone.
+      await act(async () => {
+        window.dispatchEvent(new Event("pointerdown"));
+      });
+      await step(clock);
+      expect(captures).toEqual([1]);
+    } finally {
+      restoreDom();
+    }
   });
 
   test("a complete recap leaves only the approved next-session action", async () => {

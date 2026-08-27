@@ -882,7 +882,12 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // A session that has said its last word releases the retained turn: the bytes
   // can no longer be admitted, so holding them would be a false promise.
   const sessionTerminal = Boolean(agentRecapState) || agentTerminalReason !== undefined;
-  sessionTerminalRef.current = sessionTerminal;
+  // Mirrored in an effect, not during render: the ref is read from a gesture
+  // callback that runs after commit, so a committed value is the honest one —
+  // and a render-phase write would publish a state React may still discard.
+  useEffect(() => {
+    sessionTerminalRef.current = sessionTerminal;
+  }, [sessionTerminal]);
   useEffect(() => {
     if (!sessionTerminal) return;
     if (!agentRef.current.getRetainedAudioTurn()) return;
@@ -1484,8 +1489,16 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   // `session_completed` state, whose authority is a durable store event. That
   // statement is what lets success copy outrank a terminal phase or a transport
   // close that lands after the recap.
-  const sessionCompletion: { recapPersisted: true } | undefined =
-    agent.derived.recapState?.kind === "complete" ? { recapPersisted: true } : undefined;
+  //
+  // It is memoised on the BOOLEAN, not rebuilt per render: a fresh object
+  // literal in the runtime memo's dependency array would make that memo
+  // recompute on every render for the whole life of a completed session,
+  // defeating the memo it was added to.
+  const recapPersisted = agent.derived.recapState?.kind === "complete";
+  const sessionCompletion = useMemo<{ recapPersisted: true } | undefined>(
+    () => (recapPersisted ? { recapPersisted: true } : undefined),
+    [recapPersisted],
+  );
   // `WEBSESSION-READY-01` Step 3: the poll owner counts and bounds; the
   // projection decides what a bounded run may say and where the count renders.
   const boundedReadinessFailures = readinessPollBounded(readinessFailures)
