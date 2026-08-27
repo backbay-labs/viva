@@ -18,25 +18,31 @@ import {
 } from "../../lib/viva-audio-capture";
 import { projectTrace } from "../../lib/viva-session-projection";
 import {
+  answerSurfaceAvailable,
   browserLifecycleReconnectPlan,
   browserSessionReconnectReason,
   canStartMicrophoneCapture,
   captureLevelForBloom,
+  citationChallengeTarget,
   createLiveAudioTurnDriver,
   createOpaqueAudioTurnId,
   derivedStateWithProjectedRecap,
+  disclosureAcknowledgementKey,
   drainAgentAudio,
   enterTextAnswerMode,
   isCurrentBrowserLifecycleAttempt,
+  isRenewableBrowserSessionCredential,
   isSessionOver,
   type LiveAudioTurnSeam,
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
-  refreshBrowserSessionToken,
+  providerInputAllowed,
+  readinessPollBounded,
+  readinessPollFailureCount,
   resetPlaybackCancellationStateForGeneration,
+  resolveEntrySessionCredential,
   sameBrowserSessionRouteIdentity,
   sessionRouteWsAccessToken,
-  shouldRefreshBrowserSessionToken,
   shouldShowNoSpeechNudge,
   shouldStopReadinessPolling,
   shouldUseLiveMicAudioTransport,
@@ -45,6 +51,8 @@ import {
   submitSpokenCaptureTurn,
   textAnswerPayload,
   textAnswerStateForSession,
+  typedAnswerUnresolved,
+  VIVA_AGENT_READINESS_FAILURE_LIMIT,
 } from "./LiveSessionPage";
 
 describe("drainAgentAudio", () => {
@@ -152,6 +160,91 @@ describe("shouldStopReadinessPolling", () => {
       true,
     );
   });
+
+  test("stops polling when the authenticated projection failed", () => {
+    // There is no session to become ready FOR: a failed projection means the
+    // page renders its pre-loop shell and will never open a socket, so a poll
+    // is work nothing can consume.
+    expect(
+      shouldStopReadinessPolling({
+        projectionFailed: true,
+        ready: false,
+        recap: undefined,
+        status: "connecting",
+      }),
+    ).toBe(true);
+    expect(
+      shouldStopReadinessPolling({
+        projectionFailed: false,
+        ready: false,
+        recap: undefined,
+        status: "connecting",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("answerSurfaceAvailable (WEBSESSION-TERMINAL-01)", () => {
+  test("a terminal session offers no answer surface, however healthy the socket looks", () => {
+    expect(answerSurfaceAvailable({ sessionTerminal: false, websocketReady: true })).toBe(true);
+    // A recap can land while the socket is still open and ready; the answer
+    // surface must go with the turn loop, not with the transport.
+    expect(answerSurfaceAvailable({ sessionTerminal: true, websocketReady: true })).toBe(false);
+    expect(answerSurfaceAvailable({ sessionTerminal: false, websocketReady: false })).toBe(false);
+    expect(answerSurfaceAvailable({ sessionTerminal: true, websocketReady: false })).toBe(false);
+  });
+});
+
+describe("microphone gating after a terminal session (WEBSESSION-TERMINAL-01)", () => {
+  const allowed = {
+    captureStarted: false,
+    consentAcknowledged: true,
+    liveProvider: false,
+    textAnswerMode: false,
+  } as const;
+
+  test("a session that said its last word takes no more microphone audio", () => {
+    expect(canStartMicrophoneCapture({ ...allowed })).toBe(true);
+    expect(canStartMicrophoneCapture({ ...allowed, sessionTerminal: false })).toBe(true);
+    // A recap or a terminal reason closes the turn loop: opening the microphone
+    // after it would record audio no turn can ever carry.
+    expect(canStartMicrophoneCapture({ ...allowed, sessionTerminal: true })).toBe(false);
+    // …and it outranks every other affordance, acknowledged consent included.
+    expect(
+      canStartMicrophoneCapture({
+        ...allowed,
+        consentAcknowledged: true,
+        liveProvider: true,
+        sessionTerminal: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("readinessPollFailureCount (WEBSESSION-READY-01)", () => {
+  test("counts consecutive unavailable polls and resets on an observed one", () => {
+    expect(readinessPollFailureCount(0, { status: "api_missing" })).toBe(0);
+    expect(readinessPollFailureCount(2, { apiBaseUrl: "u", error: "e", status: "offline" })).toBe(
+      3,
+    );
+    expect(
+      readinessPollFailureCount(3, {
+        apiBaseUrl: "u",
+        health: {} as never,
+        healthHttpStatus: 200,
+        ready: {} as never,
+        readyHttpStatus: 200,
+        status: "observed",
+      }),
+    ).toBe(0);
+  });
+
+  test("surfaces the bounded state only after three consecutive failures", () => {
+    expect(VIVA_AGENT_READINESS_FAILURE_LIMIT).toBe(3);
+    expect(readinessPollBounded(2)).toBe(false);
+    expect(readinessPollBounded(3)).toBe(true);
+    expect(readinessPollBounded(4)).toBe(true);
+  });
 });
 
 describe("browserSessionReconnectReason", () => {
@@ -219,10 +312,8 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: { headline: "done" },
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "open",
-        userId: "user-1",
       }),
     ).toEqual({ action: "skip_session_over" });
   });
@@ -243,15 +334,13 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: { headline: "done" },
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "closed",
-        userId: "user-1",
       }),
     ).toEqual({ action: "reload" });
   });
 
-  test("refreshes spent session tokens before same-identity lifecycle reconnects", () => {
+  test("renews the rotating credential before a same-identity lifecycle reconnect", () => {
     expect(
       browserLifecycleReconnectPlan({
         currentRouteIdentity: {
@@ -267,20 +356,60 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: undefined,
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "open",
-        userId: "user-1",
       }),
-    ).toEqual({
-      action: "refresh_session_token",
-      sessionId: "session-1",
-      sessionToken: "spent-token",
-      userId: "user-1",
-    });
+    ).toEqual({ action: "renew_credential" });
   });
 
-  test("reloads instead of refreshing a same-identity closed voice session", () => {
+  test("carries no credential material in the plan itself", () => {
+    const plan = browserLifecycleReconnectPlan({
+      currentRouteIdentity: {
+        sessionId: "session-1",
+        sessionToken: "viva1.spent-access-token",
+        studySetId: "study-set-1",
+        userId: "user-1",
+      },
+      nextRouteIdentity: {
+        sessionId: "session-1",
+        sessionToken: null,
+        studySetId: "study-set-1",
+        userId: "user-1",
+      },
+      recap: undefined,
+      renewable: true,
+      status: "open",
+    });
+
+    // A plan that cannot name a token cannot replay a spent one as renewal
+    // authority: D-07 Branch A's authority is the rotating refresh credential.
+    expect(JSON.stringify(plan)).not.toContain("viva1.");
+    expect(Object.keys(plan)).toEqual(["action"]);
+  });
+
+  test("falls back to a plain socket retry when no rotating credential exists", () => {
+    expect(
+      browserLifecycleReconnectPlan({
+        currentRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: "direct-entry-token",
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        nextRouteIdentity: {
+          sessionId: "session-1",
+          sessionToken: null,
+          studySetId: "study-set-1",
+          userId: "user-1",
+        },
+        recap: undefined,
+        renewable: false,
+        status: "open",
+      }),
+    ).toEqual({ action: "socket_retry" });
+  });
+
+  test("reloads instead of renewing a same-identity closed voice session", () => {
     expect(
       browserLifecycleReconnectPlan({
         currentRouteIdentity: {
@@ -296,10 +425,8 @@ describe("browserSessionReconnectReason", () => {
           userId: "user-1",
         },
         recap: undefined,
-        sessionId: "session-1",
-        sessionToken: "spent-token",
+        renewable: true,
         status: "closed",
-        userId: "user-1",
       }),
     ).toEqual({ action: "reload" });
   });
@@ -320,7 +447,28 @@ describe("isSessionOver", () => {
   });
 });
 
-describe("sessionRouteWsAccessToken", () => {
+describe("entry credential precedence (WEBSESSION-AUTH-01)", () => {
+  const identity = {
+    sessionId: "voice-session-9",
+    sessionToken: "viva1.access-from-url",
+    studySetId: "thermo-401",
+    userId: "user-9",
+  } as const;
+
+  const vaultCredential = {
+    accessToken: "viva1.access-from-vault",
+    identity: {
+      sessionId: "voice-session-9",
+      studySetId: "thermo-401",
+      userId: "user-9",
+    },
+    mode: "retain-token-only",
+    refreshExpiresAt: Date.parse("2026-08-26T12:00:00Z"),
+    refreshToken: "viva-refresh1.credential-r1",
+    revision: 3,
+    sessionAbsoluteExpiresAt: Date.parse("2026-08-26T20:00:00Z"),
+  } as const;
+
   test("uses the signed route session token as the direct WebSocket access credential", () => {
     expect(sessionRouteWsAccessToken({ sessionToken: " viva1.signed-session-token " })).toBe(
       "viva1.signed-session-token",
@@ -328,62 +476,63 @@ describe("sessionRouteWsAccessToken", () => {
     expect(sessionRouteWsAccessToken({ sessionToken: null })).toBeUndefined();
   });
 
-  test("refreshes complete route session identities before socket connection", async () => {
-    const calls: Array<{ input: string; init?: RequestInit }> = [];
-    const token = await refreshBrowserSessionToken(
-      {
-        sessionId: "server-session",
-        sessionToken: "viva1.expired-route-token",
-        studySetId: "biology-midterm",
-        userId: "user-1",
-      },
-      (async (input: RequestInfo | URL, init?: RequestInit) => {
-        calls.push({ input: String(input), init });
-        return new Response(JSON.stringify({ session_token: "viva1.fresh-route-token" }), {
-          headers: { "content-type": "application/json" },
-          status: 200,
-        });
-      }) as typeof fetch,
-    );
-
-    expect(shouldRefreshBrowserSessionToken({ sessionToken: "viva1.only-token" })).toBe(false);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.input).toBe("/api/viva-session/refresh");
-    expect(new Headers(calls[0]?.init?.headers).get("content-type")).toBe("application/json");
-    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
-      session_id: "server-session",
-      session_token: "viva1.expired-route-token",
-      study_set_id: "biology-midterm",
-      user_id: "user-1",
-    });
-    expect(token).toBe("viva1.fresh-route-token");
+  test("an identity-matched vault credential outranks the URL access token", () => {
+    expect(resolveEntrySessionCredential({ identity, vaultCredential })).toBe(vaultCredential);
   });
 
-  test("falls back to the original route token when refresh cannot run", async () => {
-    const calls: string[] = [];
-    const missingIdentityToken = await refreshBrowserSessionToken(
-      { sessionToken: " viva1.route-token " },
-      (async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return new Response("{}", { status: 500 });
-      }) as typeof fetch,
-    );
-    const failedRefreshToken = await refreshBrowserSessionToken(
-      {
-        sessionId: "server-session",
-        sessionToken: "viva1.route-token",
-        studySetId: "biology-midterm",
-        userId: "user-1",
+  test("a vault credential for another session is ignored, not merged", () => {
+    const resolved = resolveEntrySessionCredential({
+      identity,
+      vaultCredential: {
+        ...vaultCredential,
+        identity: { ...vaultCredential.identity, sessionId: "voice-session-other" },
       },
-      (async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return new Response("{}", { status: 401 });
-      }) as typeof fetch,
-    );
+    });
 
-    expect(missingIdentityToken).toBe("viva1.route-token");
-    expect(failedRefreshToken).toBe("viva1.route-token");
-    expect(calls).toEqual(["/api/viva-session/refresh"]);
+    expect(resolved?.accessToken).toBe("viva1.access-from-url");
+    expect(isRenewableBrowserSessionCredential(resolved)).toBe(false);
+  });
+
+  test("a URL access token alone is a nonrenewable direct entry", () => {
+    const resolved = resolveEntrySessionCredential({ identity, vaultCredential: null });
+
+    expect(resolved).toEqual({
+      accessToken: "viva1.access-from-url",
+      identity: {
+        sessionId: "voice-session-9",
+        studySetId: "thermo-401",
+        userId: "user-9",
+      },
+      mode: "retain-token-only",
+      refreshExpiresAt: null,
+      refreshToken: null,
+      revision: 0,
+      sessionAbsoluteExpiresAt: null,
+    });
+    expect(isRenewableBrowserSessionCredential(resolved)).toBe(false);
+  });
+
+  test("an incomplete route identity resolves no credential at all", () => {
+    expect(
+      resolveEntrySessionCredential({
+        identity: { ...identity, studySetId: null },
+        vaultCredential,
+      }),
+    ).toBeNull();
+    expect(
+      resolveEntrySessionCredential({
+        identity: { ...identity, sessionToken: null },
+        vaultCredential: null,
+      }),
+    ).toBeNull();
+  });
+
+  test("only a rotating refresh credential makes a credential renewable", () => {
+    expect(isRenewableBrowserSessionCredential(vaultCredential)).toBe(true);
+    expect(isRenewableBrowserSessionCredential({ ...vaultCredential, refreshToken: null })).toBe(
+      false,
+    );
+    expect(isRenewableBrowserSessionCredential(null)).toBe(false);
   });
 });
 
@@ -659,8 +808,9 @@ describe("LiveSessionPage recap cleanup", () => {
     const derived: VivaAgentDerivedState = {
       canSubmitAnswer: true,
       conceptStatuses: {},
-      errors: [],
+      diagnostics: [],
       manuscriptIntents: [],
+      structuredErrors: [],
       phase: "recap",
       recap: staleRawRecap,
       sources: [],
@@ -910,7 +1060,14 @@ describe("live audio turn driver", () => {
     }
   });
 
-  test("cancels a submitted turn that is still awaiting acceptance", () => {
+  /**
+   * `WEBSESSION-AUDIO-01`, cancel-after-submit. Once `audio_end` is on the wire
+   * the assembly belongs to the server, so a plain cancel must NOT fall back to
+   * the awaiting turn id: doing so scoped a `cancel` at an assembly the server
+   * had already consumed, and it also threw away bytes the recovery path still
+   * needs for an idempotent replay.
+   */
+  test("a plain cancel never targets a turn whose audio_end already went out", () => {
     const { calls, seam } = recordingSeam();
     const driver = createLiveAudioTurnDriver({
       controller: seam,
@@ -919,10 +1076,43 @@ describe("live audio turn driver", () => {
     driver.captureFrame(frame(960));
     driver.submit();
 
-    expect(driver.cancel()).toBe(true);
+    expect(driver.cancel()).toBe(false);
 
-    expect(calls.at(-1)).toEqual({ kind: "cancel", turnId: "turn-h" });
+    expect(calls.filter((call) => call.kind === "cancel")).toEqual([]);
+    // The submitted turn stays claimed so a later ack can release it and a later
+    // capture callback cannot open a second concurrent input turn.
+    expect(driver.isAwaitingAcceptance()).toBe(true);
+    expect(driver.captureFrame(frame(960))).toEqual({
+      chunk: null,
+      end: null,
+      ignored: "awaiting_acceptance",
+    });
+  });
+
+  test("an explicit discard releases the submitted turn through the controller", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-h2"),
+    });
+    driver.captureFrame(frame(960));
+    driver.submit();
+
+    expect(driver.cancel({ discardSubmitted: true })).toBe(true);
+
+    expect(calls.at(-1)).toEqual({ kind: "cancel", turnId: "turn-h2" });
     expect(driver.isAwaitingAcceptance()).toBe(false);
+  });
+
+  test("a discard with nothing submitted or open is a no-op", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-h3"),
+    });
+
+    expect(driver.cancel({ discardSubmitted: true })).toBe(false);
+    expect(calls).toEqual([]);
   });
 
   test("ignores empty and odd-byte capture callbacks without opening a turn", () => {
@@ -962,6 +1152,32 @@ describe("live audio turn driver", () => {
     expect(errors).toEqual(["audio_queue_limit:Audio turn exceeds the maximum retained turn size"]);
     expect(errors.join(" ")).not.toContain("ESIz");
     expect(driver.getTurn()).toBe(null);
+  });
+
+  test("typed content stays unresolved across an ambiguous close and is never auto-resent", () => {
+    // Submitted, socket lost mid-turn: no final transcript, no submittable turn.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: false,
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(true);
+    // The server advanced the turn: the answer is resolved, not pending.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: false,
+        finalTranscript: "NADH donates electrons",
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(false);
+    // A fresh submittable turn means the previous one is no longer in flight.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: true,
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(false);
+    expect(typedAnswerUnresolved({ canSubmitAnswer: false })).toBe(false);
   });
 
   test("mints opaque turn ids that carry no learner material", () => {
@@ -1110,3 +1326,180 @@ class FakeLiveCaptureSource implements VivaAudioCaptureSource {
     });
   }
 }
+
+/**
+ * `WEBSESSION-DISCLOSURE-01` under the recorded D-08 Branch A
+ * (`all_live_provider_content`) and `WEBSESSION-INTENT-01`'s stale-target guard.
+ */
+describe("live disclosure scope and typed intent targeting", () => {
+  test("D-08 Branch A gates typed answers and citation challenges, not just the mic", () => {
+    const inputs = ["microphone_audio", "typed_answer", "citation_challenge"] as const;
+
+    for (const input of inputs) {
+      expect({
+        allowed: providerInputAllowed({
+          acknowledged: false,
+          input,
+          liveProvider: true,
+          scope: "all_live_provider_content",
+        }),
+        input,
+      }).toEqual({ allowed: false, input });
+
+      expect({
+        allowed: providerInputAllowed({
+          acknowledged: true,
+          input,
+          liveProvider: true,
+          scope: "all_live_provider_content",
+        }),
+        input,
+      }).toEqual({ allowed: true, input });
+    }
+  });
+
+  test("the unselected Branch B remains executable and gates microphone audio only", () => {
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "typed_answer",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "citation_challenge",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "microphone_audio",
+        liveProvider: true,
+        scope: "microphone_audio_only",
+      }),
+    ).toBe(false);
+  });
+
+  test("a non-live provider keeps its labelled behavior, but the mic still needs acknowledgment", () => {
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "typed_answer",
+        liveProvider: false,
+        scope: "all_live_provider_content",
+      }),
+    ).toBe(true);
+    expect(
+      providerInputAllowed({
+        acknowledged: false,
+        input: "microphone_audio",
+        liveProvider: false,
+        scope: "all_live_provider_content",
+      }),
+    ).toBe(false);
+  });
+
+  test("the acknowledgment key is scoped to branch, study set, and voice session", () => {
+    expect(
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+    ).toBe("viva:disclosure:v1:all_live_provider_content:thermo-401:voice-session-9");
+    // A different scope, study set, or session is a DIFFERENT key, so none of
+    // them can inherit another's acknowledgment.
+    const keys = new Set([
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "microphone_audio_only",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "other-set",
+        voiceSessionId: "voice-session-9",
+      }),
+      disclosureAcknowledgementKey({
+        scope: "all_live_provider_content",
+        studySetId: "thermo-401",
+        voiceSessionId: "voice-session-10",
+      }),
+    ]);
+    expect(keys.size).toBe(4);
+  });
+
+  test("microphone eligibility is decided by providerInputAllowed and nothing else", () => {
+    // Unacknowledged: refused under BOTH branches, live or not.
+    for (const scope of ["all_live_provider_content", "microphone_audio_only"] as const) {
+      for (const liveProvider of [true, false]) {
+        expect({
+          allowed: canStartMicrophoneCapture({
+            captureStarted: false,
+            consentAcknowledged: false,
+            liveProvider,
+            scope,
+            textAnswerMode: false,
+          }),
+          liveProvider,
+          scope,
+        }).toEqual({ allowed: false, liveProvider, scope });
+      }
+    }
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
+        liveProvider: true,
+        scope: "all_live_provider_content",
+        textAnswerMode: false,
+      }),
+    ).toBe(true);
+    // Lifecycle guards still apply on top of the disclosure gate.
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: true,
+        consentAcknowledged: true,
+        textAnswerMode: false,
+      }),
+    ).toBe(false);
+    expect(
+      canStartMicrophoneCapture({
+        captureStarted: false,
+        consentAcknowledged: true,
+        textAnswerMode: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("a citation challenge targets only the response and source that are still current", () => {
+    expect(
+      citationChallengeTarget({
+        currentResponseId: "response-2",
+        currentSourceId: "src-lecture-5-slide-18",
+      }),
+    ).toEqual({
+      response_id: "response-2",
+      source_id: "src-lecture-5-slide-18",
+      kind: "citation_challenge",
+    });
+    // The response moved on: there is no honest target left, so the challenge is
+    // disabled rather than re-aimed at a different response.
+    expect(
+      citationChallengeTarget({ currentResponseId: undefined, currentSourceId: "src-1" }),
+    ).toBeNull();
+    expect(
+      citationChallengeTarget({ currentResponseId: "response-2", currentSourceId: undefined }),
+    ).toBeNull();
+  });
+});

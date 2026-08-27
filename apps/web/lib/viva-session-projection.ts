@@ -8,6 +8,8 @@ import {
   type SourceReference,
   VIVA_LEARNER_LOOP_CONTRACT,
   type VivaReadyFrame,
+  type VivaServerError,
+  type VivaVoiceTermination,
 } from "@viva/core";
 import type {
   ChecklistItem,
@@ -20,8 +22,14 @@ import type { VivaAgentDerivedState } from "./use-viva-agent-session";
 import type {
   VivaAgentCloseDiagnostics,
   VivaAgentConnectionStatus,
+  VivaAgentDeferredTurn,
+  VivaAgentDiagnostic,
   VivaAgentReadinessProbe,
   VivaAgentReadyEndpoint,
+  VivaAgentRecapState,
+  VivaAgentReconnectState,
+  VivaAgentRetainedAudioTurn,
+  VivaAgentStructuredError,
 } from "./viva-agent-client";
 
 /**
@@ -68,6 +76,13 @@ export type VoiceTurnCaption = {
 export type VoiceTurnNudge = {
   label: string;
   text: string;
+  /**
+   * A-27.2 (`WEBSESSION-DEFERRED-01`): the question the SERVER marked retryable,
+   * present only on a deferral nudge whose `can_retry_same_question` was true.
+   * It is a record of what the server said, never a target the browser binds a
+   * control to — the surface carrying it has no control at all.
+   */
+  retryQuestionId?: string;
 };
 
 export type VoiceTurnTakingState = {
@@ -101,6 +116,13 @@ export type RuntimeCopy = {
   primaryActionIntent: RuntimePrimaryActionIntent;
   primaryActionDisabled: boolean;
   primaryActionLabel: string;
+  /**
+   * `WEBSESSION-READY-01` Step 3: how many CONSECUTIVE readiness polls have
+   * failed to observe the agent, once that run has passed the poll owner's own
+   * bound — `null` while it has not. The poll owner counts and bounds; this is
+   * the number the readiness status element renders beside the readiness copy.
+   */
+  readinessBoundedFailures: number | null;
   readinessNotes: RuntimeReadinessNote[];
   statusLabel: string;
   cause: RuntimeCopyCause;
@@ -121,7 +143,32 @@ export type RuntimeReadinessNote = {
 
 export type RuntimeMicState = "available" | "denied" | "unsupported" | "unknown";
 
-type RuntimeProjectionContext = {
+/**
+ * `WEBSESSION-TERMINAL-01`: how a session ENDED, as a first-class projection
+ * input rather than something inferred from transport state deep inside the
+ * outcome switch.
+ *
+ * `completion.recapPersisted` is the page's statement that an authorized,
+ * complete `recap_ready` was parsed and retained — Plan 04's `session_completed`
+ * state, whose authority is a durable store event. It is what licenses success
+ * copy to outrank a terminal phase that lands after the recap: the learner's
+ * session finished, and calling it "drained" or "interrupted" would be false.
+ */
+export type RuntimeCompletionProjectionInputs = {
+  recap?: VivaAgentRecapState;
+  completion?: { recapPersisted: true };
+  termination?: VivaVoiceTermination;
+  reconnectState: VivaAgentReconnectState;
+};
+
+type RuntimeProjectionContext = RuntimeCompletionProjectionInputs & {
+  /**
+   * The poll owner's bound, already applied: a count once three consecutive
+   * polls have failed to observe the agent, `null` before that. The projection
+   * does not own the threshold — the single poll lifecycle does — it owns what
+   * a bounded run is allowed to say and where the count is rendered.
+   */
+  boundedReadinessFailures: number | null;
   readiness: AgentStudySetReadiness;
   readinessProbe?: VivaAgentReadinessProbe;
   ready?: VivaReadyFrame | VivaAgentReadyEndpoint;
@@ -129,6 +176,7 @@ type RuntimeProjectionContext = {
   status: VivaAgentConnectionStatus;
   mic: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
   terminalReason?: AgentTerminalSessionReason;
 };
 
@@ -193,60 +241,118 @@ export function conceptStatusColor(status: ConceptStatus): { r: number; g: numbe
 }
 
 export function projectRuntimeCopy({
+  boundedReadinessFailures = null,
   readiness,
   ready,
   status,
-  errors = [],
+  completion,
+  deferredTurn,
+  diagnostics = [],
+  lastServerError,
   mic = "unknown",
   close,
+  pendingTypedAnswer = false,
   readinessProbe,
+  recap,
+  reconnect,
+  retainedAudioTurn,
+  structuredErrors = [],
+  termination,
   terminalReason,
 }: {
+  boundedReadinessFailures?: number | null;
   readiness: AgentStudySetReadiness;
   ready?: VivaReadyFrame;
   readinessProbe?: VivaAgentReadinessProbe;
   status: VivaAgentConnectionStatus;
-  errors?: string[];
+  completion?: { recapPersisted: true };
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
   mic?: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  pendingTypedAnswer?: boolean;
+  recap?: VivaAgentRecapState;
+  reconnect?: VivaAgentReconnectState;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  termination?: VivaVoiceTermination;
   terminalReason?: AgentTerminalSessionReason;
 }): RuntimeCopy {
-  const rawNewestError = errors.at(-1) ?? "";
-  const rawCloseReason = close?.reason ?? "";
-  const newestError = sanitizeRuntimeDiagnostic(rawNewestError);
-  const closeReason = sanitizeRuntimeDiagnostic(rawCloseReason);
-  const diagnosticText = `${rawNewestError} ${rawCloseReason}`;
-  const authFailed = /auth|token|claim|unauthori[sz]ed/i.test(diagnosticText);
   const endpointReady = readinessProbe?.status === "observed" ? readinessProbe.ready : undefined;
   const readinessFacts = ready ?? endpointReady;
   const context: RuntimeProjectionContext = {
+    boundedReadinessFailures,
     mic,
     close,
+    completion,
     readiness,
     readinessProbe,
     ready: readinessFacts,
+    recap,
+    reconnectState: reconnect ?? { attempts: 0, kind: "idle" },
+    retainedAudioTurn,
     status,
+    termination,
     terminalReason,
     websocketReady: Boolean(ready) && status === "open",
   };
+
+  // `WEBSESSION-TERMINAL-01`: a session that has SAID ITS LAST WORD outranks
+  // every transport, terminal, and recovery fact.
+  //
+  // A completed session is one the page has seen persisted (`recapPersisted`)
+  // AND holds a complete recap for — either half alone is not a completion. A
+  // partial recap carries its own terminal reason plus a usable artifact, so it
+  // too outranks the bare terminal copy, which would hide that artifact.
+  if (completion?.recapPersisted === true && recap?.kind === "complete") {
+    return runtimeCopyFromOutcome(completedSessionOutcome(), context);
+  }
+  if (recap?.kind === "partial") {
+    return runtimeCopyFromOutcome(partialRecapOutcome(recap.partialReason), context);
+  }
 
   if (terminalReason) {
     return controlledTerminalCopy(terminalReason, context);
   }
 
-  if (authFailed) {
-    return runtimeCopy(
-      {
-        capsuleLabel: "Auth failed",
-        marginaliaTitle: "Agent unavailable: auth failed.",
-        marginaliaText:
-          "The Conductor auth failed for this session identity; refresh the signed session before the manuscript opens another question.",
-        statusLabel: "Auth failed",
-        cause: "auth_failed",
-      },
-      context,
-      { disabled: false, intent: "refresh_session", nextActionLabel: "Refresh session" },
-    );
+  // Recap copy always outranks recovery copy: a session that has already said
+  // its last word is never described as "Reconnecting…".
+  if (recap) {
+    const recapOutcome = projectVoiceOutcomeCopy({ recap });
+    if (recapOutcome) return runtimeCopyFromOutcome(recapOutcome, context);
+  }
+
+  // `WEBSESSION-READY-01` Step 3: a readiness run that has passed its bound is
+  // stated, not smoothed over. Recovery copy would otherwise answer three
+  // straight unobservable polls with "Reopening the session." — a reassuring
+  // sentence about a socket that has nothing to reopen — so while the bound
+  // holds and no readiness facts exist, the readiness-unavailable copy below is
+  // what the learner reads. Nothing above this line yields: a recap, a terminal
+  // phase, and a completed session are all still the session's last word.
+  //
+  // `!readinessFacts` is also what guarantees the ladder keeps the sanitized
+  // unavailable NOTE: no readiness facts means no live ready frame, so
+  // `probeContradictsLiveReady` cannot suppress the offline probe's own note.
+  const boundedReadinessUnavailable = boundedReadinessFailures !== null && !readinessFacts;
+  if (!boundedReadinessUnavailable) {
+    const recovery = projectRecoveryCopy({ pendingTypedAnswer, reconnect, retainedAudioTurn });
+    if (recovery) return runtimeCopyFromOutcome(recovery, context);
+  }
+
+  // The ONE typed outcome switch. Auth, protocol, service, and transport copy is
+  // derived from Plan 05's codes — never from a regex over diagnostic text, and
+  // never from a close-reason string (there is no longer one to read).
+  const outcome = projectVoiceOutcomeCopy({
+    deferredTurn,
+    diagnostics,
+    lastServerError,
+    recap,
+    structuredErrors,
+    termination,
+  });
+  if (outcome && outcome.scope === "session" && outcome.cause !== "turn_deferred") {
+    return runtimeCopyFromOutcome(outcome, context);
   }
 
   if (!readiness.canConnect) {
@@ -308,8 +414,7 @@ export function projectRuntimeCopy({
           : "Agent unavailable: service offline.",
         marginaliaText: connecting
           ? "The manuscript has not received provider readiness from the Conductor yet."
-          : newestError ||
-            "The `/ws` stream closed before provider readiness reached the manuscript.",
+          : "The `/ws` stream closed before provider readiness reached the manuscript.",
         statusLabel: connecting ? "connecting" : "agent offline",
         cause: "agent_offline",
       },
@@ -318,27 +423,12 @@ export function projectRuntimeCopy({
     );
   }
 
-  if (newestError && (status === "error" || status === "closed")) {
-    return runtimeCopy(
-      {
-        capsuleLabel: "Agent unavailable",
-        marginaliaTitle: "Agent unavailable: session rejected.",
-        marginaliaText: newestError,
-        statusLabel: "session rejected",
-        cause: "agent_offline",
-      },
-      context,
-      retryAgentAction(),
-    );
-  }
-
   if (status === "closed" && close && !context.websocketReady && isUnexpectedClose(close)) {
-    const reason = closeReason ? ` Reason: ${closeReason}.` : "";
     return runtimeCopy(
       {
         capsuleLabel: "Session interrupted",
         marginaliaTitle: "Session interrupted before the manuscript closed.",
-        marginaliaText: `The WebSocket closed with code ${close.code} before the Conductor sent a terminal phase.${reason} Retry the agent or share the close details with a developer.`,
+        marginaliaText: `The WebSocket closed with code ${close.code} before the Conductor sent a terminal phase. Retry the agent or share the close code with a developer.`,
         statusLabel: "unexpected close",
         cause: "unexpected_close",
       },
@@ -496,6 +586,380 @@ export function projectRuntimeCopy({
   );
 }
 
+/**
+ * `WEBSESSION-PROTOCOL-01` / `WEBSESSION-RECAP-01` / `WEBSESSION-DEFERRED-01`:
+ * the ONE total switch from Plan 05's typed voice outcome onto safe learner copy.
+ *
+ * Every branch derives its words from a CODE — a `VivaVoiceTermination.kind`, a
+ * diagnostic code, a typed server-error code, a recap discriminant, or a
+ * deferral's own boolean. Nothing here reads a message, a close-reason string, a
+ * socket status, or a provider name, so no peer-authored text can steer copy.
+ *
+ * `scope` separates a SESSION capsule (which replaces the live runtime capsule)
+ * from a TURN affordance (which sits beside it): a deferred turn is not a
+ * session outcome, and `turn_deferred` is deliberately a local literal rather
+ * than a fabricated `RuntimeCopyCause`.
+ */
+export type VoiceOutcomeCopy = Readonly<{
+  scope: "session" | "turn";
+  capsuleLabel: string;
+  marginaliaTitle: string;
+  marginaliaText: string;
+  statusLabel: string;
+  cause: RuntimeCopyCause | "turn_deferred";
+  action: Readonly<{
+    disabled: boolean;
+    intent: RuntimePrimaryActionIntent;
+    nextActionLabel: string;
+    primaryActionLabel?: string;
+  }>;
+  retryQuestionId?: string;
+}>;
+
+function runtimeCopyFromOutcome(
+  outcome: VoiceOutcomeCopy,
+  context: RuntimeProjectionContext,
+): RuntimeCopy {
+  return runtimeCopy(
+    {
+      capsuleLabel: outcome.capsuleLabel,
+      cause: outcome.cause as RuntimeCopyCause,
+      marginaliaText: outcome.marginaliaText,
+      marginaliaTitle: outcome.marginaliaTitle,
+      statusLabel: outcome.statusLabel,
+    },
+    context,
+    outcome.action,
+  );
+}
+
+/**
+ * `WEBSESSION-RECOVERY-01` Step 6. Recovery copy is truthful about WHERE the
+ * learner's spoken answer is: while a turn is retained it says so, and it never
+ * claims the server received a turn the browser has not seen acknowledged.
+ */
+export function projectRecoveryCopy(input: {
+  pendingTypedAnswer?: boolean;
+  reconnect?: VivaAgentReconnectState;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
+}): VoiceOutcomeCopy | null {
+  const reconnect = input.reconnect;
+  if (!reconnect || reconnect.kind === "idle") return null;
+  const retained = input.retainedAudioTurn
+    ? " Your spoken answer is retained on this device for retry."
+    : "";
+
+  if (reconnect.kind === "exhausted") {
+    return {
+      // Typed content is NEVER auto-resent after an ambiguous close: the answer
+      // stays visible and the learner reconnects and retries it deliberately.
+      action: {
+        disabled: false,
+        intent: "retry_agent",
+        nextActionLabel: input.pendingTypedAnswer ? "Reconnect and retry answer" : "Reconnect",
+      },
+      capsuleLabel: "Connection lost",
+      cause: "unexpected_close",
+      marginaliaText: `Viva could not reopen this session after three attempts.${retained}`,
+      marginaliaTitle: "The connection to the Conductor was lost.",
+      scope: "session",
+      statusLabel: "connection lost",
+    };
+  }
+
+  // Scheduled, refreshing, and connecting are all one learner-visible state, and
+  // the retry control is DISABLED throughout it so a second attempt cannot be
+  // stacked on the one already running.
+  return {
+    action: { disabled: true, intent: "disabled", nextActionLabel: "Reconnecting…" },
+    capsuleLabel: "Reconnecting…",
+    cause: "session_disconnected",
+    marginaliaText: `Viva is reopening this session; nothing was graded from the interrupted turn.${retained}`,
+    marginaliaTitle: "Reopening the session.",
+    scope: "session",
+    statusLabel: "reconnecting",
+  };
+}
+
+export function projectVoiceOutcomeCopy(input: {
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  recap?: VivaAgentRecapState;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  termination?: VivaVoiceTermination;
+}): VoiceOutcomeCopy | null {
+  // 1. A recap is the session's own last word and outranks every transport fact.
+  if (input.recap?.kind === "complete") return completedSessionOutcome();
+  if (input.recap?.kind === "partial") return partialRecapOutcome(input.recap.partialReason);
+
+  // 2. A terminal structured error states its reason; a recoverable one is
+  //    deliberately NOT a session outcome and never replaces the live capsule.
+  const terminalStructured = (input.structuredErrors ?? [])
+    .filter((entry) => entry.terminality === "terminal")
+    .at(-1);
+  if (terminalStructured?.terminality === "terminal") {
+    return terminalOutcome(terminalStructured.terminalReason);
+  }
+
+  if (input.termination) return terminationOutcome(input.termination);
+  if (input.lastServerError) return serverErrorOutcome(input.lastServerError);
+
+  // 3. A deferral is a turn affordance. Retryability comes from the server's
+  //    boolean; the reason string is never read to decide it and never shown.
+  if (input.deferredTurn) return deferredTurnOutcome(input.deferredTurn);
+
+  const diagnostic = (input.diagnostics ?? []).at(-1);
+  if (diagnostic) return rejectedFrameOutcome();
+  return null;
+}
+
+/**
+ * A-27.2 (`WEBSESSION-DEFERRED-01`): the deferral's DISPLAY-ONLY surface.
+ *
+ * `deferredTurnOutcome` authored this copy from the first day and nothing ever
+ * rendered it, so an ungraded turn was silent on screen — the learner watched an
+ * answer disappear with no account of it. This lifts those same words into the
+ * turn panel's nudge slot (the "TURN affordance which sits beside it" the switch
+ * above names) and deliberately DROPS the outcome's `action`: there is no
+ * client-side retry control of any kind, because answering again IS the retry
+ * and the server's progression cursor — never the browser — decides which
+ * question an answer binds to.
+ *
+ * Precedence is not re-decided here, it is reused: the one outcome switch above
+ * already ranks a recap, a terminal structured error, a termination, and a typed
+ * server error above a deferral. `terminalReason` is the single addition,
+ * because the runtime ladder ranks it above the switch itself. A session that
+ * has said its last word never also tells the learner a turn is waiting.
+ */
+export function projectDeferredTurnNudge({
+  deferredTurn,
+  diagnostics,
+  lastServerError,
+  recap,
+  structuredErrors,
+  terminalReason,
+  termination,
+}: {
+  deferredTurn?: VivaAgentDeferredTurn;
+  diagnostics?: readonly VivaAgentDiagnostic[];
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  recap?: VivaAgentRecapState;
+  structuredErrors?: readonly VivaAgentStructuredError[];
+  terminalReason?: AgentTerminalSessionReason;
+  termination?: VivaVoiceTermination;
+}): VoiceTurnNudge | undefined {
+  if (terminalReason) return undefined;
+  const outcome = projectVoiceOutcomeCopy({
+    deferredTurn,
+    diagnostics,
+    lastServerError,
+    recap,
+    structuredErrors,
+    termination,
+  });
+  if (outcome?.cause !== "turn_deferred" || outcome.scope !== "turn") return undefined;
+  return {
+    // The guidance the server's boolean already selected leads, and the reason
+    // sentence explains it. Neither string is rewritten, recomposed, or chosen
+    // here, and the deferral's own `reason` token reaches neither of them.
+    label: outcome.action.nextActionLabel,
+    retryQuestionId: outcome.retryQuestionId,
+    text: outcome.marginaliaText,
+  };
+}
+
+function terminationOutcome(termination: VivaVoiceTermination): VoiceOutcomeCopy {
+  switch (termination.kind) {
+    case "terminal":
+      return terminalOutcome(termination.terminalReason);
+    case "auth":
+      return authOutcome(termination.retryable);
+    case "protocol":
+    case "service":
+      return rejectedFrameOutcome();
+    case "normal":
+      return cleanCloseOutcome();
+    case "transport":
+      return interruptedOutcome();
+    default: {
+      // Adding a `VivaVoiceTermination.kind` without adding copy for it is a
+      // compile error, not a silent fall-through to generic wording.
+      const exhaustive: never = termination;
+      return exhaustive;
+    }
+  }
+}
+
+function serverErrorOutcome(error: Pick<VivaServerError, "code" | "retryable">): VoiceOutcomeCopy {
+  if (error.code === "VOICE_AUTH_EXPIRED") return authOutcome(true);
+  if (
+    error.code === "VOICE_AUTH_INVALID" ||
+    error.code === "VOICE_AUTH_IDENTITY_MISMATCH" ||
+    error.code === "VOICE_AUTH_REPLAYED"
+  ) {
+    return authOutcome(false);
+  }
+  return rejectedFrameOutcome();
+}
+
+function completedSessionOutcome(): VoiceOutcomeCopy {
+  const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+    (candidate) => candidate.id === "session_completed",
+  );
+  if (!state) {
+    return {
+      action: {
+        disabled: false,
+        intent: "start_session",
+        nextActionLabel: "Start a new session",
+      },
+      capsuleLabel: "Session complete",
+      cause: "recap_success",
+      marginaliaText: "Viva saved the recap for this session.",
+      marginaliaTitle: "Session recap ready.",
+      scope: "session",
+      statusLabel: "session complete",
+    };
+  }
+  return {
+    action: {
+      disabled: state.copy.primary_action_intent === "disabled",
+      intent: state.copy.primary_action_intent,
+      nextActionLabel: state.copy.next_action_label,
+      primaryActionLabel: state.copy.primary_action_label,
+    },
+    capsuleLabel: state.copy.capsule_label,
+    cause: state.runtime_copy_causes[0] ?? "recap_success",
+    marginaliaText: state.copy.marginalia_text,
+    marginaliaTitle: state.copy.marginalia_title,
+    scope: "session",
+    statusLabel: state.copy.status_label,
+  };
+}
+
+/**
+ * A partial recap ends the session for the reason the server named AND leaves a
+ * usable artifact behind. The terminal reason's approved contract copy is used
+ * verbatim; the one added sentence is this lane's own fixed text, never anything
+ * the server wrote.
+ */
+function partialRecapOutcome(reason: AgentTerminalSessionReason): VoiceOutcomeCopy {
+  const terminal = terminalOutcome(reason);
+  return {
+    ...terminal,
+    marginaliaText: `${terminal.marginaliaText} The session ended with a usable partial recap you can still review.`,
+  };
+}
+
+function terminalOutcome(reason: AgentTerminalSessionReason): VoiceOutcomeCopy {
+  const state = VIVA_LEARNER_LOOP_CONTRACT.states.find(
+    (candidate) => candidate.terminal_reason === reason,
+  );
+  if (!state) {
+    return {
+      action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+      capsuleLabel: "Session closed",
+      cause: reason as RuntimeCopyCause,
+      marginaliaText: "The Conductor emitted a terminal phase for this manuscript.",
+      marginaliaTitle: "The session closed.",
+      scope: "session",
+      statusLabel: reason.replaceAll("_", " "),
+    };
+  }
+  return {
+    action: {
+      disabled: state.copy.primary_action_intent === "disabled",
+      intent: state.copy.primary_action_intent,
+      nextActionLabel: state.copy.next_action_label,
+      primaryActionLabel: state.copy.primary_action_label,
+    },
+    capsuleLabel: state.copy.capsule_label,
+    cause: state.runtime_copy_causes[0] ?? (reason as RuntimeCopyCause),
+    marginaliaText: state.copy.marginalia_text,
+    marginaliaTitle: state.copy.marginalia_title,
+    scope: "session",
+    statusLabel: state.copy.status_label,
+  };
+}
+
+/**
+ * Only `VOICE_AUTH_EXPIRED` is renewable, so only it offers the renewal action.
+ * Invalid, identity-mismatched, and replayed credentials are not refreshable and
+ * must never present a button that pretends they are.
+ */
+function authOutcome(renewable: boolean): VoiceOutcomeCopy {
+  return {
+    action: renewable
+      ? { disabled: false, intent: "refresh_session", nextActionLabel: "Refresh session" }
+      : { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Auth failed",
+    cause: "auth_failed",
+    marginaliaText: renewable
+      ? "The signed session auth failed for this identity; renew it before the manuscript opens another question."
+      : "The signed session auth failed for this identity and cannot be renewed; start the session again.",
+    marginaliaTitle: "Agent unavailable: auth failed.",
+    scope: "session",
+    statusLabel: "Auth failed",
+  };
+}
+
+function rejectedFrameOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Agent unavailable",
+    cause: "agent_offline",
+    marginaliaText:
+      "The Conductor and the manuscript disagreed about a frame on this session, so the manuscript stopped rather than render an unverified turn.",
+    marginaliaTitle: "Agent unavailable: session rejected.",
+    scope: "session",
+    statusLabel: "session rejected",
+  };
+}
+
+function cleanCloseOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Session closed",
+    cause: "session_disconnected",
+    marginaliaText:
+      "The Conductor closed this session cleanly without a recap; reconnect to open a new one.",
+    marginaliaTitle: "The session closed.",
+    scope: "session",
+    statusLabel: "session closed",
+  };
+}
+
+function interruptedOutcome(): VoiceOutcomeCopy {
+  return {
+    action: { disabled: false, intent: "retry_agent", nextActionLabel: "Retry agent" },
+    capsuleLabel: "Session interrupted",
+    cause: "unexpected_close",
+    marginaliaText:
+      "The connection dropped before the Conductor sent a terminal phase. Retry the agent; nothing was graded from the interrupted turn.",
+    marginaliaTitle: "Session interrupted before the manuscript closed.",
+    scope: "session",
+    statusLabel: "unexpected close",
+  };
+}
+
+function deferredTurnOutcome(deferred: VivaAgentDeferredTurn): VoiceOutcomeCopy {
+  return {
+    action: deferred.canRetrySameQuestion
+      ? { disabled: false, intent: "submit_turn", nextActionLabel: "Retry this question" }
+      : { disabled: true, intent: "disabled", nextActionLabel: "Wait for the next question" },
+    capsuleLabel: "Turn not graded",
+    cause: "turn_deferred",
+    marginaliaText: deferred.canRetrySameQuestion
+      ? "Viva could not grade that turn, so nothing was recorded against this concept. Answer the same question again when you are ready."
+      : "Viva could not grade that turn, so nothing was recorded against this concept. The Conductor will move on.",
+    marginaliaTitle: "That turn was not graded.",
+    retryQuestionId: deferred.canRetrySameQuestion ? deferred.questionId : undefined,
+    scope: "turn",
+    statusLabel: "turn not graded",
+  };
+}
+
 function controlledTerminalCopy(
   reason: AgentTerminalSessionReason,
   context: RuntimeProjectionContext,
@@ -543,6 +1007,7 @@ function runtimeCopy(
     | "primaryActionDisabled"
     | "primaryActionIntent"
     | "primaryActionLabel"
+    | "readinessBoundedFailures"
     | "readinessNotes"
   >,
   context: RuntimeProjectionContext,
@@ -559,19 +1024,11 @@ function runtimeCopy(
     primaryActionDisabled: action.disabled,
     primaryActionIntent: action.intent ?? (action.disabled ? "disabled" : "submit_turn"),
     primaryActionLabel: action.primaryActionLabel ?? action.nextActionLabel,
+    // The bound describes the READINESS RUN, not the branch that won the copy,
+    // so it travels with every projection rather than only the offline one.
+    readinessBoundedFailures: context.boundedReadinessFailures,
     readinessNotes: runtimeReadinessNotes(context, copy.cause),
   };
-}
-
-function sanitizeRuntimeDiagnostic(value: string): string {
-  if (
-    /pcm16_base64|answer_text|transcript|prompt|source_context|pasted_text|session_token|viva1\.|bearer|cartesia_api_key|gemini_api_key|secret|raw answer|source excerpt/i.test(
-      value,
-    )
-  ) {
-    return "sanitized provider error";
-  }
-  return value;
 }
 
 function isUnexpectedClose(close: VivaAgentCloseDiagnostics): boolean {
@@ -668,11 +1125,23 @@ function runtimeReadinessNotes(
     });
   }
 
+  if (context.retainedAudioTurn) {
+    // The turn id is a correlation handle, not learner material, and it is
+    // deliberately NOT rendered: the note states only that bytes are held here.
+    notes.push({
+      label: "Retained answer",
+      state: "blocked",
+      text: "One spoken answer is held on this device until the Conductor accepts it.",
+    });
+  }
+
   if (context.close) {
+    // Code and cleanliness only. The peer's close-reason string is not part of
+    // `VivaAgentCloseDiagnostics` any more, so there is nothing here to leak.
     notes.push({
       label: "Close",
       state: context.close.wasClean ? "blocked" : "unavailable",
-      text: `code ${context.close.code}; ${context.close.wasClean ? "clean" : "unclean"}${context.close.reason ? `; ${context.close.reason}` : ""}.`,
+      text: `code ${context.close.code}; ${context.close.wasClean ? "clean" : "unclean"}.`,
     });
   }
 
@@ -1088,6 +1557,7 @@ function terminalReasonWithoutRecap(derived: VivaAgentDerivedState): boolean {
 }
 
 export function projectTurnTakingState(input: {
+  deferredTurnNudge?: VoiceTurnNudge;
   hasPendingAudio?: boolean;
   interruptAcknowledged?: boolean;
   playbackSpeaking?: boolean;
@@ -1107,6 +1577,11 @@ export function projectTurnTakingState(input: {
   });
   const interruptAcknowledged = base.phase === "listening" && Boolean(input.interruptAcknowledged);
   const nudge = turnNudge({
+    // A-27.2: the deferral is bounded by the SAME listening gate the other two
+    // nudges use. While the learner has a turn open, an ungraded answer is the
+    // thing to say; once they have answered again — or the session moved on —
+    // the panel states that instead of a turn outcome that is no longer current.
+    deferredTurnNudge: base.phase === "listening" ? input.deferredTurnNudge : undefined,
     interruptAcknowledged,
     textAnswerFallbackActive: base.phase === "listening" && input.textAnswerFallbackActive,
   });
@@ -1241,9 +1716,13 @@ function turnCaptions(question: Question): VoiceTurnCaption[] {
 }
 
 function turnNudge(input: {
+  deferredTurnNudge?: VoiceTurnNudge;
   interruptAcknowledged: boolean;
   textAnswerFallbackActive?: boolean;
 }): VoiceTurnNudge | undefined {
+  // A-27.2: an ungraded turn is a fact about the learner's OWN answer, so it
+  // outranks the two transient nudges, which only describe the current moment.
+  if (input.deferredTurnNudge) return input.deferredTurnNudge;
   if (input.interruptAcknowledged) {
     return {
       label: "Interruption acknowledged",

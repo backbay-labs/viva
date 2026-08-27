@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   base64ToPcm16LeBytes,
   chunkPcm16LeBytes,
   createBrowserVivaAudioCaptureSource,
   createStreamingFloat32Resampler,
+  createVivaAntiAliasedDownsampler,
+  createVivaAntiAliasLowPass,
   float32ToPcm16Base64Frames,
   float32ToPcm16Base64FramesAtSampleRate,
   float32ToPcm16LeBytes,
@@ -422,7 +424,7 @@ describe("streaming Float32 resampler", () => {
     );
   });
 
-  test("streaming capture reuses one resampler across every worklet callback", () => {
+  test("streaming capture reuses one rate converter across every worklet callback", () => {
     const source = new FakeAudioCaptureSource(48_000);
     const emitted: number[] = [];
     const capture = startVivaPcm16StreamingCapture({
@@ -439,14 +441,56 @@ describe("streaming Float32 resampler", () => {
     }
     capture.end();
 
+    // The reference is the whole lifecycle converter — WSC-M07's anti-alias
+    // stage AND Plan 03's rational-phase resampler — pushed ONCE. Streaming the
+    // same audio through irregular callbacks must be byte-identical to it, which
+    // is only true if BOTH halves keep their state across callbacks.
     const expected = float32ToPcm16LeBytes(
-      createStreamingFloat32Resampler(48_000, VIVA_AUDIO_SAMPLE_RATE_HZ).push(
+      createVivaAntiAliasedDownsampler(48_000, VIVA_AUDIO_SAMPLE_RATE_HZ).push(
         tone.subarray(0, offset),
       ),
     );
 
     expect(emitted.length).toBe(expected.length);
     expect(emitted).toEqual(Array.from(expected));
+  });
+
+  test("the anti-alias stage is length-preserving, stateful, and skipped when native", () => {
+    // Length preservation is what keeps Plan 03's exact output count intact.
+    const filter = createVivaAntiAliasLowPass(48_000, TARGET_RATE_HZ);
+    if (!filter) throw new Error("expected an anti-alias stage for 48 kHz capture");
+    for (const size of [1, 127, 128, 511, 7, 2048, 333]) {
+      expect(filter.push(new Float32Array(size).fill(0.25)).length).toBe(size);
+    }
+
+    // A native-rate (or upsampling) capture has nothing to band-limit, so the
+    // converter it gets is Plan 03's, unwrapped and byte-identical.
+    expect(createVivaAntiAliasLowPass(TARGET_RATE_HZ, TARGET_RATE_HZ)).toBe(null);
+    expect(createVivaAntiAliasLowPass(16_000, TARGET_RATE_HZ)).toBe(null);
+    const nativeSamples = toneSamples(TARGET_RATE_HZ, 0.01);
+    expect(
+      Array.from(
+        createVivaAntiAliasedDownsampler(TARGET_RATE_HZ, TARGET_RATE_HZ).push(nativeSamples),
+      ),
+    ).toEqual(Array.from(nativeSamples));
+
+    // Resetting between callbacks re-introduces the boundary artefact the stage
+    // exists to avoid, so per-block state must NOT match the continuous stream.
+    const continuous = createVivaAntiAliasLowPass(48_000, TARGET_RATE_HZ);
+    const perBlock = createVivaAntiAliasLowPass(48_000, TARGET_RATE_HZ);
+    if (!continuous || !perBlock) throw new Error("expected an anti-alias stage");
+    const tone = toneSamples(48_000, 0.02);
+    const continuousBlocks: Float32Array[] = [];
+    const perBlockBlocks: Float32Array[] = [];
+    for (let offset = 0; offset < tone.length; offset += 128) {
+      const block = tone.subarray(offset, Math.min(offset + 128, tone.length));
+      continuousBlocks.push(continuous.push(block));
+      perBlock.reset();
+      perBlockBlocks.push(perBlock.push(block));
+    }
+    expect(
+      firstMismatchIndex(concatFloat32(continuousBlocks), concatFloat32(perBlockBlocks)),
+    ).not.toBe(-1);
   });
 });
 
@@ -749,3 +793,505 @@ class FakeAudioWorkletNode {
     } as MessageEvent);
   }
 }
+
+/**
+ * `WEBSESSION-CAPTURE-01` Steps 2-3 — partial construction is a complete release.
+ *
+ * Browser capture builds five resources in sequence (context, worklet module URL,
+ * microphone stream, media-stream source node, worklet node) and then connects
+ * them. A throw at ANY of those points must leave the machine in the same state
+ * as a never-started capture: the microphone light off, the context closed, the
+ * object URL revoked once, and no listener able to deliver a later frame.
+ */
+describe("browser capture construction cleanup (WEBSESSION-CAPTURE-01)", () => {
+  type ReleaseLog = string[];
+
+  class TrackedMediaStream {
+    readonly tracks: Array<{ stop: () => void; stopCount: number }>;
+    constructor(private readonly log: ReleaseLog) {
+      this.tracks = [0, 1].map((index) => {
+        const track = {
+          stop: () => {
+            track.stopCount += 1;
+            this.log.push(`track-${index}.stop`);
+          },
+          stopCount: 0,
+        };
+        return track;
+      });
+    }
+    getTracks() {
+      return this.tracks;
+    }
+  }
+
+  class TrackedMediaDevices {
+    readonly stream: TrackedMediaStream;
+    added = 0;
+    removed = 0;
+    #listener: (() => void) | null = null;
+    constructor(private readonly log: ReleaseLog) {
+      this.stream = new TrackedMediaStream(log);
+    }
+    async getUserMedia() {
+      return this.stream;
+    }
+    addEventListener(event: string, listener: () => void) {
+      if (event !== "devicechange") return;
+      this.added += 1;
+      this.#listener = listener;
+    }
+    removeEventListener(event: string, listener: () => void) {
+      if (event !== "devicechange" || this.#listener !== listener) return;
+      this.removed += 1;
+      this.#listener = null;
+      this.log.push("devicechange.remove");
+    }
+    dispatchDeviceChange() {
+      this.#listener?.();
+    }
+    listenerAttached() {
+      return this.#listener !== null;
+    }
+  }
+
+  class TrackedSourceNode {
+    disconnectCount = 0;
+    connectCount = 0;
+    constructor(
+      private readonly log: ReleaseLog,
+      private readonly failConnect: boolean,
+      private readonly failDisconnect: boolean,
+    ) {}
+    connect() {
+      this.connectCount += 1;
+      if (this.failConnect) throw new Error("source connect failed");
+    }
+    disconnect() {
+      this.disconnectCount += 1;
+      this.log.push("source.disconnect");
+      if (this.failDisconnect) throw new Error("source disconnect failed");
+    }
+  }
+
+  class TrackedContext {
+    readonly audioWorklet = {
+      modules: [] as string[],
+      addModule: async (url: string) => {
+        this.audioWorklet.modules.push(url);
+      },
+    };
+    readonly destination = {};
+    closeCount = 0;
+    readonly source: TrackedSourceNode;
+    constructor(
+      readonly sampleRate: number,
+      private readonly log: ReleaseLog,
+      private readonly failures: CaptureFailures,
+    ) {
+      this.source = new TrackedSourceNode(
+        log,
+        failures.sourceConnect === true,
+        failures.sourceDisconnect === true,
+      );
+    }
+    createMediaStreamSource() {
+      if (this.failures.createMediaStreamSource) throw new Error("createMediaStreamSource failed");
+      return this.source;
+    }
+    async close() {
+      this.closeCount += 1;
+      this.log.push("context.close");
+      if (this.failures.contextClose) throw new Error("context close failed");
+    }
+  }
+
+  type CaptureFailures = {
+    contextClose?: boolean;
+    createMediaStreamSource?: boolean;
+    processorConnect?: boolean;
+    sourceConnect?: boolean;
+    sourceDisconnect?: boolean;
+    workletNodeCtor?: boolean;
+  };
+
+  class TrackedWorkletNode {
+    static instances: TrackedWorkletNode[] = [];
+    readonly port = { onmessage: null as ((event: MessageEvent) => void) | null };
+    onprocessorerror: (() => void) | null = null;
+    disconnectCount = 0;
+    constructor(
+      private readonly log: ReleaseLog,
+      private readonly failConnect: boolean,
+    ) {
+      TrackedWorkletNode.instances.push(this);
+    }
+    connect() {
+      if (this.failConnect) throw new Error("worklet connect failed");
+    }
+    disconnect() {
+      this.disconnectCount += 1;
+      this.log.push("worklet.disconnect");
+    }
+  }
+
+  type Harness = {
+    log: ReleaseLog;
+    context: () => TrackedContext;
+    mediaDevices: TrackedMediaDevices;
+    revokes: () => number;
+    creates: () => number;
+    build: () => Promise<VivaAudioCaptureSource>;
+  };
+
+  function harness(failures: CaptureFailures = {}): Harness {
+    const log: ReleaseLog = [];
+    const contexts: TrackedContext[] = [];
+    const mediaDevices = new TrackedMediaDevices(log);
+    TrackedWorkletNode.instances = [];
+    const created: string[] = [];
+    const revoked: string[] = [];
+
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = ((blob: Blob) => {
+      const url = `blob:viva-capture-${created.length}`;
+      created.push(url);
+      void blob;
+      return url;
+    }) as typeof URL.createObjectURL;
+    URL.revokeObjectURL = ((url: string) => {
+      revoked.push(url);
+      log.push("module.revoke");
+    }) as typeof URL.revokeObjectURL;
+    restoreObjectUrl = () => {
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+    };
+
+    const AudioContextCtor = function TrackedContextCtor(options: { sampleRate: number }) {
+      const context = new TrackedContext(options.sampleRate, log, failures);
+      contexts.push(context);
+      return context;
+    } as unknown as typeof AudioContext;
+
+    const AudioWorkletNodeCtor = function TrackedWorkletNodeCtor() {
+      const node = new TrackedWorkletNode(log, failures.processorConnect === true);
+      if (failures.workletNodeCtor) throw new Error("AudioWorkletNode construction failed");
+      return node;
+    } as unknown as typeof AudioWorkletNode;
+
+    return {
+      build: () =>
+        createBrowserVivaAudioCaptureSource({
+          AudioContextCtor,
+          AudioWorkletNodeCtor,
+          mediaDevices: mediaDevices as unknown as VivaBrowserMediaDevices,
+          sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
+        }),
+      context: () => {
+        const context = contexts[0];
+        if (!context) throw new Error("no AudioContext was constructed");
+        return context;
+      },
+      creates: () => created.length,
+      log,
+      mediaDevices,
+      revokes: () => revoked.length,
+    };
+  }
+
+  let restoreObjectUrl: (() => void) | null = null;
+
+  afterEach(() => {
+    restoreObjectUrl?.();
+    restoreObjectUrl = null;
+  });
+
+  async function expectThrows(build: () => Promise<unknown>): Promise<unknown> {
+    try {
+      await build();
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected construction to throw");
+  }
+
+  function expectFullyReleased(h: Harness) {
+    for (const track of h.mediaDevices.stream.tracks) expect(track.stopCount).toBe(1);
+    expect(h.context().closeCount).toBe(1);
+    // The object URL is revoked exactly once — never twice, and never left alive.
+    expect(h.creates()).toBe(1);
+    expect(h.revokes()).toBe(1);
+    // Nothing is left that could deliver a later frame.
+    expect(h.mediaDevices.listenerAttached()).toBe(false);
+    for (const node of TrackedWorkletNode.instances) {
+      expect(node.port.onmessage).toBe(null);
+      expect(node.onprocessorerror).toBe(null);
+    }
+  }
+
+  test("a failing createMediaStreamSource releases the stream, the context, and the module URL once", async () => {
+    const h = harness({ createMediaStreamSource: true });
+    const error = await expectThrows(h.build);
+
+    expect(error instanceof Error).toBe(true);
+    expectFullyReleased(h);
+  });
+
+  test("a failing AudioWorkletNode construction disconnects the source and releases everything once", async () => {
+    const h = harness({ workletNodeCtor: true });
+    const error = await expectThrows(h.build);
+
+    expect(error instanceof Error).toBe(true);
+    expect(h.context().source.disconnectCount).toBe(1);
+    expectFullyReleased(h);
+  });
+
+  test("a failing source connect releases everything and never leaves a half-wired graph", async () => {
+    const h = harness({ sourceConnect: true });
+    const source = await h.build();
+
+    expect(() => source.start(() => {})).toThrow("source connect failed");
+    expect(h.context().source.disconnectCount).toBe(1);
+    expect(TrackedWorkletNode.instances[0]?.disconnectCount).toBe(1);
+    expectFullyReleased(h);
+    // A later stop is a no-op, not a second release.
+    source.stop();
+    expectFullyReleased(h);
+  });
+
+  test("a failing worklet connect releases everything exactly once", async () => {
+    const h = harness({ processorConnect: true });
+    const source = await h.build();
+
+    expect(() => source.start(() => {})).toThrow("worklet connect failed");
+    expectFullyReleased(h);
+  });
+
+  test("stop() twice after a successful construction releases each resource once", async () => {
+    const h = harness();
+    const source = await h.build();
+    source.start(() => {});
+
+    source.stop();
+    source.stop();
+    source.stop();
+
+    expectFullyReleased(h);
+    expect(h.context().source.disconnectCount).toBe(1);
+    expect(TrackedWorkletNode.instances[0]?.disconnectCount).toBe(1);
+    expect(h.mediaDevices.removed).toBe(1);
+  });
+
+  test("listeners are removed before anything is disconnected or closed", async () => {
+    const h = harness();
+    const source = await h.build();
+    source.start(() => {});
+    source.stop();
+
+    const order = h.log.filter((entry) => entry !== "module.revoke");
+    expect(order.indexOf("devicechange.remove")).toBeLessThan(order.indexOf("worklet.disconnect"));
+    expect(order.indexOf("worklet.disconnect")).toBeLessThan(order.indexOf("source.disconnect"));
+    expect(order.indexOf("source.disconnect")).toBeLessThan(order.indexOf("track-0.stop"));
+    expect(order.indexOf("track-0.stop")).toBeLessThan(order.indexOf("context.close"));
+  });
+
+  test("a rejecting context close still stops every track and clears every listener", async () => {
+    const h = harness({ contextClose: true });
+    const source = await h.build();
+    source.start(() => {});
+    let ended: string | undefined;
+    source.stop();
+    void ended;
+
+    expectFullyReleased(h);
+    // The rejection is swallowed as a release failure, never rethrown into the
+    // caller and never left as an unhandled rejection.
+    await Promise.resolve();
+  });
+
+  test("a release that throws synchronously never suppresses the releases after it", async () => {
+    const h = harness({ sourceDisconnect: true });
+    const source = await h.build();
+    source.start(() => {});
+
+    // The throw is contained: the caller sees an ordinary stop, and every
+    // release registered BEFORE the failing one still ran.
+    expect(() => source.stop()).not.toThrow();
+    expectFullyReleased(h);
+    expect(h.context().source.disconnectCount).toBe(1);
+  });
+
+  test("run-once lives in the release boundary, not in the caller's stop flag", async () => {
+    const h = harness();
+    const source = await h.build();
+    let endedCount = 0;
+    source.start(() => {}, { onEnded: () => (endedCount += 1) });
+
+    // Every one of these reaches the release boundary; only the boundary's own
+    // run-once keeps each resource from being released more than once.
+    source.stop();
+    source.stop();
+    source.stop();
+
+    expect(endedCount).toBe(1);
+    expectFullyReleased(h);
+    expect(h.context().source.disconnectCount).toBe(1);
+    expect(TrackedWorkletNode.instances[0]?.disconnectCount).toBe(1);
+  });
+
+  test("a frame delivered after teardown reaches no consumer", async () => {
+    const h = harness();
+    const source = await h.build();
+    const frames: Float32Array[] = [];
+    source.start((samples) => frames.push(samples));
+    const node = TrackedWorkletNode.instances[0];
+    const deliver = node?.port.onmessage;
+
+    source.stop();
+    deliver?.({
+      data: {
+        rms: 1,
+        sampleRateHz: VIVA_AUDIO_SAMPLE_RATE_HZ,
+        samples: Float32Array.from([1]),
+        type: "samples",
+      },
+    } as MessageEvent);
+
+    expect(frames).toHaveLength(0);
+    expect(node?.port.onmessage).toBe(null);
+  });
+});
+
+/**
+ * `WEBSESSION-CAPTURE-01` Step 4 (WSC-M07) — downsampling is band-limited.
+ *
+ * Decimating 48 kHz to 24 kHz without a low-pass stage lands every target sample
+ * exactly on a source sample: content above the 12 kHz output Nyquist is not
+ * attenuated at all, it is FOLDED down into the speech band as a phantom tone the
+ * examiner then hears as part of the answer. These specs pin the passband the
+ * learner's voice lives in and the rejection above Nyquist, at both browser
+ * capture rates and across irregular AudioWorklet block boundaries.
+ */
+describe("capture anti-alias quality (WSC-M07)", () => {
+  const IRREGULAR_BLOCKS = [1, 127, 128, 511, 7, 2048, 333] as const;
+  const AMPLITUDE = 0.5;
+
+  function tone(sourceRateHz: number, toneHz: number, seconds: number): Float32Array {
+    const total = Math.round(sourceRateHz * seconds);
+    const samples = new Float32Array(total);
+    for (let index = 0; index < total; index += 1) {
+      samples[index] = AMPLITUDE * Math.sin((2 * Math.PI * toneHz * index) / sourceRateHz);
+    }
+    return samples;
+  }
+
+  /** Drives the REAL capture pipeline and returns its emitted 24 kHz PCM16. */
+  function capturePcm16(sourceRateHz: number, toneHz: number, seconds: number): Int16Array {
+    const source = new FakeAudioCaptureSource(sourceRateHz);
+    const chunks: Uint8Array[] = [];
+    const capture = startVivaPcm16StreamingCapture({
+      onFrame: (frame) => chunks.push(frame.pcm16Bytes),
+      source,
+    });
+    const samples = tone(sourceRateHz, toneHz, seconds);
+    let offset = 0;
+    let callback = 0;
+    while (offset < samples.length) {
+      const requested = IRREGULAR_BLOCKS[callback % IRREGULAR_BLOCKS.length] ?? 128;
+      const size = Math.min(requested, samples.length - offset);
+      source.push(samples.subarray(offset, offset + size));
+      offset += size;
+      callback += 1;
+    }
+    capture.end();
+
+    let total = 0;
+    for (const chunk of chunks) total += chunk.byteLength;
+    const merged = new Uint8Array(total);
+    let byteOffset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, byteOffset);
+      byteOffset += chunk.byteLength;
+    }
+    const view = new DataView(merged.buffer, merged.byteOffset, merged.byteLength);
+    const pcm = new Int16Array(merged.byteLength / 2);
+    for (let index = 0; index < pcm.length; index += 1) {
+      pcm[index] = view.getInt16(index * 2, true);
+    }
+    return pcm;
+  }
+
+  /** RMS over the steady state, skipping the filter's start-up transient. */
+  function steadyStateRms(pcm: Int16Array, skip = 4_000): number {
+    let sumOfSquares = 0;
+    let count = 0;
+    for (let index = skip; index < pcm.length; index += 1) {
+      const sample = pcm[index] ?? 0;
+      sumOfSquares += sample * sample;
+      count += 1;
+    }
+    return count === 0 ? 0 : Math.sqrt(sumOfSquares / count);
+  }
+
+  function hasNoNanOrClip(pcm: Int16Array): boolean {
+    for (const sample of pcm) {
+      if (!Number.isFinite(sample)) return false;
+      if (sample >= 32_767 || sample <= -32_768) return false;
+    }
+    return true;
+  }
+
+  const nativeReference = steadyStateRms(capturePcm16(24_000, 1_000, 1));
+
+  test("the native 24 kHz path is the reference and carries a full-amplitude tone", () => {
+    expect(nativeReference).toBeGreaterThan(0.5 * AMPLITUDE * 32_767);
+  });
+
+  test("48 kHz capture keeps the speech passband intact", () => {
+    const oneKilohertz = capturePcm16(48_000, 1_000, 1);
+    const tenKilohertz = capturePcm16(48_000, 10_000, 1);
+
+    expect(hasNoNanOrClip(oneKilohertz)).toBe(true);
+    expect(hasNoNanOrClip(tenKilohertz)).toBe(true);
+    expect(Math.abs(steadyStateRms(oneKilohertz) - nativeReference) / nativeReference).toBeLessThan(
+      0.05,
+    );
+    expect(Math.abs(steadyStateRms(tenKilohertz) - nativeReference) / nativeReference).toBeLessThan(
+      0.1,
+    );
+  });
+
+  test("48 kHz capture rejects every tone above the 12 kHz output Nyquist by 20 dB", () => {
+    for (const toneHz of [14_000, 18_000, 22_000]) {
+      const pcm = capturePcm16(48_000, toneHz, 1);
+      const rejectionDb = 20 * Math.log10(Math.max(steadyStateRms(pcm), 1e-9) / nativeReference);
+
+      expect(hasNoNanOrClip(pcm)).toBe(true);
+      expect(rejectionDb).toBeLessThanOrEqual(-20);
+    }
+  });
+
+  test("44.1 kHz capture rejects a 16 kHz tone and still emits Plan 03's exact sample count", () => {
+    const pcm = capturePcm16(44_100, 16_000, 45);
+    const rejectionDb = 20 * Math.log10(Math.max(steadyStateRms(pcm), 1e-9) / nativeReference);
+
+    expect(rejectionDb).toBeLessThanOrEqual(-20);
+    expect(hasNoNanOrClip(pcm)).toBe(true);
+    // The quality stage is length-preserving: a 45-second turn is still exactly
+    // 45 * 24_000 samples, so Plan 03's ledger accounting is untouched.
+    expect(pcm.length).toBe(45 * 24_000);
+  });
+
+  test("the 24 kHz native path is bypassed byte-for-byte", () => {
+    const native = capturePcm16(24_000, 10_000, 0.5);
+    const expected = float32ToPcm16LeBytes(tone(24_000, 10_000, 0.5));
+    const view = new DataView(expected.buffer, expected.byteOffset, expected.byteLength);
+
+    expect(native.length).toBe(expected.byteLength / 2);
+    for (let index = 0; index < native.length; index += 1) {
+      expect(native[index]).toBe(view.getInt16(index * 2, true));
+    }
+  });
+});

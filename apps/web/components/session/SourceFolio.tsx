@@ -12,12 +12,18 @@ import type { Question } from "./session-data";
  * challenge the citation. Deliberately not a PDF viewer.
  */
 export function SourceFolio({
+  challengeDisabled,
   question,
   sourceFolio,
   onBack,
   onChallenge,
   rootRef,
 }: {
+  /**
+   * `WEBSESSION-INTENT-01`: a stale or ungated challenge is DISABLED rather than
+   * re-aimed at a different response.
+   */
+  challengeDisabled?: boolean;
   question: Question;
   sourceFolio?: SourceFolioProjection;
   onBack: () => void;
@@ -58,6 +64,7 @@ export function SourceFolio({
       <p className="source-folio__caveat">{folio.caveat}</p>
       <p className="folio__footer">{folio.regionNavigation}</p>
       <SessionActionButton
+        disabled={challengeDisabled}
         label={folio.challengeLabel}
         leading={<Icon color="var(--viva-amethyst)" name="pen" size={15} strokeWidth={1.6} />}
         onClick={onChallenge}

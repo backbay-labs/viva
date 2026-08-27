@@ -2435,6 +2435,156 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*if\ \(url\.username\ \|\|\ url\.password\)\ return\ null;\s*$/,
     ]),
   },
+  // A-27 (2026-08-27): coordinator-applied sanction rows for Plan 10 web-session
+  // client sources (node 10 admission). Dual-keyed, file-filtered, anchored
+  // literals: type members, wire field names, protocol discriminants, header
+  // construction, doc prose — never values or logging. Plan 12 reconciles at 12B.
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "access_token",
+    patterns: Object.freeze([
+      /^\s*setBootstrapAccessToken\(result\.credential\.accessToken\);\s*$/,
+      /^\s*accessToken:\ credential\.accessToken,\s*$/,
+      /^\s*accessToken:\ renewal\.credential\.accessToken,\s*$/,
+      /^\s*accessToken:\ directToken,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*intent:\ \{\ kind:\ "answer_text",\ text:\ payload\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "direct_token",
+    patterns: Object.freeze([
+      /^\s*const\ directToken\ =\ input\.identity\.sessionToken\?\.trim\(\)\ \|\|\ input\.envAccessToken\?\.trim\(\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "env_access_token",
+    patterns: Object.freeze([
+      /^\s*envAccessToken:\ process\.env\.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN\?\.trim\(\)\ \|\|\ null,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "refresh_token",
+    patterns: Object.freeze([
+      /^\s*return\ credential\?\.mode\ ===\ "retain\-token\-only"\ \&\&\ Boolean\(credential\.refreshToken\);\s*$/,
+      /^\s*refreshToken:\ null,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*sessionToken:\ null,\s*$/,
+      /^\s*sessionToken:\ bootstrapAccessToken,\s*$/,
+      /^\s*envAccessToken:\ process\.env\.NEXT_PUBLIC_VIVA_VOICE_SESSION_TOKEN\?\.trim\(\)\ \|\|\ null,\s*$/,
+      /^\s*agentRef\.current\.refreshSession\(\{\ reason,\ sessionToken:\ current\.accessToken\ \}\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/components/session/LiveSessionPage.tsx",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*token:\ sessionRouteWsAccessToken\(\{\ sessionToken:\ bootstrapAccessToken\ \}\),\s*$/,
+      /^\s*const\ token\ =\ reconnectAttemptTokenRef\.current\ \+\ 1;\s*$/,
+      /^\s*reconnectAttemptTokenRef\.current\ =\ token;\s*$/,
+      /^\s*const\ isCurrent\ =\ \(\)\ =>\ mountedRef\.current\ \&\&\ reconnectAttemptTokenRef\.current\ ===\ token;\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/use-viva-agent-session.ts",
+    marker: "access_token",
+    patterns: Object.freeze([
+      /^\s*accessToken:\ string;\s*$/,
+      /^\s*accessToken:\ next\.session_token,\s*$/,
+      /^\s*const\ accessToken\ =\ nonEmptyString\(record\.session_token\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/use-viva-agent-session.ts",
+    marker: "refresh_token",
+    patterns: Object.freeze([
+      /^\s*refreshToken:\ string\ \|\ null;\s*$/,
+      /^\s*refresh_token:\ string;\s*$/,
+      /^\s*refresh_token:\ string\ \|\ null;\s*$/,
+      /^\s*refreshToken:\ next\.refresh_token,\s*$/,
+      /^\s*const\ refreshToken\ =\ nonEmptyString\(record\.refresh_token\);\s*$/,
+      /^\s*\*\ The\ POST\ body\ is\ exactly\ `\{refresh_token,\ session_id,\ study_set_id,\ user_id\}`\s*$/,
+      /^\s*const\ refreshToken\ =\ credential\.refreshToken;\s*$/,
+      /^\s*refresh_token:\ refreshToken,\s*$/,
+      /^\s*if\ \(credential\.mode\ !==\ "retain\-token\-only"\ \|\|\ !credential\.refreshToken\)\ \{\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/use-viva-agent-session.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*session_token:\ string;\s*$/,
+      /^\s*accessToken:\ next\.session_token,\s*$/,
+      /^\s*"session_token",\s*$/,
+      /^\s*const\ accessToken\ =\ nonEmptyString\(record\.session_token\);\s*$/,
+      /^\s*sessionToken:\ options\.sessionToken,\s*$/,
+      /^\s*\},\ \[options\.WebSocketImpl,\ options\.sessionToken,\ options\.token,\ options\.url,\ session\]\);\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*headers:\ \{\ authorization:\ `Bearer\ \$\{input\.accessToken\}`\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "access_token",
+    patterns: Object.freeze([
+      /^\s*accessToken:\ string;\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*intent:\ \{\ kind:\ "answer_text",\ text\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "authorization",
+    patterns: Object.freeze([
+      /^\s*headers:\ \{\ authorization:\ `Bearer\ \$\{input\.accessToken\}`\ \},\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "current_session_token",
+    patterns: Object.freeze([
+      /^\s*const\ signedCredential\ =\ currentSessionToken;\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "pasted_text",
+    patterns: Object.freeze([
+      /^\s*\*\ over\ `\{title,\ course,\ exam_date,\ pasted_text\}`,\ so\ a\ `user_id`\/`session_id`\s*$/,
+      /^\s*pasted_text:\ string;\s*$/,
+      /^\s*pasted_text:\ input\.pastedText,\s*$/,
+    ]),
+  },
+  {
+    file: "apps/web/lib/viva-agent-client.ts",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\/\/\ rather\ than\ serialized\ as\ `session_token:\ null`\ for\ the\ server\ to\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);

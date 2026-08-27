@@ -2,7 +2,6 @@ import { LandingEntry } from "../components/landing/LandingEntry";
 import {
   fetchVivaLibrarySnapshot,
   type VivaLibrarySnapshotOptions,
-  vivaStaticExportEnabled,
 } from "../lib/viva-agent-client";
 import { browserInitialLibrarySnapshot, type VivaLibrarySnapshot } from "../lib/viva-library";
 import {
@@ -46,9 +45,16 @@ async function initialSnapshot(): Promise<VivaLibrarySnapshot | null> {
             userId: config.options.userId ?? "",
           })
         : bootstrapSnapshot;
+    // `D-06: DELETE` removed the build-mode predicate from the browser client,
+    // so this call no longer passes one. Plan 13 owns retiring the matching
+    // optional argument of `browserInitialLibrarySnapshot`, together with
+    // `viva-library.ts` and the landing tests written against it; omitting it
+    // here is the same `false` the deleted predicate returned in every served
+    // build. This comment deliberately names no deleted identifier: Plan 13 and
+    // Plan 14 both prove the deletion by finding zero occurrences of those
+    // names in this file.
     return browserInitialLibrarySnapshot(browserSnapshot as VivaLibrarySnapshot, {
       directSessionTokens: config.kind === "disabled",
-      staticExport: vivaStaticExportEnabled(),
     });
   } catch {
     return null;

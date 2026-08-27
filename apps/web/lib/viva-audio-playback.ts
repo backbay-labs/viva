@@ -46,11 +46,24 @@ export type VivaAudioPlaybackSinkOptions = {
   onStateChange?: (state: VivaAudioPlaybackState) => void;
 };
 
-type ScheduledPlaybackFrame = {
-  node: AudioBufferSourceNode;
+/**
+ * `WEBSESSION-PLAYBACK-01`: one scheduled frame, with the interval it occupies.
+ *
+ * `buffer` is retained alongside the node because an `AudioBufferSourceNode` is
+ * ONE-SHOT: a survivor that has to move earlier cannot be rescheduled, it has to
+ * be recreated from the same decoded audio. `startTime`/`endTime` are what make
+ * "has this already begun?" and "where does the next frame go?" answerable from
+ * the frames that actually survived rather than from a running total that
+ * cancellation silently invalidated.
+ */
+type ScheduledPlaybackFrame = Readonly<{
   responseId: string;
+  source: AudioBufferSourceNode;
+  buffer: AudioBuffer;
   sequence: number;
-};
+  startTime: number;
+  endTime: number;
+}>;
 
 export function initialVivaAudioPlaybackState(): VivaAudioPlaybackState {
   return {
@@ -210,9 +223,7 @@ export class VivaAudioPlaybackSink {
 
   cancel(responseId?: string | null): VivaAudioPlaybackState {
     if (!responseId) {
-      for (const frame of this.#scheduled.values()) {
-        stopPlaybackNode(frame.node);
-      }
+      for (const frame of this.#scheduled.values()) releasePlaybackFrame(frame);
       this.#scheduled.clear();
       this.#state = {
         ...cancelVivaAudioPlaybackResponse(this.#state, null),
@@ -220,17 +231,20 @@ export class VivaAudioPlaybackSink {
         scheduledFrameCount: 0,
         speaking: false,
       };
-      this.#resetNextStartTime();
+      this.#rebaseOnSurvivingFrames();
       this.#publishState();
       return this.getState();
     }
 
     for (const frame of this.#scheduled.values()) {
       if (frame.responseId === responseId) {
-        stopPlaybackNode(frame.node);
+        releasePlaybackFrame(frame);
         this.#scheduled.delete(frame.sequence);
       }
     }
+    // The gap the cancelled frames left is closed BEFORE any state is published,
+    // so a listener never sees a schedule that still counts abandoned time.
+    this.#rebaseOnSurvivingFrames();
     this.#state = {
       ...cancelVivaAudioPlaybackResponse(this.#state, responseId),
       scheduledFrameCount: this.#scheduled.size,
@@ -239,24 +253,20 @@ export class VivaAudioPlaybackSink {
         this.#state.queue.some((frame) => frame.responseId !== responseId) ||
         this.#scheduled.size > 0,
     };
-    this.#resetNextStartTime();
     this.#publishState();
     return this.getState();
   }
 
   resetForGeneration(): VivaAudioPlaybackState {
     const nextSequence = this.#state.nextSequence;
-    for (const frame of this.#scheduled.values()) {
-      frame.node.onended = null;
-      stopPlaybackNode(frame.node);
-    }
+    for (const frame of this.#scheduled.values()) releasePlaybackFrame(frame);
     this.#scheduled.clear();
     this.#state = {
       ...initialVivaAudioPlaybackState(),
       nextSequence,
       userGestureUnlocked: this.#state.userGestureUnlocked,
     };
-    this.#resetNextStartTime();
+    this.#rebaseOnSurvivingFrames();
     this.#publishState();
     return this.getState();
   }
@@ -277,46 +287,96 @@ export class VivaAudioPlaybackSink {
     }
 
     const context = this.#context;
-    const remainingQueue: VivaAudioPlaybackQueuedFrame[] = [];
     for (const frame of this.#state.queue) {
       if (this.#state.cancelledResponseIds.includes(frame.responseId)) continue;
       const buffer = pcm16LeBytesToAudioBuffer(frame.pcm16Bytes, context, this.#outputSampleRateHz);
-      const node = context.createBufferSource();
       const startTime = Math.max(context.currentTime, this.#nextStartTime);
-      node.buffer = buffer;
-      node.connect(this.#outputTarget(context));
-      node.onended = () => {
-        this.#scheduled.delete(frame.sequence);
-        this.#state = {
-          ...this.#state,
-          responding: this.#state.queue.length > 0 || this.#scheduled.size > 0,
-          scheduledFrameCount: this.#scheduled.size,
-          speaking: this.#scheduled.size > 0,
-        };
-        this.#publishState();
-      };
-      this.#scheduled.set(frame.sequence, {
-        node,
+      this.#startScheduledFrame({
+        buffer,
+        context,
         responseId: frame.responseId,
         sequence: frame.sequence,
+        startTime,
       });
-      node.start(startTime);
       this.#nextStartTime = startTime + buffer.duration;
     }
 
+    // WSC-M08: this loop drains the WHOLE queue on every run — a frame is either
+    // scheduled or dropped as cancelled, never carried over — so there is no
+    // remainder to keep.
     this.#state = {
       ...this.#state,
-      queue: remainingQueue,
-      responding: this.#scheduled.size > 0 || remainingQueue.length > 0,
+      queue: [],
+      responding: this.#scheduled.size > 0,
       scheduledFrameCount: this.#scheduled.size,
       speaking: this.#scheduled.size > 0,
     };
   }
 
-  #resetNextStartTime() {
-    if (this.#context && this.#scheduled.size === 0) {
-      this.#nextStartTime = this.#context.currentTime;
+  /** Creates, wires, and starts ONE node for a frame, recording its interval. */
+  #startScheduledFrame(input: {
+    buffer: AudioBuffer;
+    context: VivaAudioContextLike;
+    responseId: string;
+    sequence: number;
+    startTime: number;
+  }) {
+    const source = input.context.createBufferSource();
+    source.buffer = input.buffer;
+    source.connect(this.#outputTarget(input.context));
+    source.onended = () => {
+      this.#scheduled.delete(input.sequence);
+      this.#state = {
+        ...this.#state,
+        responding: this.#state.queue.length > 0 || this.#scheduled.size > 0,
+        scheduledFrameCount: this.#scheduled.size,
+        speaking: this.#scheduled.size > 0,
+      };
+      this.#publishState();
+    };
+    this.#scheduled.set(input.sequence, {
+      buffer: input.buffer,
+      endTime: input.startTime + input.buffer.duration,
+      responseId: input.responseId,
+      sequence: input.sequence,
+      source,
+      startTime: input.startTime,
+    });
+    source.start(input.startTime);
+  }
+
+  /**
+   * Recomputes the schedule from the frames that SURVIVED a cancellation.
+   *
+   * A survivor that has already begun keeps its interval — restarting audio the
+   * learner is mid-way through hearing would be worse than the gap. Every
+   * survivor still in the future is released and recreated from its retained
+   * buffer, in sequence order, contiguously from the later of "now" and the end
+   * of whatever is still playing. `nextStartTime` then follows from those
+   * intervals, and collapses to `currentTime` when nothing survived at all.
+   */
+  #rebaseOnSurvivingFrames() {
+    const context = this.#context;
+    if (!context) return;
+    const now = context.currentTime;
+    const survivors = [...this.#scheduled.values()].sort((a, b) => a.sequence - b.sequence);
+    let cursor = now;
+    for (const frame of survivors) {
+      if (frame.startTime <= now) cursor = Math.max(cursor, frame.endTime);
     }
+    for (const frame of survivors) {
+      if (frame.startTime <= now) continue;
+      releasePlaybackFrame(frame);
+      this.#startScheduledFrame({
+        buffer: frame.buffer,
+        context,
+        responseId: frame.responseId,
+        sequence: frame.sequence,
+        startTime: cursor,
+      });
+      cursor += frame.buffer.duration;
+    }
+    this.#nextStartTime = cursor;
   }
 
   #publishState() {
@@ -357,6 +417,21 @@ function clonePlaybackState(state: VivaAudioPlaybackState): VivaAudioPlaybackSta
       pcm16Bytes: frame.pcm16Bytes.slice(),
     })),
   };
+}
+
+/**
+ * Releases one scheduled node exactly once: its `onended` is cleared FIRST so a
+ * stop cannot re-enter the scheduler's bookkeeping, then it is stopped and
+ * disconnected so the discarded node holds no graph edge.
+ */
+function releasePlaybackFrame(frame: ScheduledPlaybackFrame) {
+  frame.source.onended = null;
+  stopPlaybackNode(frame.source);
+  try {
+    frame.source.disconnect();
+  } catch {
+    // A node that was never connected (or already torn down) is already released.
+  }
 }
 
 function stopPlaybackNode(node: AudioBufferSourceNode) {

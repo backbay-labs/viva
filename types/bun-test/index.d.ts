@@ -15,6 +15,7 @@ declare module "bun:test" {
     toBeGreaterThanOrEqual: (expected: number) => void;
     toBeLessThan: (expected: number) => void;
     toBeLessThanOrEqual: (expected: number) => void;
+    toBeNull: () => void;
     toBeUndefined: () => void;
     toContain: (expected: unknown) => void;
     toEqual: (expected: unknown) => void;
@@ -28,4 +29,22 @@ declare module "bun:test" {
   export const test: TestFn;
   export const it: TestFn;
   export function expect<T = unknown>(actual: T): Matchers<T>;
+
+  /**
+   * Suite lifecycle hooks. Declared because a mounted (happy-dom) suite has to
+   * install its DOM before its tests and tear it down after them — a test that
+   * fails without running its own teardown would otherwise leak a live document
+   * into the next suite.
+   */
+  export function beforeAll(fn: TestBody): void;
+  export function beforeEach(fn: TestBody): void;
+  export function afterAll(fn: TestBody): void;
+  export function afterEach(fn: TestBody): void;
+
+  /** Bun's Jest-compatible timer control, used to prove exact deadlines. */
+  export const jest: {
+    advanceTimersByTime: (ms: number) => void;
+    useFakeTimers: () => void;
+    useRealTimers: () => void;
+  };
 }

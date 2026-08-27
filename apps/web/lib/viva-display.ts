@@ -1,7 +1,10 @@
 import {
-  buildReviewSchedule,
+  type AgentStudySetReadiness,
+  type AuthenticatedStudyProjectionV1,
   type ConceptStatus,
-  type ReviewScheduleItem,
+  type ReviewScheduleAuthority,
+  reviewDueAtFromProjection,
+  reviewIntervalFromProjection,
   type SessionRecap,
   type StudySet,
 } from "@viva/core";
@@ -13,24 +16,118 @@ export type RecapStat = {
   topics: number;
 };
 
-export type ReviewPlanSignals = {
-  hinted?: boolean;
-  examDate?: Date;
-  lastReviewedAt?: Date;
-};
-
-export type RecapPlanProjection = {
-  recap?: SessionRecap;
-  reviewPlan: ReviewScheduleItem[];
-};
-
-type RecapConceptSignal = {
+/**
+ * One learner-visible review entry, read ONLY from the persisted projection.
+ *
+ * `dueAt` is the server's own RFC3339 instant, carried through unchanged, and
+ * `intervalLabel` is derived from that instant by the shared reader — never from
+ * a status-shaped estimate. `authority` is rendered so a surface can never
+ * silently disagree with the one D-01 selected.
+ */
+export type SessionReviewPlanItem = Readonly<{
   conceptId: string;
   label: string;
   status: ConceptStatus;
-  misses: number;
-  centrality: number;
-};
+  dueAt: string;
+  authority: ReviewScheduleAuthority;
+  intervalLabel: string;
+}>;
+
+export type SessionReviewPlanProjection =
+  | { status: "ready"; items: SessionReviewPlanItem[] }
+  | { status: "invalid_projection" };
+
+/**
+ * `WEBSESSION-TASK10-LOCAL-DATE-01` / ledger Minor M2 (in-session half).
+ *
+ * The browser recomputes nothing. Each entry pairs the projection's persisted
+ * `dueAt` with the label of the concept the projection itself names; a schedule
+ * entry for a concept the projection does not carry is a sanitized
+ * invalid-projection state, not a guessed label. `reviewIntervalFromProjection`
+ * is the single reader, so the margin and any other surface reading the same
+ * entry cannot disagree about the same concept's interval.
+ */
+export function sessionReviewPlanFromProjection(
+  projection: AuthenticatedStudyProjectionV1,
+  now: Date,
+): SessionReviewPlanProjection {
+  const conceptsById = new Map(projection.concepts.map((concept) => [concept.id, concept]));
+  const items: SessionReviewPlanItem[] = [];
+  for (const entry of projection.reviewSchedule) {
+    const concept = conceptsById.get(entry.conceptId);
+    if (!concept) return { status: "invalid_projection" };
+    let intervalLabel: string | null;
+    try {
+      intervalLabel = reviewIntervalFromProjection(projection.reviewSchedule, entry.conceptId, now);
+    } catch {
+      // A duplicated entry, an unparseable instant, or an authority the recorded
+      // decision did not select: refuse the whole projection rather than render
+      // the entries that happened to parse.
+      return { status: "invalid_projection" };
+    }
+    if (intervalLabel === null) return { status: "invalid_projection" };
+    items.push({
+      authority: entry.authority,
+      conceptId: entry.conceptId,
+      dueAt: entry.dueAt,
+      intervalLabel,
+      label: concept.label,
+      status: concept.status,
+    });
+  }
+  return { items, status: "ready" };
+}
+
+/** The persisted due instant for one concept, or `null` when none is scheduled. */
+export function sessionReviewDueAt(
+  projection: AuthenticatedStudyProjectionV1,
+  conceptId: string,
+): Date | null {
+  return reviewDueAtFromProjection(projection.reviewSchedule, conceptId);
+}
+
+/**
+ * Readiness derived from the AUTHENTICATED projection's ingestion status rather
+ * than from a `StudySet` fixture. A projection the server marked anything but
+ * `ready` cannot open a voice socket, and the page never overwrites that with a
+ * local `ready`.
+ */
+export function studyProjectionReadiness(
+  projection: AuthenticatedStudyProjectionV1,
+): AgentStudySetReadiness {
+  switch (projection.studySet.ingestionStatus) {
+    case "ready":
+      return {
+        canConnect: true,
+        message: "Connected agent is serving this server-owned study set.",
+        reason: "trusted",
+      };
+    case "failed":
+      return {
+        canConnect: false,
+        message: "Connected agent is unavailable because server ingestion failed.",
+        reason: "failed_ingestion",
+      };
+    case "retry":
+      return {
+        canConnect: false,
+        message: "Server ingestion is retrying; the session cannot open yet.",
+        reason: "retry_ingestion",
+      };
+    case "processing":
+      return {
+        canConnect: false,
+        message: "Server ingestion is still processing this study set.",
+        reason: "processing_ingestion",
+      };
+    default:
+      return {
+        canConnect: false,
+        message: "Server ingestion has not started for this study set.",
+        reason: "pending_ingestion",
+      };
+  }
+}
 
 export function uploadPreviewSummary(studySet: StudySet): {
   conceptLabel: string;
@@ -75,212 +172,6 @@ export function recapStats(recap: SessionRecap): RecapStat[] {
   ];
 }
 
-export function recapPlanFromSessionEvents({
-  recap,
-  studySet,
-  conceptStatuses,
-  now,
-  signals = {},
-}: {
-  recap?: SessionRecap;
-  studySet: StudySet;
-  conceptStatuses: Record<string, ConceptStatus>;
-  now: Date;
-  signals?: ReviewPlanSignals;
-}): RecapPlanProjection {
-  if (!recap) return { recap: undefined, reviewPlan: [] };
-
-  const conceptSignals = conceptSignalsFromStatuses(studySet, conceptStatuses);
-  const reviewPlan = reviewPlanFromConceptSignals(conceptSignals, studySet, now, signals);
-
-  return {
-    recap: {
-      ...recap,
-      strongConcepts: labelsForStatus(conceptSignals, "strong"),
-      shakyConcepts: labelsForStatus(conceptSignals, "shaky"),
-      missedConcepts: labelsForStatus(conceptSignals, "missed"),
-      reviewLater: conceptSignals
-        .filter((concept) => concept.status !== "strong")
-        .map((concept) => concept.label),
-      nextAction: primaryNextAction(conceptSignals, reviewPlan),
-    },
-    reviewPlan,
-  };
-}
-
-export function reviewPlanFromRecap(
-  recap: SessionRecap,
-  studySet: StudySet,
-  now: Date,
-  signals: ReviewPlanSignals = {},
-): ReviewScheduleItem[] {
-  const statusByLabel = new Map<string, ConceptStatus>();
-  const examDate = signals.examDate ?? examDateFromLabel(studySet.examDateLabel, now);
-  const lastReviewedAt =
-    signals.lastReviewedAt ?? lastReviewedAtFromLabel(studySet.lastSessionLabel, now);
-  for (const label of recap.strongConcepts) statusByLabel.set(label.toLowerCase(), "strong");
-  for (const label of recap.shakyConcepts) statusByLabel.set(label.toLowerCase(), "shaky");
-  for (const label of recap.missedConcepts) statusByLabel.set(label.toLowerCase(), "missed");
-  for (const label of recap.reviewLater) {
-    const key = label.toLowerCase();
-    if (!statusByLabel.has(key)) statusByLabel.set(key, "review");
-  }
-
-  return buildReviewSchedule(
-    [...statusByLabel].flatMap(([key, status]) => {
-      const concept = studySet.concepts.find(
-        (item) => item.label.toLowerCase() === key || item.id === key,
-      );
-      if (!concept) return [];
-
-      return [
-        {
-          conceptId: concept.id,
-          label: concept.label,
-          status,
-          misses: concept.misses,
-          hinted: signals.hinted === true,
-          centrality: concept.centrality,
-          now,
-          examDate,
-          lastReviewedAt,
-        },
-      ];
-    }),
-  );
-}
-
-function reviewPlanFromConceptSignals(
-  conceptSignals: RecapConceptSignal[],
-  studySet: StudySet,
-  now: Date,
-  signals: ReviewPlanSignals,
-): ReviewScheduleItem[] {
-  const examDate = signals.examDate ?? examDateFromLabel(studySet.examDateLabel, now);
-  const lastReviewedAt =
-    signals.lastReviewedAt ?? lastReviewedAtFromLabel(studySet.lastSessionLabel, now);
-
-  return buildReviewSchedule(
-    conceptSignals.map((concept) => ({
-      conceptId: concept.conceptId,
-      label: concept.label,
-      status: concept.status,
-      misses: concept.misses,
-      hinted: signals.hinted === true,
-      centrality: concept.centrality,
-      now,
-      examDate,
-      lastReviewedAt,
-    })),
-  );
-}
-
-function conceptSignalsFromStatuses(
-  studySet: StudySet,
-  conceptStatuses: Record<string, ConceptStatus>,
-): RecapConceptSignal[] {
-  const conceptOrder = new Map(studySet.concepts.map((concept, index) => [concept.id, index]));
-  const concepts = Object.entries(conceptStatuses).flatMap(([conceptId, status]) => {
-    const concept = studySet.concepts.find((item) => item.id === conceptId);
-    if (!concept) return [];
-
-    return {
-      conceptId,
-      label: concept.label,
-      status,
-      misses: concept.misses,
-      centrality: concept.centrality,
-    };
-  });
-
-  return concepts.sort(
-    (left, right) =>
-      (conceptOrder.get(left.conceptId) ?? Number.MAX_SAFE_INTEGER) -
-        (conceptOrder.get(right.conceptId) ?? Number.MAX_SAFE_INTEGER) ||
-      left.label.localeCompare(right.label),
-  );
-}
-
-function labelsForStatus(concepts: RecapConceptSignal[], status: ConceptStatus): string[] {
-  return concepts.filter((concept) => concept.status === status).map((concept) => concept.label);
-}
-
-function primaryNextAction(
-  conceptSignals: RecapConceptSignal[],
-  reviewPlan: ReviewScheduleItem[],
-): string {
-  if (conceptSignals.length === 0) {
-    return "Finish the session to let the Conductor build a source-grounded review plan.";
-  }
-
-  const firstMissed = reviewPlan.find((item) => item.status === "missed");
-  if (firstMissed) {
-    return `Rebuild ${firstMissed.label} from the source, then answer it once without hints.`;
-  }
-
-  const firstWeak = reviewPlan.find((item) => item.status === "shaky" || item.status === "review");
-  if (firstWeak) {
-    return `Tighten ${firstWeak.label} ${firstWeak.intervalLabel} with one source-backed recall pass.`;
-  }
-
-  const firstStrong = reviewPlan[0];
-  if (firstStrong) {
-    return `Bank this pass; return to ${firstStrong.label} for spaced recall ${firstStrong.intervalLabel}.`;
-  }
-
-  return "Finish the session to let the Conductor build a source-grounded review plan.";
-}
-
 export function correctionQuote(answer: string): string {
   return answer.trim().length > 0 ? `"${answer}"` : "No browser transcript captured";
-}
-
-function examDateFromLabel(label: string, now: Date): Date | undefined {
-  if (/no exam/i.test(label)) return undefined;
-
-  const weekdayMatch = label.match(
-    /exam\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)/i,
-  );
-  if (weekdayMatch?.[1]) {
-    const targetDay = weekdayIndex(weekdayMatch[1]);
-    const currentDay = now.getUTCDay();
-    const daysUntil = targetDay >= currentDay ? targetDay - currentDay : targetDay - currentDay + 7;
-    return utcNoon(addDays(now, daysUntil));
-  }
-
-  const daysMatch = label.match(/exam\s+in\s+(\d+)\s+days?/i);
-  if (daysMatch?.[1]) return utcNoon(addDays(now, Number(daysMatch[1])));
-
-  const weeksMatch = label.match(/exam\s+in\s+(\d+)\s+weeks?/i);
-  if (weeksMatch?.[1]) return utcNoon(addDays(now, Number(weeksMatch[1]) * 7));
-
-  return undefined;
-}
-
-function lastReviewedAtFromLabel(label: string, now: Date): Date | undefined {
-  const minutesMatch = label.match(/studied\s+(\d+)\s+minutes?\s+ago/i);
-  if (minutesMatch?.[1]) return new Date(now.getTime() - Number(minutesMatch[1]) * 60_000);
-
-  const hoursMatch = label.match(/studied\s+(\d+)\s+hours?\s+ago/i);
-  if (hoursMatch?.[1]) return new Date(now.getTime() - Number(hoursMatch[1]) * 3_600_000);
-
-  if (/studied\s+yesterday/i.test(label)) return addDays(now, -1);
-
-  return undefined;
-}
-
-function weekdayIndex(day: string): number {
-  return ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(
-    day.toLowerCase(),
-  );
-}
-
-function addDays(date: Date, days: number): Date {
-  return new Date(date.getTime() + days * 86_400_000);
-}
-
-function utcNoon(date: Date): Date {
-  return new Date(
-    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 12, 0, 0, 0),
-  );
 }

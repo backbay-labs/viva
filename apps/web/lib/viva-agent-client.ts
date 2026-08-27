@@ -11,26 +11,41 @@ import {
   type AgentStudySessionRecap,
   type AgentStudySourceReference,
   type AgentTerminalSessionReason,
+  type AuthenticatedStudyProjectionV1,
   audioChunkClientFrame,
   audioEndClientFrame,
+  classifyVivaVoiceTermination,
   type ManuscriptIntent,
   type PasteIngestionResponse,
-  parseVivaServerFrame,
+  parseVivaClientFrameJson,
+  parseVivaServerFrameJson,
   type StudySet,
   sessionConfigFrame,
   studySetFromPasteIngestionResponse,
   VIVA_AUDIO_MAX_CHUNK_BYTES,
   VIVA_AUDIO_MAX_TURN_BYTES,
   VIVA_VOICE_MAX_TEXT_FRAME_BYTES,
+  VIVA_VOICE_NORMAL_CLOSE_CODE,
   VIVA_VOICE_PROTOCOL_VERSION,
+  type VivaBrowserClientFrame,
+  type VivaCancelClientFrame,
   type VivaClientFrame,
+  type VivaClientTurnIntent,
   type VivaReadyFrame,
+  type VivaServerError,
   type VivaServerEvent,
   type VivaServerFrame,
+  type VivaStopClientFrame,
+  type VivaTurnIntentClientFrame,
+  type VivaVoiceDeferralReason,
+  type VivaVoiceDiagnosticCode,
+  VivaVoiceProtocolError,
+  type VivaVoiceServerErrorCode,
+  type VivaVoiceTermination,
+  validateAuthenticatedStudyProjectionV1,
 } from "@viva/core";
 import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
 import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
-import { isRedactedVivaLogValue, redactForVivaLog } from "./viva-redaction";
 
 /**
  * Retention high-water mark for the browser send queue. Once the socket has this
@@ -45,41 +60,32 @@ export type VivaAgentClientOptions = {
   WebSocketImpl?: typeof WebSocket;
 };
 
+/**
+ * `WEBSESSION-PASTE-01`. Exactly the four members the server's ingestion contract
+ * owns, and no identity. `PasteStudySetRequest` is `#[serde(deny_unknown_fields)]`
+ * over `{title, course, exam_date, pasted_text}`, so a `user_id`/`session_id`
+ * member is no longer merely ignored — it is a rejected request. The browser
+ * never held authority over who a study set belongs to: the server derives that
+ * from the authenticated caller.
+ */
 export type VivaPasteStudySetInput = {
-  userId: string;
   title: string;
-  course: string | null;
+  course?: string;
   examDate?: string;
   pastedText: string;
-  sessionId?: string;
 };
+
+/** The wire body, reconstructed field by field — never a spread of the input. */
+type VivaPasteStudySetRequestBody = Readonly<{
+  title: string;
+  course?: string;
+  exam_date?: string;
+  pasted_text: string;
+}>;
 
 export type VivaPasteStudySetOptions = {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
-};
-
-export type VivaSessionRefreshInput = {
-  sessionId: string;
-  sessionToken: string;
-  studySetId: string;
-  userId: string;
-};
-
-export type VivaSessionRefreshOptions = {
-  apiBaseUrl?: string;
-  fetchImpl?: typeof fetch;
-};
-
-export type VivaSessionRefreshResult = {
-  failure_class: null;
-  session: {
-    session_id: string;
-    study_set_id: string;
-    user_id: string;
-  };
-  session_token: string;
-  token_refresh_outcome: string;
 };
 
 export type VivaLibrarySnapshotOptions = {
@@ -132,9 +138,15 @@ export type VivaAgentReadinessProbe =
 
 export type VivaAgentConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
+/**
+ * `WEBSESSION-PROTOCOL-01`: a close carries a CODE and a cleanliness flag and
+ * nothing else. The peer-authored `reason` string is deliberately absent from
+ * this type: under Plan 05's typed-termination contract it is never parsed for
+ * classification and never displayed, so retaining it at all would only create a
+ * path for provider text to reach a learner surface.
+ */
 export type VivaAgentCloseDiagnostics = {
   code: number;
-  reason: string;
   wasClean: boolean;
 };
 
@@ -184,6 +196,33 @@ export type VivaAudioSendResult =
       error: VivaClientSendError;
     }>;
 
+/**
+ * `WEBSESSION-INTENT-01`: the outcome of ONE typed learner intent. `pending`
+ * (the turn slot is already occupied) and `socket_closed` (there is no live
+ * generation to carry it) are different facts, and `rejected` carries only a
+ * typed diagnostic — never the content that was refused.
+ */
+export type VivaTurnIntentSendResult =
+  | Readonly<{ status: "sent"; turnId: string }>
+  | Readonly<{ status: "pending"; turnId: string }>
+  | Readonly<{
+      status: "rejected";
+      turnId: string;
+      diagnostic: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }>;
+    }>
+  | Readonly<{
+      status: "socket_closed";
+      turnId: string;
+      retryable: true;
+      error: VivaClientSendError;
+    }>;
+
+export type VivaAgentSessionControllerTurnIntentAddition = {
+  sendTurnIntent(
+    input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>,
+  ): VivaTurnIntentSendResult;
+};
+
 export type VivaAudioChunkInput = Readonly<{
   turnId: string;
   sequence: number;
@@ -223,6 +262,77 @@ export type VivaAgentManuscriptIntent = {
   intent: ManuscriptIntent;
 };
 
+export type VivaAgentConceptStatusEvent = {
+  responseId: string;
+  conceptId: string;
+  status: AgentConceptStatus;
+};
+
+/**
+ * `WEBSESSION-PROTOCOL-01`: the ONLY shape a rejected frame may leave behind — a
+ * closed-vocabulary code and the JSON path it was raised at. Never an excerpt,
+ * never a parser message, never `String(error)`. `WEB_VOICE_INTERNAL` is the one
+ * fixed browser-local code; a local exception is mapped to it without reading
+ * the exception at all.
+ */
+export type VivaAgentDiagnostic = Readonly<{
+  code: VivaVoiceDiagnosticCode | VivaVoiceServerErrorCode | "WEB_VOICE_INTERNAL";
+  path: string | null;
+}>;
+
+/**
+ * `WEBSESSION-RECAP-01`: a structured error's terminality is the server's typed
+ * discriminant, kept as a discriminant. Its free-form `source`, `code`, and
+ * `message` are dropped at the boundary — terminality is never inferred from
+ * them, from socket status, or from a message regex.
+ */
+export type VivaAgentStructuredError =
+  | Readonly<{ terminality: "recoverable" }>
+  | Readonly<{
+      terminality: "terminal";
+      terminalReason: AgentTerminalSessionReason;
+    }>;
+
+/**
+ * `WEBSESSION-RECAP-01`: the v2 recap arrives ONCE, and whether it is complete
+ * or partial is a discriminant, not an optional flag a consumer may forget.
+ */
+export type VivaAgentRecapState =
+  | { kind: "complete"; recap: AgentStudySessionRecap }
+  | {
+      kind: "partial";
+      recap: AgentStudySessionRecap;
+      partialReason: AgentTerminalSessionReason;
+    };
+
+/**
+ * `WEBSESSION-DEFERRED-01`: a within-session recovery fact. It is never a
+ * terminal, never a grade, and never a mastery or schedule change, and
+ * `canRetrySameQuestion` is the server's authoritative affordance — retryability
+ * is never derived from `reason`.
+ */
+export type VivaAgentDeferredTurn = Readonly<{
+  turnId: string;
+  responseId: string;
+  questionId: string;
+  reason: VivaVoiceDeferralReason;
+  canRetrySameQuestion: boolean;
+}>;
+
+/**
+ * The complete typed protocol surface of `VivaAgentSessionState`. It replaces
+ * the former free-form `errors: string[]` and bare `recap`: there is deliberately
+ * no member that can carry arbitrary payload text.
+ */
+export type VivaAgentProtocolStateFields = {
+  diagnostics: VivaAgentDiagnostic[];
+  structuredErrors: VivaAgentStructuredError[];
+  deferredTurn?: VivaAgentDeferredTurn;
+  recap?: VivaAgentRecapState;
+  lastServerError?: Pick<VivaServerError, "code" | "retryable">;
+  termination?: VivaVoiceTermination;
+};
+
 export type VivaAgentSessionState = {
   status: VivaAgentConnectionStatus;
   close?: VivaAgentCloseDiagnostics;
@@ -247,13 +357,110 @@ export type VivaAgentSessionState = {
   sources: AgentStudySourceReference[];
   currentConceptStatus?: AgentConceptStatus;
   conceptStatuses: Record<string, AgentConceptStatus>;
+  /**
+   * Every graded concept status in arrival order, keyed by the response that
+   * produced it. The v2 recap's `source_moments` name only a `response_id` and a
+   * `source_id`, so this is the server's OWN link between a cited source and the
+   * status the same turn was graded at — without it, a recap source moment could
+   * only be labelled by guessing.
+   */
+  conceptStatusEvents: VivaAgentConceptStatusEvent[];
   manuscriptIntents: VivaAgentManuscriptIntent[];
-  recap?: AgentStudySessionRecap;
   audio: VivaAgentAudioOutput[];
   cancelledResponseIds: string[];
-  errors: string[];
   staleEvents: number;
-};
+} & VivaAgentProtocolStateFields;
+
+/* --------------------------------------------------------------------- *
+ * `WEBSESSION-RECOVERY-01`: the bounded reconnect policy, kept pure so the
+ * whole stop-condition table is provable without a socket, a DOM, or a clock.
+ * -------------------------------------------------------------------- */
+
+/** Three attempts, no more. The first already clears the server's 250 ms lease grace. */
+export const VIVA_AGENT_RECONNECT_DELAYS_MS = [500, 1_000, 2_000] as const;
+export const VIVA_AGENT_RECONNECT_JITTER_MS = 100;
+
+export type VivaAgentReconnectState =
+  | { kind: "idle"; attempts: 0 }
+  | { kind: "scheduled"; attempt: 1 | 2 | 3; delayMs: number }
+  | { kind: "refreshing_credential"; attempt: 1 | 2 | 3 }
+  | { kind: "connecting"; attempt: 1 | 2 | 3 }
+  | { kind: "exhausted"; attempts: 3 };
+
+/**
+ * Jitter is added, never subtracted, so even the fastest first retry (500 ms)
+ * stays clear of the 250 ms lease grace. A hostile or non-finite `random` is
+ * clamped rather than trusted.
+ */
+export function reconnectDelayMs(attempt: 1 | 2 | 3, random: number): number {
+  const bounded = Number.isFinite(random) ? Math.min(0.999_999, Math.max(0, random)) : 0;
+  return (
+    VIVA_AGENT_RECONNECT_DELAYS_MS[attempt - 1] +
+    Math.floor(bounded * VIVA_AGENT_RECONNECT_JITTER_MS)
+  );
+}
+
+export type VivaAgentReconnectStopReason =
+  | "recap"
+  | "terminal"
+  | "not_retryable"
+  | "explicit_stop"
+  | "still_open";
+
+export type VivaAgentReconnectDecision =
+  | { action: "schedule"; attempt: 1 | 2 | 3; delayMs: number }
+  | { action: "exhausted" }
+  | { action: "stop"; reason: VivaAgentReconnectStopReason };
+
+export type VivaAgentReconnectInputState = Pick<
+  VivaAgentSessionState,
+  "recap" | "status" | "structuredErrors" | "terminalReason" | "termination"
+>;
+
+/**
+ * The single place that decides whether a closed session may be retried.
+ *
+ * Retryability is read off Plan 05's typed termination — never off a close
+ * reason, a socket status guess, or a message. A recap (complete OR partial), a
+ * terminal reason, a terminal structured error, a nonretryable auth/protocol
+ * termination, a clean 1000, and an explicit learner stop are all final.
+ */
+export function vivaAgentReconnectDecision(input: {
+  attempts: 0 | 1 | 2 | 3;
+  explicitlyStopped: boolean;
+  random: number;
+  state: VivaAgentReconnectInputState;
+}): VivaAgentReconnectDecision {
+  if (input.explicitlyStopped) return { action: "stop", reason: "explicit_stop" };
+  if (input.state.recap) return { action: "stop", reason: "recap" };
+  if (input.state.terminalReason !== undefined) return { action: "stop", reason: "terminal" };
+  if (input.state.structuredErrors.some((entry) => entry.terminality === "terminal")) {
+    return { action: "stop", reason: "terminal" };
+  }
+  const termination = input.state.termination;
+  if (!termination) return { action: "stop", reason: "still_open" };
+  if (!termination.retryable) return { action: "stop", reason: "not_retryable" };
+  if (input.state.status !== "closed" && input.state.status !== "error") {
+    return { action: "stop", reason: "still_open" };
+  }
+  if (input.attempts >= VIVA_AGENT_RECONNECT_DELAYS_MS.length) return { action: "exhausted" };
+  const attempt = (input.attempts + 1) as 1 | 2 | 3;
+  return { action: "schedule", attempt, delayMs: reconnectDelayMs(attempt, input.random) };
+}
+
+/**
+ * What Plan 03's bounded ledger still holds, published read-only so the page can
+ * tell a learner their spoken answer is retained ON THIS DEVICE without ever
+ * touching the bytes or opening a second queue.
+ */
+export type VivaAgentRetainedAudioTurn = Readonly<{
+  turnId: string;
+  retainedFromSequence: number;
+  acceptedThroughSequence: number | null;
+  finalSequence: number | null;
+  endRequested: boolean;
+  retainedBytes: number;
+}>;
 
 export type VivaAgentSessionControllerOptions = VivaAgentClientOptions & {
   generationIdFactory?: (input: { reason: VivaAgentGenerationReason; sequence: number }) => string;
@@ -278,10 +485,14 @@ export type VivaAgentSessionController = {
   }) => WebSocket;
   reset: () => void;
   sendText: (text: string) => boolean;
+  sendTurnIntent: (
+    input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>,
+  ) => VivaTurnIntentSendResult;
   sendAudioChunk: (input: VivaAudioChunkInput) => VivaAudioSendResult;
   endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
   cancelAudioTurn: (turnId: string) => void;
   retryPendingAudio: () => VivaAudioSendResult;
+  getRetainedAudioTurn: () => VivaAgentRetainedAudioTurn | null;
   acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
   cancel: () => void;
   stop: () => void;
@@ -292,8 +503,6 @@ export type VivaAgentSessionController = {
 const bundledVivaAgentWsUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL;
 const bundledVivaAgentHttpUrl = process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL;
 const bundledVivaApiUrl = process.env.NEXT_PUBLIC_VIVA_API_URL;
-const bundledVivaStaticExport = process.env.VIVA_STATIC_EXPORT;
-const bundledNextPublicVivaStaticExport = process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT;
 const defaultVivaAgentWsUrl = "ws://127.0.0.1:4318/ws";
 
 export function vivaAgentWsUrl(env?: Record<string, string | undefined>): string {
@@ -360,19 +569,51 @@ export function vivaAgentHttpBaseUrl(env?: Record<string, string | undefined>): 
   }
 }
 
+/**
+ * `WEBSESSION-READY-01`: one readiness probe's hard deadline, and the interval
+ * the page's single poll owner waits AFTER a probe settles. The deadline is
+ * strictly inside the interval, so a settle-then-schedule loop can never be
+ * overtaken by its own successor.
+ */
+export const VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS = 4_000;
+export const VIVA_AGENT_READINESS_POLL_INTERVAL_MS = 5_000;
+
+/**
+ * One readiness observation, bounded and abortable.
+ *
+ * Both endpoints share ONE `AbortController`, so a caller that goes away (or a
+ * probe that outlives its deadline) cancels the work it started instead of
+ * leaving a request to resolve into a component that no longer exists. The
+ * result is total: an unreachable, malformed, or timed-out agent is a
+ * `status:"offline"` FACT, never a thrown promise, and a deadline states its own
+ * bound rather than echoing the rejected request's message. There is no retry
+ * here — repetition belongs to the page's single poll owner.
+ */
 export async function fetchVivaAgentReadinessProbe({
   apiBaseUrl = vivaAgentHttpBaseUrl(),
   fetchImpl = fetch,
+  signal,
 }: {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 } = {}): Promise<VivaAgentReadinessProbe> {
   if (!apiBaseUrl) return { status: "api_missing" };
   const base = trimTrailingSlash(apiBaseUrl);
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+  const forwardAbort = () => controller.abort();
+  if (signal?.aborted) forwardAbort();
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+
   try {
     const [healthResponse, readyResponse] = await Promise.all([
-      fetchImpl(`${base}/health/brain`),
-      fetchImpl(`${base}/ready`),
+      fetchImpl(`${base}/health/brain`, { signal: controller.signal }),
+      fetchImpl(`${base}/ready`, { signal: controller.signal }),
     ]);
     const [health, ready] = await Promise.all([
       healthResponse.json() as Promise<VivaAgentBrainHealthEndpoint>,
@@ -393,11 +634,35 @@ export async function fetchVivaAgentReadinessProbe({
       status: "observed",
     };
   } catch (error) {
+    // Nothing may outlive a failed probe: if one endpoint answered and the
+    // other rejected, the survivor is cancelled here rather than left in
+    // flight. A successful probe has nothing left to cancel.
+    const cancelled = controller.signal.aborted;
+    controller.abort();
+    if (timedOut) {
+      return {
+        apiBaseUrl: base,
+        error: `readiness endpoints did not answer within ${VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS} ms`,
+        status: "offline",
+      };
+    }
+    if (cancelled) {
+      // The caller withdrew. That is a cancellation FACT; the rejected request's
+      // own message is never carried into a probe a surface could render.
+      return {
+        apiBaseUrl: base,
+        error: "readiness probe was cancelled before the endpoints answered",
+        status: "offline",
+      };
+    }
     return {
       apiBaseUrl: base,
       error: error instanceof Error ? error.message : String(error),
       status: "offline",
     };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", forwardAbort);
   }
 }
 
@@ -472,23 +737,40 @@ export async function pasteStudySetToVivaApi(
     throw new Error("Viva API URL is unavailable");
   }
   const fetchImpl = options.fetchImpl ?? fetch;
+  const course = suppliedIngestionValue(input.course);
+  const examDate = suppliedIngestionValue(input.examDate);
+  // Reconstructed member by member from the four contract fields. A spread of
+  // `input` would carry whatever a runtime caller attached to it — exactly the
+  // shape `deny_unknown_fields` now refuses — so there is no spread here.
+  const requestBody: VivaPasteStudySetRequestBody = {
+    pasted_text: input.pastedText,
+    title: input.title,
+    ...(course === undefined ? {} : { course }),
+    ...(examDate === undefined ? {} : { exam_date: examDate }),
+  };
   const response = await fetchImpl(`${trimTrailingSlash(apiBaseUrl)}/study-sets/paste`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      user_id: input.userId,
-      title: input.title,
-      course: input.course,
-      ...(input.examDate ? { exam_date: input.examDate } : {}),
-      pasted_text: input.pastedText,
-      ...(input.sessionId ? { session_id: input.sessionId } : {}),
-    }),
+    body: JSON.stringify(requestBody),
   });
   if (!response.ok) {
     throw new Error(`Viva paste ingestion failed with HTTP ${response.status}`);
   }
   const body = (await response.json()) as PasteIngestionResponse;
-  return studySetFromPasteIngestionResponse(body, { examDate: input.examDate });
+  return studySetFromPasteIngestionResponse(body, { examDate });
+}
+
+/**
+ * An optional ingestion field the learner left blank is ABSENT, not present and
+ * empty. Rust `PasteStudySetRequest` types `course` and `exam_date` as
+ * `Option<String>`, so `""` would arrive as `Some("")` — a supplied-looking exam
+ * input that `create_paste_study_set` would carry into its authoritative
+ * `exam_at` instant. Blankness is the ONLY thing decided here: a real value is
+ * forwarded byte for byte, padding included, because the browser does not own
+ * ingestion content.
+ */
+function suppliedIngestionValue(value: string | undefined): string | undefined {
+  return value === undefined || value.trim() === "" ? undefined : value;
 }
 
 export async function fetchVivaLibrarySnapshot(
@@ -577,27 +859,169 @@ export async function deleteVivaSessionHistory(
   return response.json();
 }
 
-export async function refreshVivaSessionToken(
-  input: VivaSessionRefreshInput,
-  options: VivaSessionRefreshOptions = {},
-): Promise<VivaSessionRefreshResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const base = options.apiBaseUrl ? trimTrailingSlash(options.apiBaseUrl) : "";
-  const response = await fetchImpl(`${base}/api/viva-session/refresh`, {
-    body: JSON.stringify({
-      session_id: input.sessionId,
-      session_token: input.sessionToken,
-      study_set_id: input.studySetId,
-      user_id: input.userId,
-    }),
-    headers: { "content-type": "application/json" },
-    method: "POST",
-  });
-  const body = (await response.json().catch(() => null)) as unknown;
-  if (!response.ok || !isVivaSessionRefreshResult(body)) {
-    throw new Error("Viva session refresh failed");
+/* --------------------------------------------------------------------- *
+ * `WEBSESSION-DATA-01` — the authenticated study projection client.
+ *
+ * This is the ONLY study/session read model the live session renders. There is
+ * no library-metadata fallback and no seed overlay: a missing, invalid,
+ * mismatched, or unavailable projection is a sanitized pre-loop failure.
+ * -------------------------------------------------------------------- */
+
+export type AuthenticatedStudyProjectionRequest = Readonly<{
+  studySetId: string;
+  voiceSessionId: string;
+  accessToken: string;
+  signal: AbortSignal;
+}>;
+
+export type AuthenticatedStudyProjectionFailureCause =
+  | "invalid_request"
+  | "unauthorized"
+  | "not_found"
+  | "rate_limited"
+  | "timeout"
+  | "invalid_projection"
+  | "unavailable";
+
+export type AuthenticatedStudyProjectionResult =
+  | { status: "ready"; projection: AuthenticatedStudyProjectionV1 }
+  | {
+      status: "failed";
+      cause: AuthenticatedStudyProjectionFailureCause;
+      retryAfterSeconds?: number;
+    };
+
+/** The browser's own per-attempt deadline, matching Plan 11's BFF deadline. */
+export const VIVA_STUDY_PROJECTION_TIMEOUT_MS = 8_000;
+
+type ProjectionAttemptOutcome = {
+  result: AuthenticatedStudyProjectionResult;
+  retryable: boolean;
+};
+
+/**
+ * Fetches and validates the authenticated study projection.
+ *
+ * The request carries the signed access token in `authorization` and NOTHING in
+ * the URL: a credential in a query string is a credential in every proxy log and
+ * `Referer` header. `Sec-Fetch-Site` is deliberately NOT set — it is a forbidden
+ * header name, so a script that tried would have it dropped; the browser's own
+ * same-origin fetch metadata is what satisfies Plan 11's `same-origin` guard, and
+ * that is exactly why this must stay a same-origin relative URL.
+ *
+ * Exactly one retry, and only after a 502 or a 504, each with its own fresh
+ * 8,000 ms deadline. 400/401/404/429 are answers, not outages, and the 503 the
+ * BFF emits when the shared `SessionSecurityStore` is unavailable is a stop —
+ * retrying it would only spend more admission budget, and there is no agent
+ * fallback to fall through to.
+ */
+export async function fetchAuthenticatedStudyProjection(
+  input: AuthenticatedStudyProjectionRequest,
+  fetchImpl: typeof fetch = fetch,
+): Promise<AuthenticatedStudyProjectionResult> {
+  let attempt = await attemptAuthenticatedStudyProjection(input, fetchImpl);
+  if (attempt.retryable && !input.signal.aborted) {
+    attempt = await attemptAuthenticatedStudyProjection(input, fetchImpl);
   }
-  return body;
+  return attempt.result;
+}
+
+async function attemptAuthenticatedStudyProjection(
+  input: AuthenticatedStudyProjectionRequest,
+  fetchImpl: typeof fetch,
+): Promise<ProjectionAttemptOutcome> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, VIVA_STUDY_PROJECTION_TIMEOUT_MS);
+  const forwardAbort = () => controller.abort();
+  if (input.signal.aborted) forwardAbort();
+  input.signal.addEventListener("abort", forwardAbort, { once: true });
+
+  try {
+    const response = await fetchImpl(
+      `/api/viva-session/projection?${new URLSearchParams({
+        study_set_id: input.studySetId,
+        voice_session_id: input.voiceSessionId,
+      })}`,
+      {
+        cache: "no-store",
+        headers: { authorization: `Bearer ${input.accessToken}` },
+        method: "GET",
+        signal: controller.signal,
+      },
+    );
+    if (timedOut) return projectionFailure("timeout");
+    if (response.status === 200) {
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        return projectionFailure("invalid_projection");
+      }
+      try {
+        return {
+          result: { projection: validateAuthenticatedStudyProjectionV1(body), status: "ready" },
+          retryable: false,
+        };
+      } catch {
+        // The validator's message names fields and values from an untrusted
+        // upstream body; only the coarse cause is allowed out of this function.
+        return projectionFailure("invalid_projection");
+      }
+    }
+    return projectionStatusFailure(response);
+  } catch {
+    return projectionFailure(timedOut ? "timeout" : "unavailable");
+  } finally {
+    clearTimeout(timer);
+    input.signal.removeEventListener("abort", forwardAbort);
+  }
+}
+
+function projectionFailure(
+  cause: AuthenticatedStudyProjectionFailureCause,
+  options: { retryable?: boolean; retryAfterSeconds?: number } = {},
+): ProjectionAttemptOutcome {
+  return {
+    result:
+      options.retryAfterSeconds === undefined
+        ? { cause, status: "failed" }
+        : { cause, retryAfterSeconds: options.retryAfterSeconds, status: "failed" },
+    retryable: options.retryable === true,
+  };
+}
+
+function projectionStatusFailure(response: Response): ProjectionAttemptOutcome {
+  switch (response.status) {
+    case 400:
+      return projectionFailure("invalid_request");
+    case 401:
+    case 403:
+      return projectionFailure("unauthorized");
+    case 404:
+      return projectionFailure("not_found");
+    case 429:
+      return projectionFailure("rate_limited", {
+        retryAfterSeconds: projectionRetryAfterSeconds(response.headers.get("retry-after")),
+      });
+    case 502:
+      return projectionFailure("unavailable", { retryable: true });
+    case 504:
+      return projectionFailure("timeout", { retryable: true });
+    default:
+      return projectionFailure("unavailable");
+  }
+}
+
+/** Whole delta-seconds only; a date-form or non-numeric hint is no hint at all. */
+function projectionRetryAfterSeconds(value: string | null): number | undefined {
+  const raw = value?.trim();
+  if (!raw || !/^[0-9]+$/.test(raw)) return undefined;
+  const seconds = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : undefined;
 }
 
 function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
@@ -613,38 +1037,20 @@ function vivaLibraryApiBaseUrl(options: VivaLibrarySnapshotOptions): string {
   return apiBaseUrl;
 }
 
-function isVivaSessionRefreshResult(value: unknown): value is VivaSessionRefreshResult {
-  return (
-    isRecord(value) &&
-    value.failure_class === null &&
-    isRecord(value.session) &&
-    typeof value.session.session_id === "string" &&
-    typeof value.session.study_set_id === "string" &&
-    typeof value.session.user_id === "string" &&
-    typeof value.session_token === "string" &&
-    value.session_token.trim().length > 0 &&
-    typeof value.token_refresh_outcome === "string"
-  );
-}
-
 function configuredVivaAgentHttpBaseUrl(): string | undefined {
   const explicitAgentHttp = envRecord().NEXT_PUBLIC_VIVA_AGENT_HTTP_URL ?? bundledVivaAgentHttpUrl;
   return explicitAgentHttp?.trim() ? trimTrailingSlash(explicitAgentHttp.trim()) : undefined;
 }
 
-export function vivaStaticExportEnabled(env?: Record<string, string | undefined>): boolean {
-  const explicitEnv = env !== undefined;
-  const resolvedEnv = env ?? envRecord();
-  const publicFlag =
-    resolvedEnv.NEXT_PUBLIC_VIVA_STATIC_EXPORT ??
-    (explicitEnv ? undefined : bundledNextPublicVivaStaticExport);
-  const serverFlag =
-    resolvedEnv.VIVA_STATIC_EXPORT ?? (explicitEnv ? undefined : bundledVivaStaticExport);
-  return publicFlag === "1" || serverFlag === "1";
-}
-
+/**
+ * `WEBSESSION-STATIC-01` under the recorded `D-06 STATIC_EXPORT: DELETE`. A
+ * browser call always goes to the same-origin Next route; the configured public
+ * agent origin is a SERVER base and never a browser destination. There is no
+ * remaining flag, predicate, or bundled variable that could route a browser
+ * request past the proxy — being in a browser is now the only condition.
+ */
 function browserVivaLibraryProxyBaseUrl(): string | undefined {
-  if (vivaStaticExportEnabled() || typeof window === "undefined") return undefined;
+  if (typeof window === "undefined") return undefined;
   return `${window.location.origin}/api/viva-library`;
 }
 
@@ -657,8 +1063,14 @@ function vivaLibraryAuthHeaders(options: VivaLibrarySnapshotOptions): HeadersIni
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+/**
+ * Plan 05's own JSON entry point, not a local `JSON.parse`: a malformed body is
+ * its typed `VOICE_PROTOCOL_MALFORMED_JSON` at `$`, and an oversized one is
+ * `VOICE_PROTOCOL_FRAME_TOO_LARGE`, rather than a browser `SyntaxError` whose
+ * message would have to be sanitized.
+ */
 export function parseVivaAgentMessage(data: string): VivaServerFrame {
-  return parseVivaServerFrame(JSON.parse(data));
+  return parseVivaServerFrameJson(data);
 }
 
 export function agentProtocolVersion(): number {
@@ -672,10 +1084,12 @@ export function initialVivaAgentSessionState(): VivaAgentSessionState {
     transcript: "",
     sources: [],
     conceptStatuses: {},
+    conceptStatusEvents: [],
     manuscriptIntents: [],
     audio: [],
     cancelledResponseIds: [],
-    errors: [],
+    diagnostics: [],
+    structuredErrors: [],
     staleEvents: 0,
   };
 }
@@ -694,12 +1108,16 @@ export function vivaAgentReducer(
   if (frame.type === "audio_turn_accepted") {
     return state;
   }
+  // `VOICE-ERROR-001`: only the typed pair survives. The frame's `message` is a
+  // free-form peer string and is discarded here, at the boundary, so no later
+  // consumer can be tempted to read it.
   if (frame.type === "error") {
     return {
       ...state,
       status: "error",
       pendingSubmission: undefined,
-      errors: [...state.errors, sanitizeAgentError(frame.message)],
+      lastServerError: { code: frame.error.code, retryable: frame.error.retryable },
+      diagnostics: [...state.diagnostics, { code: frame.error.code, path: "$.error" }],
     };
   }
 
@@ -726,12 +1144,24 @@ export function vivaAgentReducer(
         state.pendingSubmission,
       );
       if (state.recap && event.phase !== "recap") return state;
-      if (event.terminal_reason && event.phase === "recap" && !state.recap) {
+      // A trailing terminal phase that CONTRADICTS an already-recorded terminal
+      // reason is a cross-frame invariant violation. Plan 05's parser is
+      // per-frame and cannot see it, so it is recorded here with Plan 05's own
+      // sanitized invariant code and the recorded reason is kept: a session does
+      // not end twice, for two different reasons.
+      if (
+        event.terminal_reason &&
+        state.terminalReason &&
+        event.terminal_reason !== state.terminalReason
+      ) {
         return {
           ...state,
-          phase: event.phase,
+          diagnostics: [
+            ...state.diagnostics,
+            { code: "VOICE_PROTOCOL_INVARIANT", path: "$.event.terminal_reason" },
+          ],
           pendingSubmission,
-          terminalReason: event.terminal_reason,
+          phase: event.phase,
         };
       }
       return {
@@ -739,6 +1169,9 @@ export function vivaAgentReducer(
         phase: event.phase,
         pendingSubmission,
         terminalReason: event.terminal_reason ?? state.terminalReason,
+        termination: event.terminal_reason
+          ? inBandTerminalTermination(event.terminal_reason)
+          : state.termination,
       };
     }
     case "question_started":
@@ -758,6 +1191,10 @@ export function vivaAgentReducer(
         currentConceptStatus: undefined,
         manuscriptIntents: [],
         recap: undefined,
+        // A valid question progression is what clears a deferred turn: the
+        // learner is being asked something again, so the previous deferral is
+        // no longer the state to act on.
+        deferredTurn: undefined,
       };
     case "transcript_delta":
       return { ...state, transcript: state.transcript + event.text };
@@ -769,7 +1206,30 @@ export function vivaAgentReducer(
         transcriptConfidence: event.confidence ?? undefined,
       };
     case "answer_evaluated":
-      return { ...state, evaluation: event.evaluation, pendingSubmission: undefined };
+      return {
+        ...state,
+        evaluation: event.evaluation,
+        pendingSubmission: undefined,
+        deferredTurn:
+          state.deferredTurn?.responseId === event.response_id ? undefined : state.deferredTurn,
+      };
+    case "turn_deferred":
+      // `VOICE-TURN-002`: an ungraded, nonterminal turn outcome. It changes NO
+      // learner fact — no evaluation, no concept status, no recap, no schedule —
+      // and it never becomes a terminal reason or a reconnect trigger. The
+      // pending slot is released so the learner can act on the server's own
+      // `can_retry_same_question` affordance.
+      return {
+        ...state,
+        deferredTurn: {
+          canRetrySameQuestion: event.can_retry_same_question,
+          questionId: event.question_id,
+          reason: event.reason,
+          responseId: event.response_id,
+          turnId: event.turn_id,
+        },
+        pendingSubmission: undefined,
+      };
     case "source_reference":
       return { ...state, currentSource: event.source, sources: [...state.sources, event.source] };
     case "concept_status":
@@ -777,6 +1237,14 @@ export function vivaAgentReducer(
         ...state,
         currentConceptStatus: event.status,
         conceptStatuses: { ...state.conceptStatuses, [event.concept_id]: event.status },
+        conceptStatusEvents: [
+          ...state.conceptStatusEvents,
+          {
+            conceptId: event.concept_id,
+            responseId: event.response_id,
+            status: event.status,
+          },
+        ],
       };
     case "manuscript_intent":
       return {
@@ -787,7 +1255,25 @@ export function vivaAgentReducer(
         ],
       };
     case "recap_ready":
-      return { ...state, phase: "recap", pendingSubmission: undefined, recap: event.recap };
+      // `VOICE-TERMINAL-001`: `partial` is a discriminant. A partial recap is
+      // terminal the instant it arrives, WITHOUT waiting for a trailing phase
+      // that the transport may never deliver; a complete recap is a success and
+      // is not a terminal reason at all.
+      return event.partial
+        ? {
+            ...state,
+            phase: "recap",
+            pendingSubmission: undefined,
+            recap: { kind: "partial", partialReason: event.partial_reason, recap: event.recap },
+            terminalReason: event.partial_reason,
+            termination: inBandTerminalTermination(event.partial_reason),
+          }
+        : {
+            ...state,
+            phase: "recap",
+            pendingSubmission: undefined,
+            recap: { kind: "complete", recap: event.recap },
+          };
     case "audio_delta":
       return {
         ...state,
@@ -827,16 +1313,46 @@ export function vivaAgentReducer(
         cancelledResponseIds,
       };
     }
-    case "structured_error":
+    case "structured_error": {
+      // `VOICE-TERMINAL-002`: terminality is read off the discriminant and
+      // nothing else. A recoverable one leaves the socket, the phase, and the
+      // pending turn exactly as they were — it names no turn, so it resolves
+      // none. A terminal one closes input immediately.
+      if (event.terminality === "recoverable") {
+        return {
+          ...state,
+          structuredErrors: [...state.structuredErrors, { terminality: "recoverable" }],
+        };
+      }
       return {
         ...state,
-        status: "error",
         pendingSubmission: undefined,
-        errors: [...state.errors, sanitizeAgentError(event.message)],
+        structuredErrors: [
+          ...state.structuredErrors,
+          { terminalReason: event.terminal_reason, terminality: "terminal" },
+        ],
+        terminalReason: event.terminal_reason,
+        termination: inBandTerminalTermination(event.terminal_reason),
       };
+    }
     default:
       return state;
   }
+}
+
+/**
+ * The provisional termination for a terminal fact stated IN BAND, before the
+ * socket has actually closed. The classifier's `closeCode` is informational for
+ * a `terminal` kind (retryability is fixed at `false` by the reason), so the
+ * normal close code stands in until the real close arrives and the controller
+ * reclassifies with the true code. The kind and the reason never change.
+ */
+function inBandTerminalTermination(reason: AgentTerminalSessionReason): VivaVoiceTermination {
+  return classifyVivaVoiceTermination({
+    closeCode: VIVA_VOICE_NORMAL_CLOSE_CODE,
+    terminalReason: reason,
+    wasClean: true,
+  });
 }
 
 function pendingSubmissionForSessionPhase(
@@ -848,22 +1364,89 @@ function pendingSubmissionForSessionPhase(
     : undefined;
 }
 
-function sanitizeAgentError(message: string): string {
-  if (!message) return "agent error";
-  const normalized = message.replace(/\s+/g, " ").trim().toLowerCase();
-  if (legacyAgentAuthReasons.has(normalized)) return "session auth failed";
-  const redacted = redactForVivaLog({ message });
-  if (isRecord(redacted) && isRedactedVivaLogValue(redacted.message)) {
-    return "sanitized provider error";
+/**
+ * The one browser-local diagnostic. Nothing about the local exception is read —
+ * not its message, not its name, not `String(error)` — so no browser, provider,
+ * or transcript text can reach client state through a thrown value.
+ */
+const WEB_INTERNAL_DIAGNOSTIC: VivaAgentDiagnostic = { code: "WEB_VOICE_INTERNAL", path: null };
+
+/**
+ * Catches ONLY `VivaVoiceProtocolError`'s `{code, path}`. Any other local
+ * exception collapses to the fixed internal diagnostic above.
+ */
+function diagnosticForCaughtError(error: unknown): VivaAgentDiagnostic {
+  if (error instanceof VivaVoiceProtocolError) {
+    return { code: error.code, path: error.path };
   }
-  return String(isRecord(redacted) ? redacted.message : message)
-    .replace(/\s+/g, " ")
-    .slice(0, 160);
+  return WEB_INTERNAL_DIAGNOSTIC;
 }
 
-function webSocketErrorMessage(token?: string | null): string {
-  if (token) return "WebSocket session token preflight failed";
-  return "WebSocket error";
+export type VivaBrowserFrameSerializationResult =
+  | Readonly<{ status: "serialized"; payload: string }>
+  | Readonly<{
+      status: "rejected";
+      diagnostic: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }>;
+    }>;
+
+/**
+ * `WEBSESSION-AUTHORITY-01`: the browser's outbound boundary, and the only way a
+ * frame becomes bytes.
+ *
+ * Order matters. The envelope is serialized ONCE, measured in UTF-8 bytes against
+ * Plan 05's exported `VIVA_VOICE_MAX_TEXT_FRAME_BYTES`, and only then handed to
+ * Plan 05's own parser — so an oversized payload is refused before anything
+ * parses it, and a forged one (a `tool_result` the browser has no authority to
+ * send) is refused before anything transmits it. There is no second validator
+ * and no local re-derivation of the taxonomy: only `{code, path}` survives, so a
+ * refused frame's own content can never reach state, a log, or the DOM.
+ *
+ * Audio frames do NOT come through here. Plan 03 owns their chunk/turn bounds,
+ * queue, retained ledger, and backpressure, and a second size check on that path
+ * would be a second, drifting authority.
+ */
+export function serializeVivaBrowserClientFrame(
+  frame: VivaBrowserClientFrame,
+): VivaBrowserFrameSerializationResult {
+  let payload: string;
+  try {
+    payload = JSON.stringify(frame);
+  } catch {
+    return { diagnostic: WEB_INTERNAL_FRAME_DIAGNOSTIC, status: "rejected" };
+  }
+  if (typeof payload !== "string") {
+    return { diagnostic: WEB_INTERNAL_FRAME_DIAGNOSTIC, status: "rejected" };
+  }
+  if (new TextEncoder().encode(payload).byteLength > VIVA_VOICE_MAX_TEXT_FRAME_BYTES) {
+    return {
+      diagnostic: { code: "VOICE_PROTOCOL_FRAME_TOO_LARGE", path: "$" },
+      status: "rejected",
+    };
+  }
+  try {
+    parseVivaClientFrameJson(payload);
+  } catch (error) {
+    return { diagnostic: outboundFrameDiagnostic(error), status: "rejected" };
+  }
+  return { payload, status: "serialized" };
+}
+
+/**
+ * The frame-shaped counterpart of `WEB_INTERNAL_DIAGNOSTIC`. The serialization
+ * result's diagnostic is a `{code, path}` pair with a non-null path, so a local
+ * failure that is not one of Plan 05's typed rejections collapses to this fixed
+ * envelope-level value rather than to anything derived from the exception.
+ */
+const WEB_INTERNAL_FRAME_DIAGNOSTIC: Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> = {
+  code: "VOICE_PROTOCOL_INVALID_FIELD",
+  path: "$",
+};
+
+function outboundFrameDiagnostic(
+  error: unknown,
+): Readonly<{ code: VivaVoiceDiagnosticCode; path: string }> {
+  if (error instanceof VivaVoiceProtocolError) return { code: error.code, path: error.path };
+  return WEB_INTERNAL_FRAME_DIAGNOSTIC;
 }
 
 export function createVivaAgentSessionController(
@@ -989,6 +1572,24 @@ export function createVivaAgentSessionController(
     audioLedger = null;
   }
 
+  /**
+   * `WEBSESSION-AUDIO-01`: rebinds the retained turn onto the CURRENT generation
+   * so a replay re-serializes the same turn id, the same sequence numbers, and
+   * the same bytes onto the replacement socket. Only the serialization
+   * bookkeeping is reset — the retained chunks are untouched, so this is a
+   * replay of the original turn, not a new one, and there is still exactly one
+   * queue.
+   */
+  function rebindRetainedTurnToActiveGeneration() {
+    const ledger = audioLedger;
+    const generationId = activeGeneration?.id;
+    if (!ledger || !generationId || ledger.generationId === generationId) return;
+    ledger.generationId = generationId;
+    ledger.serializedChunkCount = 0;
+    ledger.lastSerializedSequence = null;
+    ledger.endSerialized = false;
+  }
+
   function applyAudioTurnAccepted(frame: AgentAudioTurnAcceptedFrame) {
     const ledger = audioLedger;
     const matchesInFlightTurn =
@@ -1022,28 +1623,76 @@ export function createVivaAgentSessionController(
     return socket === nextSocket && activeGeneration?.id === generation.id;
   }
 
-  function sendFrame(frame: VivaClientFrame): boolean {
-    const generationId = activeGeneration?.id;
-    if (socket?.readyState !== 1 || !generationId) {
-      setState({
-        ...state,
-        status: "error",
-        pendingSubmission: undefined,
-        errors: [...state.errors, "WebSocket is not open"],
-      });
+  function recordSendRejection(diagnostic: VivaAgentDiagnostic) {
+    setState({
+      ...state,
+      status: "error",
+      pendingSubmission: undefined,
+      diagnostics: [...state.diagnostics, diagnostic],
+    });
+  }
+
+  /**
+   * The controller's sender for command frames. Its parameter is Plan 05's
+   * browser-sendable union, and every byte it transmits comes from
+   * `serializeVivaBrowserClientFrame` — so an oversized or forged frame is
+   * refused here, before `WebSocket.send`, with only a typed `{code, path}`.
+   *
+   * It is deliberately NOT the controller's only `socket.send`, and must not
+   * become one. An auditor of `WEBSESSION-AUTHORITY-01` should read the call
+   * graph, not this sentence; the other two writers are:
+   *  - `sendTurnIntent`, which serializes through the SAME function above and
+   *    then sends inline, because that send has to be ordered against
+   *    `pendingSubmission` and the recap/terminal checks around it;
+   *  - Plan 03's audio transport (`pumpAudioQueue`, `cancelAudioTurn`), which
+   *    writes its own chunk/end/cancel frames against its retained ledger,
+   *    backpressure budget, and ACK accounting. Routing those through here
+   *    would impose the second audio size check this task forbids.
+   *
+   * So the boundary this function guards is the browser's TEXT-frame authority
+   * — `tool_result` unrepresentable, 64 KiB envelope cap — not "every outbound
+   * byte".
+   */
+  function sendFrame(frame: VivaBrowserClientFrame): boolean {
+    if (socket?.readyState !== 1 || !activeGeneration) {
+      recordSendRejection(WEB_INTERNAL_DIAGNOSTIC);
       return false;
     }
-    socket.send(JSON.stringify(withClientGeneration(frame, generationId)));
+    const serialized = serializeVivaBrowserClientFrame(frame);
+    if (serialized.status === "rejected") {
+      recordSendRejection(serialized.diagnostic);
+      return false;
+    }
+    socket.send(serialized.payload);
     return true;
   }
 
+  /**
+   * `client_generation_id` is never the caller's to choose, so a command frame is
+   * stamped with the live generation here and only then handed to `sendFrame`.
+   */
+  function sendGenerationFrame(draft: VivaClientFrameDraft): boolean {
+    const generationId = activeGeneration?.id;
+    if (socket?.readyState !== 1 || !generationId) {
+      recordSendRejection(WEB_INTERNAL_DIAGNOSTIC);
+      return false;
+    }
+    return sendFrame(withClientGeneration(draft, generationId));
+  }
+
+  /**
+   * A submission is refused once the session has a terminal fact or a recap:
+   * after either, the wire turn the answer would belong to no longer exists, and
+   * an optimistic send would be a false promise to the learner.
+   */
   function sendSubmissionFrame(
     kind: VivaAgentPendingSubmission["kind"],
-    frame: VivaClientFrame,
+    frame: VivaClientFrameDraft,
   ): boolean {
     const generationId = activeGeneration?.id;
     if (!generationId || state.pendingSubmission) return false;
-    if (sendFrame(frame)) {
+    if (state.recap || state.terminalReason) return false;
+    if (sendGenerationFrame(frame)) {
       setState({ ...state, pendingSubmission: { generationId, kind } });
       return true;
     }
@@ -1066,12 +1715,26 @@ export function createVivaAgentSessionController(
     setState({ ...initialVivaAgentSessionState(), generation, status: "connecting" });
     setSocketHandler(nextSocket, "open", () => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
-      sendFrame(sessionConfigFrame(currentSession, currentSessionToken, generation.id));
+      const signedCredential = currentSessionToken;
+      if (!signedCredential) {
+        // `VOICE-AUTH-001`: the signed credential is a REQUIRED member of the
+        // canonical first frame. An unauthenticated generation is refused here
+        // rather than serialized as `session_token: null` for the server to
+        // reject — the browser already knows it has no authority.
+        setState({
+          ...state,
+          diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
+          pendingSubmission: undefined,
+          status: "error",
+        });
+        return;
+      }
+      sendFrame(sessionConfigFrame(currentSession, signedCredential, generation.id));
     });
     setSocketHandler(nextSocket, "message", (event) => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
-      if (typeof event.data !== "string") return;
       try {
+        if (typeof event.data !== "string") return;
         const frame = parseVivaAgentMessage(event.data);
         if (frame.type === "audio_turn_accepted") {
           applyAudioTurnAccepted(frame);
@@ -1079,22 +1742,32 @@ export function createVivaAgentSessionController(
         }
         setState(vivaAgentReducer(state, frame));
       } catch (error) {
+        // The frame is rejected, not repaired: only Plan 05's typed `{code, path}`
+        // (or the fixed internal code) is recorded. A rejected frame never
+        // changes phase, question, transcript, or terminality.
         setState({
           ...state,
-          status: "error",
-          pendingSubmission: undefined,
-          errors: [...state.errors, error instanceof Error ? error.message : String(error)],
+          diagnostics: [...state.diagnostics, diagnosticForCaughtError(error)],
         });
       }
     });
     setSocketHandler(nextSocket, "close", (event) => {
       if (!isActiveSocketGeneration(nextSocket, generation)) return;
+      const close = closeDiagnosticsForEvent(event);
       setState({
         ...state,
+        close,
         generation,
         pendingSubmission: undefined,
         status: "closed",
-        close: closeDiagnosticsForEvent(event),
+        // The ONLY close classifier. The peer's close-reason string is not an
+        // input to it and is not retained anywhere in this state.
+        termination: classifyVivaVoiceTermination({
+          closeCode: close.code,
+          error: state.lastServerError ? { ...state.lastServerError, message: "" } : undefined,
+          terminalReason: state.terminalReason,
+          wasClean: close.wasClean,
+        }),
       });
     });
     setSocketHandler(nextSocket, "error", () => {
@@ -1103,7 +1776,7 @@ export function createVivaAgentSessionController(
         ...state,
         pendingSubmission: undefined,
         status: "error",
-        errors: [...state.errors, webSocketErrorMessage(currentSessionToken)],
+        diagnostics: [...state.diagnostics, WEB_INTERNAL_DIAGNOSTIC],
       });
     });
     return nextSocket;
@@ -1137,11 +1810,51 @@ export function createVivaAgentSessionController(
       setState(initialVivaAgentSessionState());
     },
     sendText(text: string) {
-      return sendSubmissionFrame("text", {
-        type: "text",
+      // `VOICE-TURN-001`: there is no v5 plain text frame. A typed answer is a
+      // typed INTENT, bound to its own wire turn, so a citation challenge can
+      // never be smuggled through the same channel as an answer.
+      return (
+        this.sendTurnIntent({
+          intent: { kind: "answer_text", text },
+          turnId: createTurnIntentId(),
+        }).status === "sent"
+      );
+    },
+    /**
+     * The one typed-intent send. The frame is serialized and then validated by
+     * PLAN 05's OWN parser before it can reach the socket, so an oversized or
+     * malformed intent is refused at the browser boundary with that parser's
+     * `{code, path}` — no second validator, no local size arithmetic, and never
+     * the refused content in a result or in state.
+     */
+    sendTurnIntent(input: Readonly<{ turnId: string; intent: VivaClientTurnIntent }>) {
+      const turnId = input.turnId;
+      const generationId = activeGeneration?.id;
+      if (!generationId) {
+        return intentSocketClosedResult(turnId, "Viva voice session has no open generation");
+      }
+      const serialized = serializeVivaBrowserClientFrame({
+        client_generation_id: generationId,
+        intent: input.intent,
+        turn_id: turnId,
+        type: "turn_intent",
         version: VIVA_VOICE_PROTOCOL_VERSION,
-        text,
       });
+      if (serialized.status === "rejected") {
+        const diagnostic = serialized.diagnostic;
+        setState({ ...state, diagnostics: [...state.diagnostics, diagnostic] });
+        return { diagnostic, status: "rejected", turnId } as const;
+      }
+      if (state.pendingSubmission) return { status: "pending", turnId } as const;
+      if (state.recap || state.terminalReason) {
+        return intentSocketClosedResult(turnId, "Viva voice session is closed for submissions");
+      }
+      if (socket?.readyState !== 1) {
+        return intentSocketClosedResult(turnId, "Viva voice WebSocket is not open");
+      }
+      socket.send(serialized.payload);
+      setState({ ...state, pendingSubmission: { generationId, kind: "text" } });
+      return { status: "sent", turnId } as const;
     },
     sendAudioChunk(input: VivaAudioChunkInput) {
       const bytes = input.pcm16Bytes;
@@ -1213,9 +1926,20 @@ export function createVivaAgentSessionController(
       const ledger = audioLedger;
       // A cancellation for another turn is never permission to discard this one.
       if (!ledger || ledger.turnId !== turnId) return;
+      // Once `audio_end` is on the wire the server owns the assembly: a scoped
+      // `cancel` for it would address a turn the server has already consumed.
+      // The local bytes are still released — the learner asked to discard — but
+      // no frame is sent. (Plan 08 made the server tolerate a late cancel; the
+      // browser still must not send one.)
+      const assemblyConsumed = ledger.endSerialized;
       releaseAudioLedger();
       const generationId = activeGeneration?.id;
-      if (generationId && generationId === ledger.generationId && socket?.readyState === 1) {
+      if (
+        !assemblyConsumed &&
+        generationId &&
+        generationId === ledger.generationId &&
+        socket?.readyState === 1
+      ) {
         socket.send(
           JSON.stringify({
             client_generation_id: generationId,
@@ -1230,7 +1954,20 @@ export function createVivaAgentSessionController(
       }
     },
     retryPendingAudio() {
+      rebindRetainedTurnToActiveGeneration();
       return pumpAudioQueue();
+    },
+    getRetainedAudioTurn() {
+      const ledger = audioLedger;
+      if (!ledger) return null;
+      return {
+        acceptedThroughSequence: ledger.lastSerializedSequence,
+        endRequested: ledger.endRequested,
+        finalSequence: ledger.finalSequence,
+        retainedBytes: ledger.retainedBytes,
+        retainedFromSequence: retainedFromSequence(ledger),
+        turnId: ledger.turnId,
+      };
     },
     acknowledgeAudio(consumed: readonly VivaAgentAudioOutput[]) {
       // Drop exactly the frames the consumer enqueued to the playback sink — by
@@ -1246,10 +1983,10 @@ export function createVivaAgentSessionController(
       setState({ ...state, audio: state.audio.filter((output) => !drop.has(output)) });
     },
     cancel() {
-      sendFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });
+      sendGenerationFrame({ type: "cancel", version: VIVA_VOICE_PROTOCOL_VERSION });
     },
     stop() {
-      sendFrame({ type: "stop", version: VIVA_VOICE_PROTOCOL_VERSION });
+      sendGenerationFrame({ type: "stop", version: VIVA_VOICE_PROTOCOL_VERSION });
     },
     getState() {
       return state;
@@ -1332,8 +2069,47 @@ function requireAudioTurnId(turnId: string): string {
   return turnId;
 }
 
-function withClientGeneration(frame: VivaClientFrame, generationId: string): VivaClientFrame {
-  return { ...frame, client_generation_id: generationId } as VivaClientFrame;
+/**
+ * A frame as its call site writes it, before the controller stamps the active
+ * generation onto it. `client_generation_id` is never the caller's to choose:
+ * only the controller knows which generation is live, and a caller-chosen one
+ * could address a generation that has already been replaced.
+ */
+type VivaClientFrameDraft =
+  | VivaClientFrame
+  | Omit<VivaTurnIntentClientFrame, "client_generation_id">
+  | Omit<VivaCancelClientFrame, "client_generation_id">
+  | Omit<VivaStopClientFrame, "client_generation_id">;
+
+function withClientGeneration(
+  frame: VivaClientFrameDraft,
+  generationId: string,
+): VivaBrowserClientFrame {
+  // The draft union is built FROM the browser union, so this narrowing can only
+  // ever produce a browser-sendable frame; it cannot widen one into tool
+  // authority. `serializeVivaBrowserClientFrame` re-proves that at runtime.
+  return { ...frame, client_generation_id: generationId } as VivaBrowserClientFrame;
+}
+
+/**
+ * An opaque per-turn identifier for a typed intent. It carries no learner text,
+ * no transcript, and no identity — a turn id is a correlation handle, not a
+ * description of what the learner said.
+ */
+function intentSocketClosedResult(turnId: string, message: string): VivaTurnIntentSendResult {
+  return {
+    error: { code: "socket_closed", message },
+    retryable: true,
+    status: "socket_closed",
+    turnId,
+  };
+}
+
+function createTurnIntentId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `intent-${crypto.randomUUID()}`;
+  }
+  return `intent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function defaultVivaAgentGenerationId(input: {
@@ -1353,6 +2129,7 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
     case "transcript_delta":
     case "transcript_final":
     case "answer_evaluated":
+    case "turn_deferred":
     case "source_reference":
     case "concept_status":
     case "manuscript_intent":
@@ -1366,45 +2143,23 @@ function responseIdForEvent(event: VivaServerEvent): string | undefined {
   }
 }
 
+/**
+ * `event.reason` is deliberately NOT read. Under Plan 05's typed-termination
+ * contract the close-reason string is never parsed for classification and never
+ * displayed, so the former safe-string allowlist (which drifted against the
+ * server's own wording and turned every unlisted reason into a redaction
+ * placeholder) is gone rather than maintained.
+ */
 function closeDiagnosticsForEvent(event: VivaSocketEvent): VivaAgentCloseDiagnostics {
   return {
     code: typeof event.code === "number" ? event.code : 1005,
-    reason: safeCloseReasonForDisplay(typeof event.reason === "string" ? event.reason : ""),
     wasClean: typeof event.wasClean === "boolean" ? event.wasClean : false,
   };
-}
-
-const safeAgentCloseReasons = new Set([
-  "agent input closed",
-  "binary frame too large",
-  "client stop",
-  "first frame timeout",
-  "idle timeout",
-  "invalid client frame",
-  "provider source authority rejected",
-  "session config required",
-  "session auth failed",
-  "text frame too large",
-  "untrusted tool_result",
-]);
-const legacyAgentAuthReasons = new Set([
-  "invalid session identity",
-  "invalid session token",
-  "study set access denied",
-]);
-
-function safeCloseReasonForDisplay(reason: string): string {
-  const normalized = reason.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const lower = normalized.toLowerCase();
-  if (legacyAgentAuthReasons.has(lower)) return "session auth failed";
-  return safeAgentCloseReasons.has(lower) ? lower : "[redacted close reason]";
 }
 
 type VivaSocketEvent = Event & {
   code?: number;
   data?: unknown;
-  reason?: string;
   wasClean?: boolean;
 };
 

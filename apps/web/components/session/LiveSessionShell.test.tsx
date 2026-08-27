@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentStudySetReadiness,
-  type ReviewScheduleItem,
   type SessionRecap,
   VIVA_VOICE_PROTOCOL_ADVERTISEMENT,
   VIVA_VOICE_PROTOCOL_VERSION,
   type VivaReadyFrame,
 } from "@viva/core";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import {
   projectRuntimeCopy,
@@ -72,6 +72,7 @@ const runtime: RuntimeCopy = {
   primaryActionDisabled: false,
   primaryActionIntent: "submit_turn",
   primaryActionLabel: "I'm ready — check it",
+  readinessBoundedFailures: null,
   readinessNotes: [{ label: "Provider", state: "ready", text: "Synthetic brain ready." }],
   statusLabel: "synthetic",
   cause: "synthetic",
@@ -109,30 +110,22 @@ const trustedRecap: SessionRecap = {
   summary: "The Conductor recap stayed grounded to the server-owned source span.",
 };
 
-const trustedReviewPlan: ReviewScheduleItem[] = [
+const trustedReviewPlan: SessionReviewPlanItem[] = [
   {
-    authoritativeDueAt: new Date("2026-06-18T12:00:00.000Z"),
-    authority: "core_fsrs",
-    capReason: null,
-    card: {
-      difficulty: 6.5,
-      due_at: "2026-06-18T12:00:00.000Z",
-      elapsed_days: 0,
-      lapses: 1,
-      last_review_at: "2026-06-17T12:00:00.000Z",
-      reps: 1,
-      scheduled_days: 1,
-      schema_version: 1,
-      stability: 0.6,
-      state: "relearning",
-    },
+    authority: "server_persisted_fsrs",
     conceptId: "atp-synthase",
-    dueAt: new Date("2026-06-18T12:00:00.000Z"),
-    explanation: ["FSRS rating: Hard", "hint-assisted answer lowered the rating"],
+    dueAt: "2026-06-18T12:00:00.000Z",
     intervalLabel: "tomorrow",
     label: "ATP synthase",
-    priority: "urgent",
     status: "missed",
+  },
+  {
+    authority: "server_persisted_fsrs",
+    conceptId: "oxidative-phosphorylation",
+    dueAt: "2026-06-21T12:00:00.000Z",
+    intervalLabel: "in 4 days",
+    label: "Oxidative phosphorylation",
+    status: "shaky",
   },
 ];
 
@@ -305,6 +298,15 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(canvasMarkup).toContain('data-concept-count="7"');
     expect(canvasMarkup).toContain('data-concept-density="dense"');
     expect(canvasMarkup).toContain('data-text-mode="true"');
+    // `WEBSESSION-CANVAS-01`: the shared effects budget is a post-mount browser
+    // measurement (viewport, DPR, media queries, stored preference), so the
+    // server frame must publish NO policy attribute at all. Rendering a guessed
+    // one here would be both untrue and a hydration mismatch on the first
+    // client render.
+    expect(canvasMarkup).not.toContain("data-viva-effects");
+    expect(canvasMarkup).not.toContain("data-render-mode");
+    expect(canvasMarkup).not.toContain("data-fps-budget");
+    expect(canvasMarkup).not.toContain("data-dpr-cap");
     expect(marginaliaMarkup).toContain('class="marginalia"');
     expect(marginaliaMarkup).toContain('data-scene-register="correcting"');
     expect(marginaliaMarkup).toContain('data-scene-marginalia-count="1"');
@@ -776,7 +778,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("proton gradient");
     expect(markup).toContain("Next session");
     expect(markup).toContain("ATP synthase");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
     expect(markup).toContain("Review the ATP synthase source span");
     expect(markup).not.toContain("Share");
     expect(markup).not.toContain("Add to calendar");
@@ -957,7 +966,7 @@ describe("LiveSessionShell scene intent wiring", () => {
 
   test("renders controlled terminal copy when a terminal phase has no recap payload", () => {
     const runtimeCopy = projectRuntimeCopy({
-      close: { code: 1008, reason: "session cap", wasClean: true },
+      close: { code: 1008, wasClean: true },
       readiness: trustedReadiness,
       ready: ready("synthetic"),
       status: "closed",
@@ -1027,7 +1036,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("slide:18");
     expect(markup).toContain("Electron flow pumps protons");
     expect(markup).toContain("Due Jun 18, 2026");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
     expect(markup).toContain('class="voice-trace"');
     expect(markup).not.toContain("Use this to answer again.");
     expect(markup).not.toContain("dashboard");
@@ -1080,7 +1096,14 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Pre-exam");
     // The precise FSRS-dated next session is preserved alongside the timeline.
     expect(markup).toContain("Next session");
-    expect(markup).toContain("core FSRS");
+    // The old hard-coded "core FSRS" label claimed an authority the browser no
+    // longer computes; what renders now is the projection's own persisted
+    // instant, on the runtime-local calendar.
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("FSRS rating");
+    expect(markup).toContain("tomorrow · Due ");
+    expect(markup).toContain("2026");
+    expect(markup).toContain("18");
   });
 
   test("recap closing fold omits the mastery rings when no concepts were graded", () => {
@@ -1142,6 +1165,77 @@ describe("LiveSessionShell scene intent wiring", () => {
     expect(markup).toContain("Acknowledge");
   });
 
+  /**
+   * `WEBSESSION-DISCLOSURE-01` under the recorded D-08 Branch A
+   * (`all_live_provider_content`): the gate covers TYPED content as well as
+   * spoken, so the session copy must say so rather than implying a
+   * microphone-only scope.
+   */
+  test("the D-08A disclosure names typed content as well as spoken content", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        consentDisclosure={{
+          acknowledged: false,
+          onAcknowledge: noop,
+          scope: "all_live_provider_content",
+        }}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={["NADH"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("typed answers");
+    expect(markup).toContain("Before Viva sends anything to the live provider");
+    expect(markup).not.toContain("Before Viva uses the microphone, acknowledge");
+  });
+
+  test("the unselected Branch B copy stays microphone-scoped and claims nothing more", () => {
+    const markup = renderToStaticMarkup(
+      <LiveSessionShell
+        clockLabel="Fixture clock"
+        conceptNodes={[...denseConceptNodes]}
+        consentDisclosure={{
+          acknowledged: false,
+          onAcknowledge: noop,
+          scope: "microphone_audio_only",
+        }}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={["NADH"]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        runtime={runtime}
+        state="listening"
+      />,
+    );
+
+    expect(markup).toContain("Before Viva uses the microphone");
+    expect(markup).not.toContain("typed answers");
+  });
+
   test("renders source_reference folio as a bounded museum label", () => {
     const markup = renderSourceFolioSurface();
 
@@ -1193,13 +1287,11 @@ describe("LiveSessionShell scene intent wiring", () => {
       projectRuntimeCopy({
         readiness: trustedReadiness,
         status: "closed",
-        errors: ["WebSocket error"],
       }),
     );
 
     expect(markup).toContain("Agent offline");
     expect(markup).toContain("Agent unavailable: service offline.");
-    expect(markup).toContain("WebSocket error");
     expect(markup).toContain("Retry agent");
   });
 
@@ -1231,3 +1323,187 @@ function boxesOverlap(
 ) {
   return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
+
+/**
+ * `WEBSESSION-A11Y-02` — the live session is a landmark with a keyboard entrance.
+ *
+ * A keyboard or screen-reader learner arriving on this route lands before the
+ * backdrop canvases, the header, and the study-context bar; without a landmark
+ * and a skip target, reaching the question they are being examined on is a long
+ * blind walk. The route exposes exactly ONE `main`, and its first focusable child
+ * jumps straight to the question/answer stage.
+ */
+describe("live session landmark and skip target (WEBSESSION-A11Y-02)", () => {
+  function renderSession(state: Parameters<typeof LiveSessionShell>[0]["state"] = "listening") {
+    return renderToStaticMarkup(
+      <LiveSessionShell
+        conceptNodes={[]}
+        contextLabel="Trusted server set: Biology Midterm"
+        elapsed={12}
+        glyphState="idle"
+        highlightedTokens={[]}
+        hintShown={false}
+        onBackToQuestion={noop}
+        onEndSession={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={state === "recap" ? trustedRecap : undefined}
+        reviewPlan={state === "recap" ? trustedReviewPlan : undefined}
+        runtime={runtime}
+        state={state}
+      />,
+    );
+  }
+
+  test("renders exactly one main landmark with a stable id, before and after recap", () => {
+    for (const state of ["listening", "recap"] as const) {
+      const markup = renderSession(state);
+      expect((markup.match(/<main[\s>]/g) ?? []).length).toBe(1);
+      expect(markup).toContain('id="live-session-main"');
+      expect(markup).toContain('class="live-session"');
+      // The old generic <section> root is gone, not merely wrapped.
+      expect(markup).not.toContain('<section class="live-session"');
+    }
+  });
+
+  test("the skip link is the first focusable child and targets the turn stage", () => {
+    const markup = renderSession();
+
+    expect(markup).toContain("Skip to current question and answer");
+    expect(markup).toContain('href="#live-session-turn"');
+    expect(markup).toContain('id="live-session-turn"');
+    expect(markup).toContain('tabindex="-1"');
+    // First focusable: nothing focusable may precede the skip link in source order.
+    const skipIndex = markup.indexOf("Skip to current question and answer");
+    const firstButton = markup.indexOf("<button");
+    expect(skipIndex).toBeGreaterThan(-1);
+    expect(firstButton === -1 || skipIndex < firstButton).toBe(true);
+    // Visually hidden until focused, using the existing Plan-13-owned utility.
+    const skipTag = markup.slice(markup.lastIndexOf("<a", skipIndex), skipIndex);
+    expect(skipTag).toContain("sr-only");
+  });
+});
+
+/**
+ * `WEBSESSION-TASK10-LOCAL-DATE-01` — review dates are the learner's own calendar.
+ *
+ * The instant is the server's; only its PRESENTATION is local. Extracting UTC
+ * fields tells a learner in Los Angeles to review on the 24th when their own
+ * calendar says the 23rd.
+ */
+describe("local review dates and schedule authority (WEBSESSION-TASK10-LOCAL-DATE-01)", () => {
+  const LATE_UTC_INSTANT = "2026-08-24T01:00:00.000Z";
+
+  function renderReviewPlan(dueAt: string) {
+    return renderToStaticMarkup(
+      <MarginaliaPanel
+        hintShown={false}
+        onBackToQuestion={noop}
+        onHint={noop}
+        onNextQuestion={noop}
+        onShowSource={noop}
+        onSubmitAnswer={noop}
+        onTryAgain={noop}
+        question={question}
+        recap={trustedRecap}
+        reviewPlan={[
+          {
+            authority: "server_persisted_fsrs",
+            conceptId: "atp-synthase",
+            dueAt,
+            intervalLabel: "tomorrow",
+            label: "ATP synthase",
+            status: "missed",
+          },
+        ]}
+        runtime={runtime}
+        state="recap"
+      />,
+    );
+  }
+
+  test("an instant late in the UTC day renders on the runtime-local calendar", () => {
+    const markup = renderReviewPlan(LATE_UTC_INSTANT);
+
+    const due = /Due ([^<·]+)/.exec(markup)?.[1]?.trim();
+    // `Date#getDate` / `getUTCDate` are the local and UTC calendar days WITHOUT
+    // going through the formatter under test, so this is an independent oracle
+    // in every zone: the label must carry the LOCAL day, never the UTC one.
+    const localDay = new Date(LATE_UTC_INSTANT).getDate();
+    const utcDay = new Date(LATE_UTC_INSTANT).getUTCDate();
+    expect(due).toContain(String(localDay));
+    if (utcDay !== localDay) expect(due).not.toContain(String(utcDay));
+
+    // The two zones the plan pins, asserted literally where they apply.
+    if (process.env.TZ === "America/Los_Angeles") expect(due).toBe("Aug 23, 2026");
+    if (process.env.TZ === "UTC") expect(due).toBe("Aug 24, 2026");
+  });
+
+  test("an unparseable instant renders safe copy, never Invalid Date or the raw value", () => {
+    const markup = renderReviewPlan("not-an-instant");
+
+    expect(markup).toContain("Review date unavailable");
+    expect(markup).not.toContain("Invalid Date");
+    expect(markup).not.toContain("not-an-instant");
+    expect(markup).not.toContain("NaN");
+  });
+
+  test("the projection's own schedule authority is rendered, never a hard-coded scheduler", () => {
+    const markup = renderReviewPlan("2026-08-29T09:00:00.000Z");
+
+    expect(markup).toContain("server_persisted_fsrs");
+    expect(markup).not.toContain("core FSRS");
+    expect(markup).not.toContain("core_fsrs_read_time");
+  });
+
+  test("the authority a learner READS is a label, not the D-01 enum identifier", () => {
+    const markup = renderReviewPlan("2026-08-29T09:00:00.000Z");
+
+    // The identifier stays machine-readable on the element that carries it…
+    expect(markup).toContain('data-authority="server_persisted_fsrs"');
+    // …and the text between the tags is prose a learner can act on. Stripping
+    // every tag is what proves the enum is not ALSO the visible label.
+    const visible = markup.replace(/<[^>]*>/g, " ");
+    expect(visible).not.toContain("server_persisted_fsrs");
+    expect(visible).toContain("Saved review schedule");
+  });
+});
+
+/**
+ * `WEBSESSION-READY-01` Step 3 — the bounded readiness count is rendered on the
+ * READINESS STATUS ELEMENT: the ladder that already states each readiness fact,
+ * inside the session landmark, beside the sanitized unavailable copy.
+ */
+describe("bounded readiness count on the readiness ladder (WEBSESSION-READY-01)", () => {
+  const offlineRuntime: RuntimeCopy = {
+    ...runtime,
+    capsuleLabel: "Agent offline",
+    cause: "agent_offline",
+    marginaliaText: "The manuscript could not reach `/ready` or `/health/brain`.",
+    marginaliaTitle: "Agent unavailable: service offline.",
+    readinessNotes: [
+      { label: "Agent", state: "unavailable", text: "Could not reach /ready or /health/brain." },
+    ],
+    statusLabel: "agent offline",
+  };
+
+  test("an unbounded readiness poll leaves no count attribute on the ladder", () => {
+    const markup = renderRuntimeSurfaces({ ...offlineRuntime, readinessBoundedFailures: null });
+
+    expect(markup).toContain('class="readiness-ladder"');
+    expect(markup).not.toContain("data-consecutive-failures");
+  });
+
+  test("the bounded count rides the readiness ladder itself", () => {
+    const markup = renderRuntimeSurfaces({ ...offlineRuntime, readinessBoundedFailures: 3 });
+
+    const ladder = /<ul[^>]*class="readiness-ladder"[^>]*>/.exec(markup)?.[0] ?? "";
+    expect(ladder).toContain('data-consecutive-failures="3"');
+    expect(ladder).toContain('aria-label="Connected session readiness"');
+    expect(markup).toContain("Could not reach /ready or /health/brain.");
+  });
+});

@@ -1,6 +1,7 @@
-import type { ReviewScheduleItem, SessionRecap } from "@viva/core";
+import type { SessionRecap } from "@viva/core";
 import { Icon, MasteryRing, Spark, TimelineItem } from "@viva/ui-web";
 import { type CSSProperties, type FormEvent, useEffect, useId, useRef, useState } from "react";
+import type { SessionReviewPlanItem } from "../../lib/viva-display";
 import type { VivaSceneState } from "../../lib/viva-scene-reducer";
 import type { RuntimeCopy, SourceFolioProjection } from "../../lib/viva-session-projection";
 import { CorrectionMarginalia } from "./CorrectionMarginalia";
@@ -42,6 +43,7 @@ export function MarginaliaPanel({
   checkingControl,
   onHint,
   onShowSource,
+  challengeDisabled,
   onChallengeSource,
   onSubmitAnswer,
   onSubmitTextAnswer,
@@ -57,12 +59,13 @@ export function MarginaliaPanel({
   question: Question;
   sourceFolio?: SourceFolioProjection;
   recap?: SessionRecap;
-  reviewPlan?: ReviewScheduleItem[];
+  reviewPlan?: SessionReviewPlanItem[];
   hintShown: boolean;
   textAnswer?: TextAnswerState;
   checkingControl?: CheckingControl;
   onHint: () => void;
   onShowSource: () => void;
+  challengeDisabled?: boolean;
   onChallengeSource?: () => void;
   onSubmitAnswer: () => void;
   onSubmitTextAnswer?: (answer: string) => void;
@@ -140,9 +143,17 @@ export function MarginaliaPanel({
             question={question}
           />
         ) : null}
-        {isRecap ? <RecapFold recap={recap} reviewPlan={reviewPlan} /> : null}
+        {isRecap ? (
+          <RecapFold
+            onNextSession={onSubmitAnswer}
+            recap={recap}
+            reviewPlan={reviewPlan}
+            runtime={runtime}
+          />
+        ) : null}
         {isSource ? (
           <SourceFolio
+            challengeDisabled={challengeDisabled}
             onBack={onBackToQuestion}
             onChallenge={onChallengeSource ?? onTryAgain}
             question={question}
@@ -212,7 +223,19 @@ function ListeningNote({
       {textAnswer?.lastAnswer ? (
         <StudentHand answer={textAnswer.lastAnswer} uncertain={textAnswer.lastAnswerUncertain} />
       ) : null}
-      <ul className="readiness-ladder" aria-label="Connected session readiness">
+      {/*
+        `WEBSESSION-READY-01` Step 3: the readiness ladder IS the readiness status
+        element, so a bounded run's count belongs here — on the element that
+        already states each readiness fact, inside the session landmark, beside
+        the ladder's own sanitized unavailable copy. `undefined` (not `null`)
+        keeps the attribute off the element entirely while the bound has not been
+        reached, so "no count" is absence rather than a rendered zero.
+      */}
+      <ul
+        className="readiness-ladder"
+        aria-label="Connected session readiness"
+        data-consecutive-failures={runtime.readinessBoundedFailures ?? undefined}
+      >
         {runtime.readinessNotes.map((note) => (
           <li className="readiness-ladder__item" data-state={note.state} key={note.label}>
             <span className="readiness-ladder__dot" />
@@ -316,11 +339,15 @@ function StudentHand({ answer, uncertain }: { answer: string; uncertain?: boolea
 }
 
 function RecapFold({
+  onNextSession,
   recap,
   reviewPlan,
+  runtime,
 }: {
+  onNextSession: () => void;
   recap: SessionRecap;
-  reviewPlan: ReviewScheduleItem[];
+  reviewPlan: SessionReviewPlanItem[];
+  runtime: RuntimeCopy;
 }) {
   const masteryTiers = recapMasteryTiers(recap);
 
@@ -387,8 +414,10 @@ function RecapFold({
               <li key={item.conceptId}>
                 <span>{item.label}</span>
                 <span>
-                  {item.intervalLabel} · core FSRS · {formatRecapDueDate(item.dueAt)} ·{" "}
-                  {item.explanation[0]}
+                  {item.intervalLabel} · {formatRecapDueDate(item.dueAt)} ·{" "}
+                  <span className="recap-fold__authority" data-authority={item.authority}>
+                    {recapAuthorityLabel(item.authority)}
+                  </span>
                 </span>
               </li>
             ))}
@@ -425,6 +454,23 @@ function RecapFold({
         </div>
       ) : null}
       <p className="folio__footer">Conductor next action: {recap.nextAction}</p>
+      {/*
+        `WEBSESSION-TERMINAL-01`: the ONE action a closed session offers. Every
+        answer and microphone control is gone with the turn loop, so this is the
+        only way forward — and it is the approved label the learner-loop contract
+        names for the state the projection landed in, never a local invention.
+      */}
+      {runtime.primaryActionIntent === "start_session" ? (
+        <div className="margin-note__actions">
+          <SessionActionButton
+            disabled={runtime.primaryActionDisabled}
+            label={runtime.primaryActionLabel}
+            leading={<Icon color="var(--viva-paper)" name="book" size={15} strokeWidth={1.7} />}
+            onClick={onNextSession}
+            variant="primary"
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -510,23 +556,50 @@ function recapSourceStatusLabel(status: SessionRecap["sourceMoments"][number]["s
   }
 }
 
-const DUE_MONTHS = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-] as const;
+/**
+ * The schedule authority the learner READS.
+ *
+ * `authority` is the projection's own display field and the raw D-01 identifier
+ * stays on `data-authority`, machine-readable, for any surface that needs to key
+ * off it. What sits beside the date is prose: `server_persisted_fsrs` is an
+ * engineering identifier, and a learner deciding whether to trust "Due Aug 29"
+ * needs to know it is Viva's SAVED plan rather than something recomputed while
+ * the page was being drawn. Same shape as the confidence and status labels above
+ * — a total switch over a closed union, no fallback string to drift.
+ *
+ * D-01 selected SERVER_PERSISTED_FSRS, so `ReviewScheduleAuthority` spells one
+ * authority and this switch has one arm. A second arm would be an artifact of a
+ * branch the program did not select; when another authority is ever selected,
+ * this stops compiling — which is the point.
+ */
+function recapAuthorityLabel(authority: SessionReviewPlanItem["authority"]): string {
+  switch (authority) {
+    case "server_persisted_fsrs":
+      return "Saved review schedule";
+  }
+}
 
-function formatRecapDueDate(dueAt: Date) {
-  return `Due ${DUE_MONTHS[dueAt.getUTCMonth()]} ${dueAt.getUTCDate()}, ${dueAt.getUTCFullYear()}`;
+/**
+ * `WEBSESSION-TASK10-LOCAL-DATE-01`: the projection's persisted due instant,
+ * rendered on the RUNTIME-LOCAL calendar.
+ *
+ * The instant itself is the server's; only its presentation is local.
+ * `Intl.DateTimeFormat` with the runtime's own locale and time zone is what
+ * makes `2026-08-24T01:00:00Z` read as August 23 to a learner in Los Angeles —
+ * extracting UTC calendar fields would send them to revise on the wrong day.
+ * An instant that cannot be parsed renders safe copy rather than `Invalid Date`
+ * or the raw value. The old hard-coded "core FSRS" label is gone with the
+ * client-side scheduler that produced it: the authority rendered beside the date
+ * is the projection's own.
+ */
+function formatRecapDueDate(dueAt: string): string {
+  const parsed = new Date(dueAt);
+  if (Number.isNaN(parsed.getTime())) return "Review date unavailable";
+  return `Due ${new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(parsed)}`;
 }
 
 function ThinkingNote({
