@@ -5041,16 +5041,25 @@ fn signed_start_state(
     ))
 }
 
-/// Performs the product's own signed start: the library snapshot that
-/// `POST /api/viva-session/start` reads, returning the exact `session_id` and
-/// `session_token` pair the web tier hands the browser.
-async fn signed_start(app: &axum::Router, study_set_id: &str) -> (String, String) {
+/// Reads the library snapshot exactly as a caller does. `record_start_for` is the
+/// explicit start-mint selector: `None` is a plain listing read, `Some(id)` is the
+/// request `POST /api/viva-session/start` makes for the one set it is starting.
+async fn library_snapshot_json(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+) -> serde_json::Value {
+    let uri = match record_start_for {
+        Some(study_set_id) => {
+            format!("/study-sets/library?user_id=user-1&record_start_for={study_set_id}")
+        }
+        None => "/study-sets/library?user_id=user-1".to_owned(),
+    };
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/study-sets/library?user_id=user-1")
+                .uri(uri)
                 .header("origin", STARTED_SESSION_ORIGIN)
                 .body(Body::empty())
                 .unwrap(),
@@ -5063,15 +5072,28 @@ async fn signed_start(app: &axum::Router, study_set_id: &str) -> (String, String
         "the library snapshot is the mint path"
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let start = payload["study_sets"]
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn library_study_set<'a>(
+    snapshot: &'a serde_json::Value,
+    study_set_id: &str,
+) -> &'a serde_json::Value {
+    snapshot["study_sets"]
         .as_array()
         .expect("study sets")
         .iter()
         .find(|set| set["id"] == study_set_id)
-        .unwrap_or_else(|| panic!("{study_set_id} missing from the library snapshot"))["actions"]
-        ["start"]
-        .clone();
+        .unwrap_or_else(|| panic!("{study_set_id} missing from the library snapshot"))
+}
+
+/// Performs the product's own signed start: the library snapshot that
+/// `POST /api/viva-session/start` reads, naming the one study set it is starting,
+/// and returning the exact `session_id` and `session_token` pair the web tier hands
+/// the browser.
+async fn signed_start(app: &axum::Router, study_set_id: &str) -> (String, String) {
+    let payload = library_snapshot_json(app, Some(study_set_id)).await;
+    let start = library_study_set(&payload, study_set_id)["actions"]["start"].clone();
     assert_eq!(
         start["available"], true,
         "the fixture set must offer a signed start: {start}"
@@ -5167,27 +5189,8 @@ async fn signed_start_is_unavailable_when_the_voice_session_cannot_be_recorded()
     });
     let app = build_router(signed_start_state(store, inner.clone()));
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/study-sets/library?user_id=user-1")
-                .header("origin", STARTED_SESSION_ORIGIN)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let start = payload["study_sets"]
-        .as_array()
-        .expect("study sets")
-        .iter()
-        .find(|set| set["id"] == "biology-midterm")
-        .expect("fixture set")["actions"]["start"]
-        .clone();
+    let payload = library_snapshot_json(&app, Some("biology-midterm")).await;
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
     assert_eq!(
         start["available"], false,
         "a store that cannot record the session must not advertise a start"
@@ -5201,6 +5204,165 @@ async fn signed_start_is_unavailable_when_the_voice_session_cannot_be_recorded()
         inner.snapshot().sessions.is_empty(),
         "a refused start records nothing"
     );
+}
+
+/// `A-32` review fix: recording belongs to the mint, not to the listing.
+///
+/// `GET /study-sets/library` is what the landing page renders from, what the panel
+/// re-reads after every control, and what the read-scoped proxy serves; it is an
+/// idempotent read and must stay one. Repeating it may not accumulate durable
+/// `voice_sessions` rows, and may not flip `resume` onto a session the learner
+/// never entered. Only a caller that names the study set it is starting — the one
+/// `POST /api/viva-session/start` makes — mints a durable session.
+#[tokio::test]
+async fn library_reads_record_nothing_until_a_start_is_actually_minted() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    for read in 1..=5 {
+        let payload = library_snapshot_json(&app, None).await;
+        let study_set = library_study_set(&payload, "biology-midterm");
+        assert_eq!(
+            study_set["actions"]["start"]["available"], true,
+            "read {read} must still advertise a signed start",
+        );
+        assert_eq!(
+            study_set["actions"]["resume"],
+            serde_json::json!({
+                "available": false,
+                "unavailable_reason": "no_open_session",
+            }),
+            "read {read} must not invent a session to resume",
+        );
+        assert!(
+            store.writes().is_empty(),
+            "read {read} wrote to the store: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "read {read} left durable sessions behind",
+        );
+    }
+
+    // The mint is the one call that writes, and it writes exactly once.
+    let (session_id, _) = signed_start(&app, "biology-midterm").await;
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "only the named start mint records a session",
+    );
+
+    // And the listing goes back to reading. It reports the session the mint opened
+    // — that is what `resume` is for — without opening another one.
+    let payload = library_snapshot_json(&app, None).await;
+    let study_set = library_study_set(&payload, "biology-midterm");
+    assert_eq!(study_set["actions"]["resume"]["available"], true);
+    assert_eq!(study_set["actions"]["resume"]["session_id"], session_id);
+    assert_eq!(
+        store.writes().len(),
+        1,
+        "a read after the mint writes nothing further: {:?}",
+        store.writes(),
+    );
+    assert_eq!(inner.snapshot().sessions.len(), 1);
+}
+
+/// `A-32` review fix: the mint selector names one study set, and only that set's
+/// start is recorded. A library holds many sets; minting a start for one of them
+/// may not open a session on every other one.
+#[tokio::test]
+async fn a_start_mint_records_only_the_study_set_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_second_startable_set(&inner, "chemistry-final");
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let payload = library_snapshot_json(&app, Some("chemistry-final")).await;
+    for study_set_id in ["biology-midterm", "chemistry-final"] {
+        assert_eq!(
+            library_study_set(&payload, study_set_id)["actions"]["start"]["available"],
+            true,
+            "{study_set_id} is startable, so every snapshot signs a start for it",
+        );
+    }
+    let named_session_id = library_study_set(&payload, "chemistry-final")["actions"]["start"]
+        ["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+
+    assert_eq!(
+        store.writes(),
+        vec![(
+            named_session_id.clone(),
+            Ok(StudyStoreWriteOutcome::Inserted)
+        )],
+        "the mint records the named set only",
+    );
+    let sessions = inner.snapshot().sessions;
+    assert_eq!(sessions.len(), 1, "exactly one session was opened");
+    assert_eq!(sessions[0].study_set_id, "chemistry-final");
+    assert_eq!(sessions[0].voice_session_id, named_session_id);
+    assert_eq!(
+        library_study_set(&payload, "biology-midterm")["actions"]["resume"],
+        serde_json::json!({
+            "available": false,
+            "unavailable_reason": "no_open_session",
+        }),
+        "an unnamed set is untouched by another set's mint",
+    );
+}
+
+/// A second ready, startable study set for the same learner: one active question
+/// over its own live source span, so `study_set_start_unavailable_reason` returns
+/// `None` for it without disturbing the fixture set. The span carries a distinct
+/// `source_id` because the in-memory store keys spans by that id alone.
+fn seed_second_startable_set(store: &data::InMemoryStudyStore, study_set_id: &str) {
+    let question_id = format!("q-{study_set_id}");
+    let document_id = format!("{study_set_id}-lecture");
+    let mut source = agent_domain::fixture_source_reference();
+    source.source_id = format!("src-{study_set_id}");
+    source.document_id = document_id.clone();
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: study_set_id.to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 101".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec!["reaction-rates".to_owned()],
+        question_ids: vec![question_id.clone()],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: study_set_id.to_owned(),
+        document_id,
+        title: "Lecture 1".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: false,
+    });
+    store.upsert_source_span(data::SourceSpanRecord {
+        study_set_id: study_set_id.to_owned(),
+        source: source.clone(),
+        tombstoned: false,
+    });
+    store.upsert_concept(data::ConceptRecord {
+        study_set_id: study_set_id.to_owned(),
+        concept_id: "reaction-rates".to_owned(),
+        label: "Reaction rates".to_owned(),
+        status: ConceptStatus::Review,
+        source_span_id: source.source_id.clone(),
+    });
+    let mut question = agent_domain::fixture_question();
+    question.question_id = question_id;
+    question.source = source;
+    store.upsert_question(data::StudyQuestionRecord {
+        study_set_id: study_set_id.to_owned(),
+        question,
+        active: true,
+    });
 }
 
 /// `A-32`, the full entry flow over a real socket: signed start, projection valid

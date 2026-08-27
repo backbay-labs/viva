@@ -28,6 +28,14 @@ use crate::http::ingestion::store_json_error;
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct LibrarySnapshotQuery {
     user_id: Option<String>,
+    /// `A-32`: the start-mint selector. The library snapshot is a listing, and a
+    /// listing is a read — every start action it returns is signed, but only the
+    /// one study set this names has its session recorded durably. Absent (the
+    /// landing render, the panel refresh, the read-scoped proxy) the route writes
+    /// nothing at all, so repeating it cannot accumulate open sessions or invent a
+    /// session to resume. Present, it is `POST /api/viva-session/start` asking for
+    /// the one session it is about to hand the browser.
+    record_start_for: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,13 +169,20 @@ pub(super) async fn library_snapshot(
         }
     };
     let request_origin = request_origin(&headers).map(ToOwned::to_owned);
+    // `A-32`: at most one study set per request may record a start, and only the one
+    // the caller named. Everything else this route does is a read.
+    let record_start_for = query
+        .record_start_for
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let mut study_sets = Vec::with_capacity(snapshot.study_sets.len());
     for study_set in snapshot.study_sets {
         let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
         let unavailable_reason = study_set_start_unavailable_reason(&study_set);
         let start = match unavailable_reason {
             Some(reason) => unavailable_action(reason),
-            None => {
+            None if record_start_for == Some(study_set.id.as_str()) => {
                 recorded_signed_start_action(
                     &state,
                     &study_set.user_id,
@@ -176,6 +191,13 @@ pub(super) async fn library_snapshot(
                 )
                 .await
             }
+            None => signed_library_action(
+                &state,
+                &study_set.user_id,
+                &study_set.id,
+                Uuid::new_v4().to_string(),
+                request_origin.as_deref(),
+            ),
         };
         let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
             (Some(reason), _) => unavailable_action(reason),
@@ -527,6 +549,12 @@ pub(super) fn available_mutation_action(control_token: Option<String>) -> Librar
 /// before any socket exists, which is what the browser's `connectionEligible`
 /// gate waits for; the socket's own `record_voice_session` is then an idempotent
 /// replay of this row, never a second session.
+///
+/// Reached only for the single study set a request's `record_start_for` selector
+/// names, so this is the mint and not the listing: a plain library read signs its
+/// start actions through `signed_library_action` and writes nothing. Recording on
+/// every read would open one permanently-open session per startable set per page
+/// render and would flip `resume` onto a session the learner never entered.
 ///
 /// Fail closed in both directions: no row is written unless a credential could
 /// actually be minted for it, and no credential is returned unless its row

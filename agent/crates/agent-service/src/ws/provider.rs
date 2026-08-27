@@ -424,7 +424,11 @@ pub(super) async fn open_failure_control_session(
     // replay is the expected outcome here and is not a second session; a first
     // insert is equally accepted, because the same code path serves a session whose
     // start was never recorded through the mint. Only a refusal to write at all
-    // gates the session.
+    // gates the session, and the outcome is reported rather than discarded — an
+    // operator diagnosing the start/projection/socket order needs to see which of
+    // the two this was. The behavioural proof that the second write is the
+    // idempotent outcome, and that it creates no second row, is the auditing store's
+    // write log in `signed_start_projection_and_socket_complete_the_entry_flow`.
     let outcome = state
         .study_store
         .record_voice_session(&config)
@@ -442,9 +446,13 @@ pub(super) async fn open_failure_control_session(
                 metadata: format!("error_kind={}", error.kind()),
             }))
         })?;
-    match outcome {
-        StudyStoreWriteOutcome::Inserted | StudyStoreWriteOutcome::IdempotentReplay => {}
-    }
+    tracing::debug!(
+        session_provisioning_outcome = match outcome {
+            StudyStoreWriteOutcome::Inserted => "inserted",
+            StudyStoreWriteOutcome::IdempotentReplay => "idempotent_replay",
+        },
+        "recorded the voice session for this socket"
+    );
 
     let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
     let (event_tx, events) = mpsc::channel::<BrainEvent>(32);
