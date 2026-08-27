@@ -299,6 +299,32 @@ function fakeMuseGlyphBrowser(options?: {
     overrideGlobal("connection", { saveData: options.saveData }, navigator);
   }
 
+  // A-31.4(a): a controllable `document.hidden` plus a fake, drainable
+  // `requestAnimationFrame` clock — the behavioral proof that the loop
+  // actually STOPS SCHEDULING frames while backgrounded (and resumes on
+  // visible) needs both: a listener-presence count alone (the pre-existing
+  // "mounts and unmounts with exactly one listener" test below) cannot tell
+  // a loop that keeps rescheduling itself from one that genuinely stopped.
+  overrideGlobal("hidden", false, document);
+  const frames = new Map<number, FrameRequestCallback>();
+  let nextFrameHandle = 1;
+  overrideGlobal(
+    "requestAnimationFrame",
+    (callback: FrameRequestCallback) => {
+      const handle = nextFrameHandle++;
+      frames.set(handle, callback);
+      return handle;
+    },
+    globalThis,
+  );
+  overrideGlobal(
+    "cancelAnimationFrame",
+    (handle: number) => {
+      frames.delete(handle);
+    },
+    globalThis,
+  );
+
   overrideGlobal(
     "getBoundingClientRect",
     () =>
@@ -390,10 +416,28 @@ function fakeMuseGlyphBrowser(options?: {
   trackListeners(window, windowListeners);
 
   return {
+    drainFrames(count: number): void {
+      act(() => {
+        for (let index = 0; index < count; index++) {
+          const pending = [...frames.entries()];
+          frames.clear();
+          for (const [, callback] of pending) callback(performance.now());
+        }
+      });
+    },
     mediaListenerCount(): number {
       let total = 0;
       for (const listeners of mediaListeners.values()) total += listeners.size;
       return total;
+    },
+    pendingFrameCount(): number {
+      return frames.size;
+    },
+    setHidden(hidden: boolean): void {
+      overrideGlobal("hidden", hidden, document);
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
     },
     setMedia(next: Partial<MediaState>) {
       Object.assign(media, next);
@@ -675,6 +719,59 @@ describe("MuseGlyphCanvas effects policy integration", () => {
       expect(browser.mediaListenerCount()).toBe(0);
       expect(browser.storageListenerCount()).toBe(0);
       expect(browser.vivaEffectsListenerCount()).toBe(0);
+    }
+  });
+
+  /**
+   * `A-31.4(a)`: the behavioral background-pause proof rows 463/558 named as
+   * missing. The listener-presence test above only proves a `visibilitychange`
+   * listener is attached/detached — it cannot distinguish a loop that
+   * genuinely stops scheduling frames from one that keeps rescheduling
+   * itself regardless. This drives the fake rAF clock directly: an animated
+   * canvas holds exactly one pending frame after mount; setting
+   * `document.hidden = true` and dispatching `visibilitychange` must drop
+   * that count to zero and keep it at zero even after draining (nothing is
+   * pending to fire, and nothing new gets scheduled); setting it back to
+   * `false` and redispatching must resume scheduling (a new frame becomes
+   * pending again).
+   */
+  test("stops scheduling animation frames while the tab is hidden, and resumes when visible again", () => {
+    const browser = fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("landing_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("animated");
+      expect(browser.pendingFrameCount()).toBe(1);
+
+      browser.setHidden(true);
+      expect(browser.pendingFrameCount()).toBe(0);
+      browser.drainFrames(5);
+      expect(browser.pendingFrameCount()).toBe(0);
+
+      browser.setHidden(false);
+      expect(browser.pendingFrameCount()).toBe(1);
+      browser.drainFrames(1);
+      // `loop()` reschedules itself as its first statement whenever
+      // `animating` is true, so one drained frame leaves a fresh successor
+      // pending — proving this is a genuine, self-perpetuating loop that
+      // resumed, not a single one-off frame.
+      expect(browser.pendingFrameCount()).toBe(1);
+    } finally {
+      mounted.unmount();
+    }
+  });
+
+  test("session_muse never has a frame to pause in the first place: a visibility toggle schedules nothing", () => {
+    const browser = fakeMuseGlyphBrowser();
+    const mounted = mountMuseGlyphCanvas("session_muse");
+    try {
+      expect(mounted.glyphs.getAttribute("data-render-mode")).toBe("static");
+      expect(browser.pendingFrameCount()).toBe(0);
+      browser.setHidden(true);
+      expect(browser.pendingFrameCount()).toBe(0);
+      browser.setHidden(false);
+      expect(browser.pendingFrameCount()).toBe(0);
+    } finally {
+      mounted.unmount();
     }
   });
 
