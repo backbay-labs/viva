@@ -30,6 +30,8 @@ import {
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
   reconnectDelayMs,
+  VIVA_AGENT_READINESS_POLL_INTERVAL_MS,
+  VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS,
   VIVA_AGENT_RECONNECT_DELAYS_MS,
   VIVA_AGENT_RECONNECT_JITTER_MS,
   VIVA_STUDY_PROJECTION_TIMEOUT_MS,
@@ -3353,5 +3355,183 @@ describe("typed learner turn intents", () => {
       generationId: "session_bootstrap-1",
       kind: "text",
     });
+  });
+});
+
+/**
+ * `WEBSESSION-READY-01` — the readiness probe's own request boundary.
+ *
+ * A readiness poll that cannot finish is an availability FACT, not a hung
+ * promise: every request carries the same signal, the probe owns a hard
+ * deadline, and a caller that goes away can abort the work it started. Nothing
+ * here retries inside one probe — repetition belongs to the page's poll owner.
+ */
+describe("bounded agent readiness probe", () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  const SENTINEL = "VIVA_READINESS_SENTINEL_TOKEN";
+
+  function healthBody() {
+    return {
+      brain: { configured: true, live_runtime: false, provider: "synthetic", selectable: true },
+      provider: "synthetic",
+      status: "ok",
+      store: readyFixture.store,
+    };
+  }
+
+  function readyBody() {
+    return {
+      brain: { configured: true, live_runtime: false, provider: "synthetic", selectable: true },
+      ready: true,
+      store: readyFixture.store,
+    };
+  }
+
+  type ProbeFetchRecord = {
+    fetchImpl: typeof fetch;
+    signals: AbortSignal[];
+    urls: string[];
+    settle: () => void;
+  };
+
+  /** Both endpoints answer only when the test says so. */
+  function stalledProbeFetch(): ProbeFetchRecord {
+    const signals: AbortSignal[] = [];
+    const urls: string[] = [];
+    const releases: Array<() => void> = [];
+    const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      urls.push(url);
+      if (init?.signal) signals.push(init.signal);
+      return new Promise<Response>((resolve, reject) => {
+        // `fetch`'s own contract: an ALREADY-aborted signal rejects rather than
+        // waiting for an abort event that can never fire again.
+        if (init?.signal?.aborted) {
+          reject(new Error(`aborted ${SENTINEL}`));
+          return;
+        }
+        releases.push(() =>
+          resolve(jsonResponse(200, url.endsWith("/ready") ? readyBody() : healthBody())),
+        );
+        init?.signal?.addEventListener("abort", () => reject(new Error(`aborted ${SENTINEL}`)), {
+          once: true,
+        });
+      });
+    }) as typeof fetch;
+    return {
+      fetchImpl,
+      settle: () => {
+        for (const release of releases) release();
+      },
+      signals,
+      urls,
+    };
+  }
+
+  test("publishes the request deadline and poll cadence the page schedules against", () => {
+    expect(VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS).toBe(4_000);
+    expect(VIVA_AGENT_READINESS_POLL_INTERVAL_MS).toBe(5_000);
+    // The request deadline must stay strictly inside the poll interval, or a
+    // "settle then wait" loop degenerates back into overlapping polls.
+    expect(VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS).toBeLessThan(
+      VIVA_AGENT_READINESS_POLL_INTERVAL_MS,
+    );
+  });
+
+  test("aborts every stalled readiness request at 4,000 ms and states sanitized unavailability", async () => {
+    jest.useFakeTimers();
+    const probe = stalledProbeFetch();
+    const pending = fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: probe.fetchImpl,
+    });
+
+    expect(probe.urls).toEqual([
+      "http://localhost:4318/health/brain",
+      "http://localhost:4318/ready",
+    ]);
+    expect(probe.signals).toHaveLength(2);
+    jest.advanceTimersByTime(VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS - 1);
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([false, false]);
+
+    jest.advanceTimersByTime(1);
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([true, true]);
+
+    const result = await pending;
+    expect(result.status).toBe("offline");
+    if (result.status !== "offline") throw new Error("Expected offline probe");
+    expect(result.apiBaseUrl).toBe("http://localhost:4318");
+    // The deadline is a structured availability fact; the rejected request's own
+    // message never becomes learner-facing copy.
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+    expect(result.error).toContain("4000");
+  });
+
+  test("forwards an outer abort to every readiness request and never hangs on it", async () => {
+    const probe = stalledProbeFetch();
+    const outer = new AbortController();
+    const pending = fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: probe.fetchImpl,
+      signal: outer.signal,
+    });
+
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([false, false]);
+    outer.abort();
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([true, true]);
+
+    const result = await pending;
+    expect(result.status).toBe("offline");
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+
+  test("an already-aborted outer signal aborts the probe's requests immediately", async () => {
+    const probe = stalledProbeFetch();
+    const outer = new AbortController();
+    outer.abort();
+
+    const result = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: probe.fetchImpl,
+      signal: outer.signal,
+    });
+
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([true, true]);
+    expect(result.status).toBe("offline");
+  });
+
+  test("a probe that answers inside the deadline leaves no armed timer behind", async () => {
+    jest.useFakeTimers();
+    const probe = stalledProbeFetch();
+    const pending = fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: probe.fetchImpl,
+    });
+    probe.settle();
+    const result = await pending;
+    expect(result.status).toBe("observed");
+
+    // The deadline timer is cleared on the success path too: if it were not, it
+    // would fire an abort into an already-answered probe (and, with a real
+    // clock, keep the process awake for four seconds after every poll).
+    jest.advanceTimersByTime(VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS * 2);
+    expect(probe.signals.map((signal) => signal.aborted)).toEqual([false, false]);
+  });
+
+  test("makes exactly one attempt per probe — repetition belongs to the poll owner", async () => {
+    const urls: string[] = [];
+    const result = await fetchVivaAgentReadinessProbe({
+      apiBaseUrl: "http://localhost:4318",
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        urls.push(String(input));
+        throw new Error("connection refused");
+      }) as typeof fetch,
+    });
+
+    expect(urls).toEqual(["http://localhost:4318/health/brain", "http://localhost:4318/ready"]);
+    expect(result.status).toBe("offline");
   });
 });

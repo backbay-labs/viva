@@ -556,19 +556,51 @@ export function vivaAgentHttpBaseUrl(env?: Record<string, string | undefined>): 
   }
 }
 
+/**
+ * `WEBSESSION-READY-01`: one readiness probe's hard deadline, and the interval
+ * the page's single poll owner waits AFTER a probe settles. The deadline is
+ * strictly inside the interval, so a settle-then-schedule loop can never be
+ * overtaken by its own successor.
+ */
+export const VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS = 4_000;
+export const VIVA_AGENT_READINESS_POLL_INTERVAL_MS = 5_000;
+
+/**
+ * One readiness observation, bounded and abortable.
+ *
+ * Both endpoints share ONE `AbortController`, so a caller that goes away (or a
+ * probe that outlives its deadline) cancels the work it started instead of
+ * leaving a request to resolve into a component that no longer exists. The
+ * result is total: an unreachable, malformed, or timed-out agent is a
+ * `status:"offline"` FACT, never a thrown promise, and a deadline states its own
+ * bound rather than echoing the rejected request's message. There is no retry
+ * here — repetition belongs to the page's single poll owner.
+ */
 export async function fetchVivaAgentReadinessProbe({
   apiBaseUrl = vivaAgentHttpBaseUrl(),
   fetchImpl = fetch,
+  signal,
 }: {
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 } = {}): Promise<VivaAgentReadinessProbe> {
   if (!apiBaseUrl) return { status: "api_missing" };
   const base = trimTrailingSlash(apiBaseUrl);
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+  const forwardAbort = () => controller.abort();
+  if (signal?.aborted) forwardAbort();
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+
   try {
     const [healthResponse, readyResponse] = await Promise.all([
-      fetchImpl(`${base}/health/brain`),
-      fetchImpl(`${base}/ready`),
+      fetchImpl(`${base}/health/brain`, { signal: controller.signal }),
+      fetchImpl(`${base}/ready`, { signal: controller.signal }),
     ]);
     const [health, ready] = await Promise.all([
       healthResponse.json() as Promise<VivaAgentBrainHealthEndpoint>,
@@ -589,11 +621,35 @@ export async function fetchVivaAgentReadinessProbe({
       status: "observed",
     };
   } catch (error) {
+    // Nothing may outlive a failed probe: if one endpoint answered and the
+    // other rejected, the survivor is cancelled here rather than left in
+    // flight. A successful probe has nothing left to cancel.
+    const cancelled = controller.signal.aborted;
+    controller.abort();
+    if (timedOut) {
+      return {
+        apiBaseUrl: base,
+        error: `readiness endpoints did not answer within ${VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS} ms`,
+        status: "offline",
+      };
+    }
+    if (cancelled) {
+      // The caller withdrew. That is a cancellation FACT; the rejected request's
+      // own message is never carried into a probe a surface could render.
+      return {
+        apiBaseUrl: base,
+        error: "readiness probe was cancelled before the endpoints answered",
+        status: "offline",
+      };
+    }
     return {
       apiBaseUrl: base,
       error: error instanceof Error ? error.message : String(error),
       status: "offline",
     };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", forwardAbort);
   }
 }
 

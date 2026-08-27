@@ -27,6 +27,7 @@ import {
   fetchVivaAgentReadinessProbe,
   isVivaAudioSendRejectedError,
   reconnectDelayMs,
+  VIVA_AGENT_READINESS_POLL_INTERVAL_MS,
   VIVA_AGENT_RECONNECT_DELAYS_MS,
   type VivaAgentAudioOutput,
   type VivaAgentGenerationReason,
@@ -230,6 +231,9 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const [micState, setMicState] = useState<RuntimeMicState>("unknown");
   const [readinessProbe, setReadinessProbe] =
     useState<VivaAgentReadinessProbe>(initialReadinessProbe);
+  // Consecutive polls that could not observe the agent. Owned by the single
+  // poll lifecycle below, so a reconnect or a re-render cannot double-count.
+  const [readinessFailures, setReadinessFailures] = useState(0);
   const [sourceOpen, setSourceOpen] = useState(false);
   const [textAnswerEnabled, setTextAnswerEnabled] = useState(false);
   const [textRetryOpen, setTextRetryOpen] = useState(false);
@@ -905,25 +909,47 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     return () => window.clearInterval(id);
   }, [sessionOver]);
 
+  // `WEBSESSION-READY-01`: ONE poll owner. It holds one abort controller and at
+  // most one armed timer, starts the next probe only from the previous one's
+  // SETTLEMENT, and is torn down by unmount, a failed projection, a terminal
+  // recap, and a superseding route attempt alike. Reconnect never creates a
+  // second loop: nothing in this effect's key depends on reconnect state.
   const stopReadinessPolling = shouldStopReadinessPolling({
+    projectionFailed: projectionStage.kind === "failed",
+    ready: Boolean(agent.agentState.ready),
     recap: agent.derived.recap,
     status: agent.status,
-    ready: Boolean(agent.agentState.ready),
   });
+  const readinessRouteKey = `${routeIdentity.studySetId ?? ""}:${routeIdentity.sessionId ?? ""}`;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: readinessRouteKey is the supersession key — a route replacement must tear this loop down, not keep polling for the previous session.
   useEffect(() => {
     if (stopReadinessPolling) return;
-    let cancelled = false;
-    const refreshReadiness = async () => {
-      const next = await depsRef.current.fetchReadiness();
-      if (!cancelled) setReadinessProbe(next);
+    const clock = depsRef.current.reconnectClock;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+
+    const runPoll = async () => {
+      const next = await depsRef.current.fetchReadiness({ signal: controller.signal });
+      if (controller.signal.aborted || !mountedRef.current) return;
+      setReadinessProbe(next);
+      setReadinessFailures((previous) => readinessPollFailureCount(previous, next));
+      // Settle THEN schedule: a probe slower than the interval delays its own
+      // successor instead of being overlapped by it.
+      timer = clock.setTimeout(() => {
+        timer = null;
+        void runPoll();
+      }, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
     };
-    void refreshReadiness();
-    const id = window.setInterval(refreshReadiness, 5_000);
+    void runPoll();
+
     return () => {
-      cancelled = true;
-      window.clearInterval(id);
+      controller.abort();
+      if (timer !== null) {
+        clock.clearTimeout(timer);
+        timer = null;
+      }
     };
-  }, [stopReadinessPolling]);
+  }, [readinessRouteKey, stopReadinessPolling]);
 
   // Play the examiner's streamed audio (synthetic emits none yet; wired for the
   // real provider) and honour cancellations/barge-in.
@@ -1585,72 +1611,79 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   }
 
   return (
-    <LiveSessionShell
-      clockLabel="Local session clock"
-      conceptNodes={conceptNodes}
-      challengeDisabled={challengeDisabled}
-      consentDisclosure={{
-        acknowledged: recordingConsentAcknowledged,
-        onAcknowledge: acknowledgeRecordingDisclosure,
-        scope: VIVA_DISCLOSURE_SCOPE,
-      }}
-      contextLabel={sessionContextLabel}
-      elapsed={elapsed}
-      glyphState={glyphStateFor(effectiveState)}
-      generationId={agent.derived.generationId}
-      highlightedTokens={highlightedTokens}
-      hintShown={hintShown}
-      checkingControl={
-        effectiveState === "thinking" && websocketReady
-          ? { onCancelTurn: cancelCheckingTurn }
-          : undefined
-      }
-      levelRef={levelRef}
-      onBackToQuestion={() => setSourceOpen(false)}
-      onChallengeSource={challengeSource}
-      onEndSession={endSession}
-      onHint={() => setHintShown((shown) => !shown)}
-      onNextQuestion={submitSpokenTurn}
-      onShowSource={() => setSourceOpen(true)}
-      onSubmitAnswer={submitRuntimePrimaryAction}
-      onSubmitTextAnswer={submitTextTurn}
-      onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
-      onUseTextAnswer={() => {
-        setTextAnswerEnabled(true);
-        activateTextAnswerMode();
-      }}
-      onUseVoiceAnswer={() => {
-        textAnswerModeRef.current = false;
-        cancelActiveAudioTurn();
-        setTextAnswerEnabled(false);
-        onUserGesture();
-      }}
-      question={trace.question}
-      recap={agent.derived.recap}
-      reviewPlan={reviewPlan}
-      runtime={runtime}
-      scene={scene}
-      sourceFolio={sourceFolio}
-      state={effectiveState}
-      studyContext={{
-        activeQuestionPrompt: studyProjection.activeQuestion?.prompt ?? null,
-        concepts: studyProjection.concepts.map(({ id, label, status }) => ({
-          id,
-          label,
-          status,
-        })),
-        course: studyProjection.studySet.course,
-        examLabel: studyProjection.studySet.examLabel,
-        ingestionStatus: studyProjection.studySet.ingestionStatus,
-        progress: studyProjection.questionProgress,
-        sessionGoal: studyProjection.session.goal,
-        sessionMode: studyProjection.session.mode,
-        title: studyProjection.studySet.title,
-      }}
-      transcript={agent.derived.transcript}
-      textAnswer={textAnswerState}
-      turnTaking={turnTaking}
-    />
+    <>
+      {readinessPollBounded(readinessFailures) ? (
+        <p className="session-readiness-status" data-consecutive-failures={readinessFailures}>
+          {runtime.marginaliaTitle} {runtime.marginaliaText}
+        </p>
+      ) : null}
+      <LiveSessionShell
+        clockLabel="Local session clock"
+        conceptNodes={conceptNodes}
+        challengeDisabled={challengeDisabled}
+        consentDisclosure={{
+          acknowledged: recordingConsentAcknowledged,
+          onAcknowledge: acknowledgeRecordingDisclosure,
+          scope: VIVA_DISCLOSURE_SCOPE,
+        }}
+        contextLabel={sessionContextLabel}
+        elapsed={elapsed}
+        glyphState={glyphStateFor(effectiveState)}
+        generationId={agent.derived.generationId}
+        highlightedTokens={highlightedTokens}
+        hintShown={hintShown}
+        checkingControl={
+          effectiveState === "thinking" && websocketReady
+            ? { onCancelTurn: cancelCheckingTurn }
+            : undefined
+        }
+        levelRef={levelRef}
+        onBackToQuestion={() => setSourceOpen(false)}
+        onChallengeSource={challengeSource}
+        onEndSession={endSession}
+        onHint={() => setHintShown((shown) => !shown)}
+        onNextQuestion={submitSpokenTurn}
+        onShowSource={() => setSourceOpen(true)}
+        onSubmitAnswer={submitRuntimePrimaryAction}
+        onSubmitTextAnswer={submitTextTurn}
+        onTryAgain={textAnswerActive ? openTextRetry : submitSpokenTurn}
+        onUseTextAnswer={() => {
+          setTextAnswerEnabled(true);
+          activateTextAnswerMode();
+        }}
+        onUseVoiceAnswer={() => {
+          textAnswerModeRef.current = false;
+          cancelActiveAudioTurn();
+          setTextAnswerEnabled(false);
+          onUserGesture();
+        }}
+        question={trace.question}
+        recap={agent.derived.recap}
+        reviewPlan={reviewPlan}
+        runtime={runtime}
+        scene={scene}
+        sourceFolio={sourceFolio}
+        state={effectiveState}
+        studyContext={{
+          activeQuestionPrompt: studyProjection.activeQuestion?.prompt ?? null,
+          concepts: studyProjection.concepts.map(({ id, label, status }) => ({
+            id,
+            label,
+            status,
+          })),
+          course: studyProjection.studySet.course,
+          examLabel: studyProjection.studySet.examLabel,
+          ingestionStatus: studyProjection.studySet.ingestionStatus,
+          progress: studyProjection.questionProgress,
+          sessionGoal: studyProjection.session.goal,
+          sessionMode: studyProjection.session.mode,
+          title: studyProjection.studySet.title,
+        }}
+        transcript={agent.derived.transcript}
+        textAnswer={textAnswerState}
+        turnTaking={turnTaking}
+      />
+    </>
   );
 }
 
@@ -2051,14 +2084,37 @@ export function resetPlaybackCancellationStateForGeneration(input: {
  * drops back below ready.
  */
 export function shouldStopReadinessPolling(input: {
+  projectionFailed?: boolean;
   recap: unknown;
   status: string;
   ready: boolean;
 }): boolean {
   return (
+    Boolean(input.projectionFailed) ||
     isSessionOver({ recap: input.recap, status: input.status }) ||
     (input.ready && input.status === "open")
   );
+}
+
+/**
+ * How many CONSECUTIVE polls have failed to observe the agent. A poll that came
+ * back `offline` — including one that hit its own request deadline — is a
+ * failure; anything the probe could actually observe resets the count, and a
+ * missing API URL is a configuration state the copy already names rather than a
+ * failed attempt.
+ */
+export const VIVA_AGENT_READINESS_FAILURE_LIMIT = 3;
+
+export function readinessPollFailureCount(
+  previous: number,
+  probe: VivaAgentReadinessProbe,
+): number {
+  if (probe.status === "offline") return previous + 1;
+  return 0;
+}
+
+export function readinessPollBounded(consecutiveFailures: number): boolean {
+  return consecutiveFailures >= VIVA_AGENT_READINESS_FAILURE_LIMIT;
 }
 
 export function stopCaptureForRecap(

@@ -36,6 +36,8 @@ import {
   micStateForAudioCaptureError,
   micStateForCaptureEndReason,
   providerInputAllowed,
+  readinessPollBounded,
+  readinessPollFailureCount,
   resetPlaybackCancellationStateForGeneration,
   resolveEntrySessionCredential,
   sameBrowserSessionRouteIdentity,
@@ -49,6 +51,7 @@ import {
   textAnswerPayload,
   textAnswerStateForSession,
   typedAnswerUnresolved,
+  VIVA_AGENT_READINESS_FAILURE_LIMIT,
 } from "./LiveSessionPage";
 
 describe("drainAgentAudio", () => {
@@ -155,6 +158,54 @@ describe("shouldStopReadinessPolling", () => {
     expect(shouldStopReadinessPolling({ recap: undefined, status: "closed", ready: false })).toBe(
       true,
     );
+  });
+
+  test("stops polling when the authenticated projection failed", () => {
+    // There is no session to become ready FOR: a failed projection means the
+    // page renders its pre-loop shell and will never open a socket, so a poll
+    // is work nothing can consume.
+    expect(
+      shouldStopReadinessPolling({
+        projectionFailed: true,
+        ready: false,
+        recap: undefined,
+        status: "connecting",
+      }),
+    ).toBe(true);
+    expect(
+      shouldStopReadinessPolling({
+        projectionFailed: false,
+        ready: false,
+        recap: undefined,
+        status: "connecting",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("readinessPollFailureCount (WEBSESSION-READY-01)", () => {
+  test("counts consecutive unavailable polls and resets on an observed one", () => {
+    expect(readinessPollFailureCount(0, { status: "api_missing" })).toBe(0);
+    expect(readinessPollFailureCount(2, { apiBaseUrl: "u", error: "e", status: "offline" })).toBe(
+      3,
+    );
+    expect(
+      readinessPollFailureCount(3, {
+        apiBaseUrl: "u",
+        health: {} as never,
+        healthHttpStatus: 200,
+        ready: {} as never,
+        readyHttpStatus: 200,
+        status: "observed",
+      }),
+    ).toBe(0);
+  });
+
+  test("surfaces the bounded state only after three consecutive failures", () => {
+    expect(VIVA_AGENT_READINESS_FAILURE_LIMIT).toBe(3);
+    expect(readinessPollBounded(2)).toBe(false);
+    expect(readinessPollBounded(3)).toBe(true);
+    expect(readinessPollBounded(4)).toBe(true);
   });
 });
 

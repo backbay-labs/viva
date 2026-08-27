@@ -17,6 +17,8 @@ import {
   type AuthenticatedStudyProjectionRequest,
   type AuthenticatedStudyProjectionResult,
   initialVivaAgentSessionState,
+  VIVA_AGENT_READINESS_POLL_INTERVAL_MS,
+  VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS,
   type VivaAgentReadinessProbe,
   type VivaAgentRetainedAudioTurn,
   type VivaAgentSessionController,
@@ -1807,5 +1809,299 @@ describe("LiveSessionPage typed intents and D-08A disclosure (WEBSESSION-INTENT-
         (button) => button.textContent === "Acknowledge",
       ),
     ).toBe(true);
+  });
+});
+
+/**
+ * `WEBSESSION-READY-01` — the page is the SINGLE readiness poll owner.
+ *
+ * One in-flight probe, one armed timer, one abort controller. The next poll is
+ * scheduled from the previous one's SETTLEMENT, so a probe slower than the five
+ * second cadence can never be overlapped by its own successor, and going away
+ * (unmount, projection failure, terminal recap) aborts the request rather than
+ * letting it resolve into a dead component.
+ */
+describe("LiveSessionPage bounded readiness polling (WEBSESSION-READY-01)", () => {
+  const OFFLINE_PROBE: VivaAgentReadinessProbe = {
+    apiBaseUrl: "http://localhost:4318",
+    error: "readiness endpoints did not answer within 4000 ms",
+    status: "offline",
+  };
+
+  const OBSERVED_PROBE: VivaAgentReadinessProbe = {
+    apiBaseUrl: "http://localhost:4318",
+    health: {
+      brain: { configured: true, live_runtime: false, provider: "synthetic", selectable: true },
+      provider: "synthetic",
+      status: "ok",
+      store: {
+        available: true,
+        backend: "in_memory",
+        durable: false,
+        nonce_replay_protection: true,
+        raw_audio_persistence: false,
+        transcript_persistence: false,
+        uuid_schema_translation: true,
+      },
+    },
+    healthHttpStatus: 200,
+    ready: {
+      brain: { configured: true, live_runtime: false, provider: "synthetic", selectable: true },
+      ready: true,
+      store: {
+        available: true,
+        backend: "in_memory",
+        durable: false,
+        nonce_replay_protection: true,
+        raw_audio_persistence: false,
+        transcript_persistence: false,
+        uuid_schema_translation: true,
+      },
+    },
+    readyHttpStatus: 200,
+    status: "observed",
+  };
+
+  type ReadinessRecord = {
+    fetchReadiness: LiveSessionPageDependencies["fetchReadiness"];
+    signals: Array<AbortSignal | null>;
+    settle: (probe: VivaAgentReadinessProbe) => void;
+    /** Probes that were started, including StrictMode's immediately-aborted one. */
+    starts: () => number;
+    /** Probes that are still live — the count an overlapping poll would raise. */
+    live: () => number;
+  };
+
+  /** A probe the test settles by hand, so "no second poll yet" is provable. */
+  function gatedReadiness(): ReadinessRecord {
+    const signals: Array<AbortSignal | null> = [];
+    type Waiter = { resolve: (probe: VivaAgentReadinessProbe) => void };
+    const waiting: Waiter[] = [];
+    return {
+      fetchReadiness: (async (input?: { signal?: AbortSignal }) => {
+        const signal = input?.signal ?? null;
+        signals.push(signal);
+        return await new Promise<VivaAgentReadinessProbe>((resolve) => {
+          const waiter: Waiter = { resolve };
+          waiting.push(waiter);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              const index = waiting.indexOf(waiter);
+              if (index >= 0) waiting.splice(index, 1);
+              resolve(OFFLINE_PROBE);
+            },
+            { once: true },
+          );
+        });
+      }) as LiveSessionPageDependencies["fetchReadiness"],
+      live: () => waiting.length,
+      settle: (probe) => {
+        while (waiting.length > 0) waiting.shift()?.resolve(probe);
+      },
+      signals,
+      starts: () => signals.length,
+    };
+  }
+
+  /**
+   * A faithful double for the real probe's own request boundary: an endpoint
+   * that never answers becomes an `offline` FACT at the 4,000 ms deadline, and
+   * an aborted probe resolves rather than hanging.
+   */
+  function deadlineReadiness(
+    clock: FakeReconnectClock,
+    probes: () => VivaAgentReadinessProbe,
+  ): ReadinessRecord {
+    const signals: Array<AbortSignal | null> = [];
+    let inFlight = 0;
+    return {
+      fetchReadiness: (async (input?: { signal?: AbortSignal }) => {
+        signals.push(input?.signal ?? null);
+        inFlight += 1;
+        const next = probes();
+        return await new Promise<VivaAgentReadinessProbe>((resolve) => {
+          const settle = (probe: VivaAgentReadinessProbe) => {
+            inFlight -= 1;
+            resolve(probe);
+          };
+          if (next.status === "observed") {
+            settle(next);
+            return;
+          }
+          const timer = clock.setTimeout(
+            () => settle(next),
+            VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS,
+          );
+          input?.signal?.addEventListener(
+            "abort",
+            () => {
+              clock.clearTimeout(timer);
+              settle(OFFLINE_PROBE);
+            },
+            { once: true },
+          );
+        });
+      }) as LiveSessionPageDependencies["fetchReadiness"],
+      live: () => inFlight,
+      settle: () => {},
+      signals,
+      starts: () => signals.length,
+    };
+  }
+
+  async function step(clock: FakeReconnectClock, ms = 0, rounds = 4) {
+    for (let round = 0; round < rounds; round += 1) {
+      await act(async () => {
+        clock.advance(round === 0 ? ms : 0);
+        await new Promise<void>((resolve) => {
+          globalThis.setTimeout(resolve, 0);
+        });
+      });
+    }
+  }
+
+  async function mountReadiness(
+    clock: FakeReconnectClock,
+    overrides: Partial<LiveSessionPageDependencies>,
+  ) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    const dependencies = testDependencies({
+      createAgentController: programmableController().factory,
+      reconnectClock: clock,
+      renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      ...overrides,
+    });
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage dependencies={dependencies} />
+        </StrictMode>,
+      );
+    });
+    await step(clock);
+    return { container, root };
+  }
+
+  test("never starts a second poll while the previous one is still settling", async () => {
+    const clock = createFakeReconnectClock(0);
+    const readiness = gatedReadiness();
+    await mountReadiness(clock, { fetchReadiness: readiness.fetchReadiness });
+
+    // Exactly ONE live probe: StrictMode's throwaway effect pass started one
+    // too, and the committed pass aborted it rather than leaving two in flight.
+    expect(readiness.live()).toBe(1);
+    const started = readiness.starts();
+
+    // The five-second wall-clock boundary passes with that probe still in
+    // flight: an interval would have started a second one here.
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    expect(readiness.starts()).toBe(started);
+    expect(readiness.live()).toBe(1);
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    expect(readiness.starts()).toBe(started);
+    expect(readiness.live()).toBe(1);
+
+    // Settlement is what arms the next start, a full interval later.
+    await act(async () => {
+      readiness.settle(OFFLINE_PROBE);
+    });
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS - 1);
+    expect(readiness.starts()).toBe(started);
+    await step(clock, 1);
+    expect(readiness.starts()).toBe(started + 1);
+    expect(readiness.live()).toBe(1);
+  });
+
+  test("unmount aborts the in-flight probe, leaves no timer, and updates nothing", async () => {
+    const clock = createFakeReconnectClock(0);
+    const readiness = gatedReadiness();
+    const { container, root } = await mountReadiness(clock, {
+      fetchReadiness: readiness.fetchReadiness,
+    });
+
+    expect(readiness.live()).toBe(1);
+    const started = readiness.starts();
+
+    await act(async () => {
+      root.unmount();
+    });
+    // EVERY request this page started is aborted, and the loop owns no timer to
+    // fire into a dead component.
+    expect(readiness.signals.every((signal) => signal?.aborted === true)).toBe(true);
+    expect(readiness.live()).toBe(0);
+    expect(clock.pending()).toEqual([]);
+    expect(container.innerHTML).toBe("");
+
+    // A late answer to an aborted probe neither re-renders nor re-arms the loop.
+    await act(async () => {
+      readiness.settle(OFFLINE_PROBE);
+    });
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS * 3);
+    expect(readiness.starts()).toBe(started);
+    expect(container.innerHTML).toBe("");
+  });
+
+  test("three consecutive failed polls surface the bounded readiness state and reset on success", async () => {
+    const clock = createFakeReconnectClock(0);
+    let probe: VivaAgentReadinessProbe = OFFLINE_PROBE;
+    const readiness = deadlineReadiness(clock, () => probe);
+    const { container } = await mountReadiness(clock, {
+      fetchReadiness: readiness.fetchReadiness,
+    });
+
+    const failures = () =>
+      container
+        .querySelector("[data-consecutive-failures]")
+        ?.getAttribute("data-consecutive-failures") ?? null;
+
+    // Poll 1 hits its own 4,000 ms deadline; the cadence stays 5,000 ms AFTER
+    // that settlement, so each failed cycle costs 9,000 ms.
+    const started = readiness.starts();
+    await step(clock, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+    expect(failures()).toBe(null);
+
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    expect(readiness.starts()).toBe(started + 1);
+    await step(clock, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+    expect(failures()).toBe(null);
+
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    expect(readiness.starts()).toBe(started + 2);
+    await step(clock, VIVA_AGENT_READINESS_REQUEST_TIMEOUT_MS);
+    expect(failures()).toBe("3");
+    // The bounded state is a count on the readiness status element, not a new
+    // cadence and not a stopped loop.
+    expect(container.textContent).toContain("Agent unavailable");
+    expect(readiness.live()).toBe(0);
+
+    probe = OBSERVED_PROBE;
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS);
+    expect(readiness.starts()).toBe(started + 3);
+    expect(failures()).toBe(null);
+  });
+
+  test("a failed projection stops the readiness loop instead of polling a dead page", async () => {
+    const clock = createFakeReconnectClock(0);
+    const readiness = gatedReadiness();
+    await mountReadiness(clock, {
+      fetchReadiness: readiness.fetchReadiness,
+      fetchStudyProjection: (async () => ({
+        cause: "unavailable",
+        status: "failed",
+      })) as LiveSessionPageDependencies["fetchStudyProjection"],
+    });
+
+    const started = readiness.starts();
+    expect(readiness.live()).toBe(0);
+    expect(readiness.signals.every((signal) => signal?.aborted === true)).toBe(true);
+
+    await act(async () => {
+      readiness.settle(OFFLINE_PROBE);
+    });
+    await step(clock, VIVA_AGENT_READINESS_POLL_INTERVAL_MS * 3);
+    expect(readiness.starts()).toBe(started);
   });
 });
