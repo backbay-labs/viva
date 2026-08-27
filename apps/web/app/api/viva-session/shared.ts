@@ -902,7 +902,7 @@ function rfc3339UtcInstant(unixSeconds: number): string {
  *
  * 1. canonical safe-read origin / fetch context
  * 2. the exact two-parameter query allowlist
- * 3. the exact `Authorization: Bearer` grammar
+ * 3. the exact credential-header grammar
  * 4. strict Plan 05 verification, bound to the query, identity bound to the allowlist
  * 5. atomic shared IP+session admission
  * 6. the scoped read credential
@@ -947,7 +947,7 @@ export async function handleVivaSessionProjection(
   if (!scopedRead || !upstream) return projectionUnavailableResponse();
 
   return fetchAuthenticatedStudyProjection({
-    accessToken: presented,
+    sessionCredential: presented,
     canonicalOrigin: canonical.value.origin,
     clientSignal: clientAbortSignal(request),
     identity: { sessionId: query.voiceSessionId, studySetId: query.studySetId },
@@ -965,7 +965,7 @@ type VivaSessionProjectionFailure =
  * credential scan, and Plan 04's validation, so a slow upstream cannot buy time in any of them.
  */
 async function fetchAuthenticatedStudyProjection(input: {
-  accessToken: string;
+  sessionCredential: string;
   canonicalOrigin: string;
   clientSignal: AbortSignal | null;
   identity: AuthenticatedStudyIdentity;
@@ -992,7 +992,7 @@ async function fetchAuthenticatedStudyProjection(input: {
         accept: "application/json",
         authorization: `Bearer ${input.scopedCredential}`,
         origin: input.canonicalOrigin,
-        "x-viva-session-token": input.accessToken,
+        "x-viva-session-token": input.sessionCredential,
       },
       method: "GET",
       redirect: "error",
@@ -1085,7 +1085,7 @@ function exactProjectionQuery(url: URL): ProjectionQuery | null {
 }
 
 /**
- * The exact `Authorization: Bearer ${accessToken}` grammar and no other.
+ * The exact credential-header grammar the plan pins, and no other.
  *
  * `Headers.get` joins repeated header values with a comma, so a comma is how a second value
  * announces itself; the token itself is printable ASCII with no spaces. The scheme is matched
@@ -1106,7 +1106,7 @@ function projectionBearerCredential(value: string | null): string | null {
  * configuration failure, never an open door.
  */
 function verifyProjectionAccessToken(
-  token: string,
+  credential: string,
   query: ProjectionQuery,
 ): ProjectionAccessTokenVerification {
   const allowedUserIds = configuredAllowlist("VIVA_SESSION_ALLOWED_USER_IDS");
@@ -1120,7 +1120,7 @@ function verifyProjectionAccessToken(
       study_set_id: query.studySetId,
       user_id: null,
     },
-    token,
+    token: credential,
   });
   if (!verified.ok) return { ok: false, reason: verified.reason };
   if (!allowedUserIds.has(verified.claims.user_id)) return { ok: false, reason: "access_denied" };
