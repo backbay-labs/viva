@@ -24,9 +24,9 @@ use agent_service::{
     begin_drain_and_wait, build_router, verify_session_token_at, AppState, ClientFrame,
     ClientTurnIntent, DrainOutcome, ExpectedSessionBinding, FailureControlConfig,
     FailureControlScenario, OperatorAccess, ProjectionReadAccess, RecorderLimits, RedactedSecret,
-    ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig,
-    VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder, VoiceWsAccess, WsTimeouts,
-    VIVA_VOICE_PROTOCOL_VERSION,
+    ServerFrame, SessionMintAccess, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder,
+    VoiceLimitConfig, VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder,
+    VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -545,6 +545,10 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
 /// nothing outside this test binary.
 const FIXTURE_OPERATOR_CREDENTIAL: &str = "viva-fixture-operator-credential-0001";
 const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
+/// `A-32` review fix: the scoped credential `POST /api/viva-session/start` presents
+/// (`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`). It is byte-distinct from the read
+/// credential the browser proxy presents, which is the entire point.
+const FIXTURE_SESSION_MINT_CREDENTIAL: &str = "viva-fixture-session-mint-cred-000001";
 
 /// A public deployment under `D-07 TOKEN_ONLY_REFRESH`: there is no WebSocket
 /// bearer at all, so the absent-permissive WebSocket bearer check would leave
@@ -5017,9 +5021,23 @@ impl StudyMemoryStore for RefusingVoiceSessionStore {
 }
 
 /// The deployment shape `main.rs` builds for a public signed-start service: the
-/// session-token secret mints the start credential, and the scoped library-read
-/// credential plus that same secret construct the projection route.
+/// session-token secret mints the start credential, the scoped library-read
+/// credential plus that same secret construct the projection route, and the scoped
+/// session-mint credential is the one authority allowed to record a started
+/// session.
 fn signed_start_state(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    signed_start_state_without_session_mint_authority(store, brain_store).with_session_mint_access(
+        SessionMintAccess::new(FIXTURE_SESSION_MINT_CREDENTIAL.into()),
+    )
+}
+
+/// The same deployment with no session-mint credential configured at all. `A-32`
+/// review fix: such a deployment has no caller entitled to record a start, so its
+/// library snapshot is a pure read for everyone.
+fn signed_start_state_without_session_mint_authority(
     store: Arc<dyn StudyMemoryStore>,
     brain_store: Arc<dyn StudyMemoryStore>,
 ) -> AppState {
@@ -5044,9 +5062,24 @@ fn signed_start_state(
 /// Reads the library snapshot exactly as a caller does. `record_start_for` is the
 /// explicit start-mint selector: `None` is a plain listing read, `Some(id)` is the
 /// request `POST /api/viva-session/start` makes for the one set it is starting.
+/// A mint request presents the scoped session-mint credential, because after the
+/// `A-32` review fix that credential — not the selector — is the write authority.
 async fn library_snapshot_json(
     app: &axum::Router,
     record_start_for: Option<&str>,
+) -> serde_json::Value {
+    let bearer = record_start_for.map(|_| FIXTURE_SESSION_MINT_CREDENTIAL);
+    library_snapshot_json_with_bearer(app, record_start_for, bearer).await
+}
+
+/// The same read with an explicit `Authorization` credential. Which credential a
+/// snapshot presents is the whole question the `A-32` review fix answers: the
+/// browser's read-scoped credential, and no credential at all, must both be unable
+/// to open a durable session however the query string is written.
+async fn library_snapshot_json_with_bearer(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
 ) -> serde_json::Value {
     let uri = match record_start_for {
         Some(study_set_id) => {
@@ -5054,16 +5087,16 @@ async fn library_snapshot_json(
         }
         None => "/study-sets/library?user_id=user-1".to_owned(),
     };
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("origin", STARTED_SESSION_ORIGIN);
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(uri)
-                .header("origin", STARTED_SESSION_ORIGIN)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -5312,6 +5345,136 @@ async fn a_start_mint_records_only_the_study_set_it_names() {
             "unavailable_reason": "no_open_session",
         }),
         "an unnamed set is untouched by another set's mint",
+    );
+}
+
+/// `A-32` review fix: a selector is not authority.
+///
+/// `GET /study-sets/library` is browser-reachable through the read-scoped proxy,
+/// which copies the caller's query string upstream verbatim, and on a loopback bind
+/// the route accepts the trusted user with no `Authorization` header at all. A
+/// selector any caller can type must therefore never open a durable
+/// `voice_sessions` row: an unauthenticated read stays a read, no matter what it
+/// names, so nothing accumulates and `resume` never names a phantom.
+#[tokio::test]
+async fn an_unauthenticated_library_read_cannot_record_the_start_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    for read in 1..=3 {
+        let payload = library_snapshot_json_with_bearer(&app, Some("biology-midterm"), None).await;
+        let study_set = library_study_set(&payload, "biology-midterm");
+        assert_eq!(
+            study_set["actions"]["start"]["available"], true,
+            "read {read}: an unauthorized selector is ignored, not an error",
+        );
+        assert!(
+            store.writes().is_empty(),
+            "read {read} recorded a session with no mint authority: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "read {read} left a durable session behind",
+        );
+        assert_eq!(
+            study_set["actions"]["resume"],
+            serde_json::json!({
+                "available": false,
+                "unavailable_reason": "no_open_session",
+            }),
+            "read {read} invented a session to resume",
+        );
+    }
+}
+
+/// `A-32` review fix: the browser's own scoped credential is a READ credential.
+///
+/// `apps/web`'s library proxy presents `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` on
+/// every browser snapshot, so on a public bind that credential — not an absent one
+/// — is what a browser-shaped request carries. It authorizes reading the library;
+/// it does not authorize opening a session.
+#[tokio::test]
+async fn the_library_read_credential_cannot_record_the_start_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let payload = library_snapshot_json_with_bearer(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    )
+    .await;
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the read credential still reads the library, and its start is still signed"
+    );
+    assert!(
+        store.writes().is_empty(),
+        "the read credential recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the read credential left a durable session behind",
+    );
+
+    // And the credential it minted is exactly as unusable as any unrecorded start:
+    // the projection still refuses it, so no client can proceed on a session the
+    // service never opened.
+    let (status, _) = projection_after_start(
+        &app,
+        "biology-midterm",
+        start["session_id"].as_str().expect("minted session id"),
+        start["session_token"].as_str().expect("minted token"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an unrecorded start must not project",
+    );
+}
+
+/// `A-32` review fix: fail closed on an unconfigured deployment.
+///
+/// A service that configures no session-mint credential has no caller entitled to
+/// record a start, so no request can — not even one presenting the value another
+/// deployment would use. The deadlock fix engages where the scoped credential is
+/// configured; where it is not, the route is exactly the read it was before.
+#[tokio::test]
+async fn a_deployment_without_session_mint_authority_records_no_start() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state_without_session_mint_authority(
+        store.clone(),
+        inner.clone(),
+    ));
+
+    for bearer in [
+        None,
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    ] {
+        let payload =
+            library_snapshot_json_with_bearer(&app, Some("biology-midterm"), bearer).await;
+        assert_eq!(
+            library_study_set(&payload, "biology-midterm")["actions"]["start"]["available"],
+            true,
+            "the snapshot still reads and still signs its starts",
+        );
+    }
+    assert!(
+        store.writes().is_empty(),
+        "an unconfigured deployment recorded a start: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "an unconfigured deployment left a durable session behind",
     );
 }
 
