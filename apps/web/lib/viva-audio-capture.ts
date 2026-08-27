@@ -234,6 +234,129 @@ export function createStreamingFloat32Resampler(
   };
 }
 
+/**
+ * `WEBSESSION-CAPTURE-01` / WSC-M07 — the quality stage Plan 03's converter needs.
+ *
+ * Plan 03's rational-phase resampler is exact about POSITION, not about band
+ * limiting: for 48 kHz -> 24 kHz every target index lands on an integer source
+ * index, so the converter is a pure decimator and content above the 12 kHz output
+ * Nyquist is not attenuated — it is folded down into the speech band as a phantom
+ * tone. This stage removes that content BEFORE the converter sees it.
+ *
+ * It is a fixed odd-length linear-phase windowed-sinc: deterministic, allocation
+ * free per tap, and adding no dependency. Its delay line persists across
+ * AudioWorklet callbacks (resetting it per callback would re-introduce a boundary
+ * artefact at every block, which is the same class of bug CRIT-AUDIO-01 fixed for
+ * phase), and it is length-preserving, so the converter's exact
+ * `floor(N * target / source)` output count is untouched.
+ */
+export const VIVA_AUDIO_ANTI_ALIAS_TAPS = 95;
+
+/**
+ * Cutoff as a fraction of the TARGET rate. 0.479 * 24 kHz = 11,496 Hz leaves the
+ * whole speech band flat while placing the stopband edge below the 12 kHz output
+ * Nyquist at both 44.1 and 48 kHz capture rates.
+ */
+export const VIVA_AUDIO_ANTI_ALIAS_CUTOFF_RATIO = 0.479;
+
+export type StreamingFloat32Filter = {
+  push(input: Float32Array): Float32Array;
+  reset(): void;
+};
+
+/**
+ * The low-pass stage for one capture lifecycle, or `null` when the capture is not
+ * downsampling at all — a native 24 kHz microphone must stay byte-identical.
+ */
+export function createVivaAntiAliasLowPass(
+  sourceSampleRateHz: number,
+  targetSampleRateHz: number,
+): StreamingFloat32Filter | null {
+  if (!Number.isFinite(sourceSampleRateHz) || sourceSampleRateHz <= 0) {
+    throw new Error("sourceSampleRateHz must be a positive finite number");
+  }
+  if (!Number.isFinite(targetSampleRateHz) || targetSampleRateHz <= 0) {
+    throw new Error("targetSampleRateHz must be a positive finite number");
+  }
+  if (sourceSampleRateHz <= targetSampleRateHz) return null;
+
+  const taps = blackmanLowPassTaps(
+    VIVA_AUDIO_ANTI_ALIAS_TAPS,
+    targetSampleRateHz * VIVA_AUDIO_ANTI_ALIAS_CUTOFF_RATIO,
+    sourceSampleRateHz,
+  );
+  const order = taps.length - 1;
+  const history = new Float32Array(order);
+
+  return {
+    push(input: Float32Array): Float32Array {
+      if (input.length === 0) return EMPTY_FLOAT32;
+      const window = new Float32Array(order + input.length);
+      window.set(history);
+      window.set(input, order);
+      const output = new Float32Array(input.length);
+      for (let index = 0; index < input.length; index += 1) {
+        let accumulator = 0;
+        const base = index + order;
+        for (let tap = 0; tap <= order; tap += 1) {
+          accumulator += (taps[tap] ?? 0) * (window[base - tap] ?? 0);
+        }
+        output[index] = accumulator;
+      }
+      history.set(window.subarray(window.length - order));
+      return output;
+    },
+    reset() {
+      history.fill(0);
+    },
+  };
+}
+
+/**
+ * Plan 03's rational-phase converter with the WSC-M07 quality stage in front of
+ * it. The converter itself is untouched and un-rewrapped when no downsampling is
+ * happening, so the native path keeps its exact previous behaviour.
+ */
+export function createVivaAntiAliasedDownsampler(
+  sourceSampleRateHz: number,
+  targetSampleRateHz: number,
+): StreamingFloat32Resampler {
+  const resampler = createStreamingFloat32Resampler(sourceSampleRateHz, targetSampleRateHz);
+  const antiAlias = createVivaAntiAliasLowPass(sourceSampleRateHz, targetSampleRateHz);
+  if (!antiAlias) return resampler;
+  return {
+    push: (input: Float32Array) => resampler.push(antiAlias.push(input)),
+    reset: () => {
+      antiAlias.reset();
+      resampler.reset();
+    },
+  };
+}
+
+/** A normalized, symmetric, Blackman-windowed sinc low-pass. */
+function blackmanLowPassTaps(taps: number, cutoffHz: number, sampleRateHz: number): Float64Array {
+  const coefficients = new Float64Array(taps);
+  const middle = (taps - 1) / 2;
+  const cutoff = cutoffHz / sampleRateHz;
+  let sum = 0;
+  for (let index = 0; index < taps; index += 1) {
+    const offset = index - middle;
+    const sinc =
+      offset === 0 ? 2 * cutoff : Math.sin(2 * Math.PI * cutoff * offset) / (Math.PI * offset);
+    const window =
+      0.42 -
+      0.5 * Math.cos((2 * Math.PI * index) / (taps - 1)) +
+      0.08 * Math.cos((4 * Math.PI * index) / (taps - 1));
+    coefficients[index] = sinc * window;
+    sum += coefficients[index] ?? 0;
+  }
+  // Unity DC gain, so the learner's voice keeps its level exactly.
+  for (let index = 0; index < taps; index += 1) {
+    coefficients[index] = (coefficients[index] ?? 0) / sum;
+  }
+  return coefficients;
+}
+
 export function float32ToPcm16Base64FramesAtSampleRate(
   samples: Float32Array | readonly number[],
   sourceSampleRateHz: number,
@@ -351,15 +474,18 @@ export function startVivaPcm16StreamingCapture(
   let finishing = false;
   let pendingPcm16 = new Uint8Array(0);
   let sequence = 0;
-  // Exactly one resampler for this capture lifecycle. It is created on the first
+  // Exactly one rate converter for this capture lifecycle — the anti-alias stage
+  // and Plan 03's rational-phase resampler together. It is created on the first
   // callback (the worklet reports the real hardware rate there), replaced only
   // when the source itself changes rate, and dropped on stop/cancel/end/error.
+  // Both halves keep their state across callbacks: resetting either one per
+  // callback re-introduces a boundary artefact at every block.
   let resampler: StreamingFloat32Resampler | null = null;
   let resamplerSourceRateHz = 0;
 
   function resampleForLifecycle(samples: Float32Array, sourceSampleRateHz: number): Float32Array {
     if (!resampler || resamplerSourceRateHz !== sourceSampleRateHz) {
-      resampler = createStreamingFloat32Resampler(sourceSampleRateHz, targetSampleRateHz);
+      resampler = createVivaAntiAliasedDownsampler(sourceSampleRateHz, targetSampleRateHz);
       resamplerSourceRateHz = sourceSampleRateHz;
     }
     return resampler.push(samples);
@@ -474,22 +600,83 @@ export function startVivaPcm16StreamingCapture(
   };
 }
 
+/**
+ * `WEBSESSION-CAPTURE-01` Steps 2-3 — construction inside ONE cleanup boundary.
+ *
+ * Browser capture builds five resources in sequence and then wires them together.
+ * Every one of those steps can throw (a revoked permission, a context in a bad
+ * state, a browser without `AudioWorkletNode`), and a throw between two of them
+ * used to strand whatever had already been created: a live microphone track with
+ * its recording indicator on, an `AudioContext` the browser counts against the
+ * page's limit, and an object URL that is never revoked.
+ *
+ * So each resource registers its release the instant it exists, and the single
+ * `releaseAll` runs those releases in REVERSE order, each isolated, exactly once.
+ * Listener removal is registered last so it runs first — nothing may deliver a
+ * frame into a graph that is being taken apart — and track stops are registered
+ * before the context close so a rejecting `close()` cannot leave the microphone
+ * open. The error a caller sees is the original typed one, unchanged.
+ */
 export async function createBrowserVivaAudioCaptureSource(
   options: VivaBrowserAudioCaptureOptions,
 ): Promise<VivaAudioCaptureSource> {
   const sampleRateHz = options.sampleRateHz ?? VIVA_AUDIO_SAMPLE_RATE_HZ;
+  const releases: Array<() => void | Promise<unknown>> = [];
+  let released = false;
+
+  /**
+   * Reverse-order, run-once, isolated release.
+   *
+   * Run-once lives HERE rather than in each caller, so no caller has to remember
+   * it. The synchronous half of every release runs before this function first
+   * suspends, so a synchronous `stop()` has fully torn the graph down by the time
+   * it returns.
+   */
+  function releaseAll(): Promise<void> {
+    if (released) return Promise.resolve();
+    released = true;
+    const settling: Array<Promise<unknown>> = [];
+    for (let index = releases.length - 1; index >= 0; index -= 1) {
+      try {
+        const pending = releases[index]?.();
+        // A rejected close must not become an unhandled rejection, and must not
+        // suppress the releases that already ran or the ones still to run.
+        if (pending) settling.push(Promise.resolve(pending).catch(() => undefined));
+      } catch {
+        // Isolated: one failing release cannot cancel the rest.
+      }
+    }
+    return Promise.allSettled(settling).then(() => undefined);
+  }
+
   const context = new options.AudioContextCtor({ sampleRate: sampleRateHz });
+  releases.push(() => context.close());
   if (!context.audioWorklet) {
-    await context.close();
+    await releaseAll();
     throw new VivaAudioWorkletUnavailableError();
   }
-  let moduleUrlCleanup: (() => void) | undefined;
-  let stream: MediaStream | undefined;
+
+  let sampleHandler:
+    | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
+    | null = null;
+  let endedHandler: ((reason: VivaAudioCaptureEndReason) => void) | null = null;
+  let stopped = false;
+
   try {
     const module = createAudioCaptureWorkletModule(options.workletModuleUrl);
-    moduleUrlCleanup = module.cleanup;
+    let moduleRevoked = false;
+    const revokeModuleUrl = () => {
+      if (moduleRevoked) return;
+      moduleRevoked = true;
+      module.cleanup();
+    };
+    releases.push(revokeModuleUrl);
     await context.audioWorklet.addModule(module.url);
-    stream = await options.mediaDevices.getUserMedia({
+    // The URL has served its only purpose; revoking it here is what keeps the
+    // success path from leaking one blob per capture.
+    revokeModuleUrl();
+
+    const stream = await options.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -497,89 +684,93 @@ export async function createBrowserVivaAudioCaptureSource(
         sampleRate: sampleRateHz,
       },
     });
-  } catch (error) {
-    moduleUrlCleanup?.();
-    for (const track of stream?.getTracks() ?? []) track.stop();
-    await context.close();
-    throw error;
-  } finally {
-    moduleUrlCleanup?.();
-  }
-  if (!stream) {
-    await context.close();
-    throw new Error("Microphone stream was not opened");
-  }
-  const activeStream = stream;
-
-  const streamSource = context.createMediaStreamSource(activeStream);
-  const AudioWorkletNodeCtor =
-    options.AudioWorkletNodeCtor ??
-    (typeof AudioWorkletNode === "function" ? AudioWorkletNode : undefined);
-  if (!AudioWorkletNodeCtor) {
-    for (const track of activeStream.getTracks()) track.stop();
-    await context.close();
-    throw new VivaAudioWorkletUnavailableError("AudioWorkletNode capture is unavailable");
-  }
-  const processor = new AudioWorkletNodeCtor(context, AUDIO_CAPTURE_WORKLET_NAME, {
-    numberOfInputs: 1,
-    numberOfOutputs: 1,
-    outputChannelCount: [1],
-  });
-  let sampleHandler:
-    | ((samples: Float32Array, sampleRateHz: number, frame?: VivaAudioCaptureSampleFrame) => void)
-    | null = null;
-  let endedHandler: ((reason: VivaAudioCaptureEndReason) => void) | null = null;
-  let stopped = false;
-
-  processor.port.onmessage = (event: MessageEvent<VivaAudioCaptureWorkletMessage>) => {
-    if (stopped || !sampleHandler) return;
-    const message = event.data;
-    if (message?.type !== "samples" || !(message.samples instanceof Float32Array)) return;
-    const sampleRate = validSampleRate(message.sampleRateHz)
-      ? message.sampleRateHz
-      : context.sampleRate;
-    const rms = Number.isFinite(message.rms) && message.rms >= 0 ? message.rms : 0;
-    sampleHandler(message.samples, sampleRate, {
-      rms,
-      sampleRateHz: sampleRate,
-      samples: message.samples,
+    if (!stream) throw new Error("Microphone stream was not opened");
+    releases.push(() => {
+      for (const track of stream.getTracks()) track.stop();
     });
-  };
-  processor.onprocessorerror = () => {
-    stop("processor_error");
-  };
 
-  const onDeviceChange = () => {
-    stop("devicechange");
-  };
-  options.mediaDevices.addEventListener?.("devicechange", onDeviceChange);
+    const streamSource = context.createMediaStreamSource(stream);
+    releases.push(() => streamSource.disconnect());
 
-  function stop(reason: VivaAudioCaptureEndReason = "stopped") {
-    if (stopped) return;
-    stopped = true;
-    sampleHandler = null;
-    options.mediaDevices.removeEventListener?.("devicechange", onDeviceChange);
-    processor.port.onmessage = null;
-    processor.onprocessorerror = null;
-    processor.disconnect();
-    streamSource.disconnect();
-    for (const track of activeStream.getTracks()) track.stop();
-    void context.close();
-    endedHandler?.(reason);
-    endedHandler = null;
+    const AudioWorkletNodeCtor =
+      options.AudioWorkletNodeCtor ??
+      (typeof AudioWorkletNode === "function" ? AudioWorkletNode : undefined);
+    if (!AudioWorkletNodeCtor) {
+      throw new VivaAudioWorkletUnavailableError("AudioWorkletNode capture is unavailable");
+    }
+    const processor = new AudioWorkletNodeCtor(context, AUDIO_CAPTURE_WORKLET_NAME, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    releases.push(() => processor.disconnect());
+    releases.push(() => {
+      processor.port.onmessage = null;
+      processor.onprocessorerror = null;
+    });
+
+    processor.port.onmessage = (event: MessageEvent<VivaAudioCaptureWorkletMessage>) => {
+      if (stopped || !sampleHandler) return;
+      const message = event.data;
+      if (message?.type !== "samples" || !(message.samples instanceof Float32Array)) return;
+      const sampleRate = validSampleRate(message.sampleRateHz)
+        ? message.sampleRateHz
+        : context.sampleRate;
+      const rms = Number.isFinite(message.rms) && message.rms >= 0 ? message.rms : 0;
+      sampleHandler(message.samples, sampleRate, {
+        rms,
+        sampleRateHz: sampleRate,
+        samples: message.samples,
+      });
+    };
+    processor.onprocessorerror = () => {
+      stop("processor_error");
+    };
+
+    const onDeviceChange = () => {
+      stop("devicechange");
+    };
+    options.mediaDevices.addEventListener?.("devicechange", onDeviceChange);
+    releases.push(() => options.mediaDevices.removeEventListener?.("devicechange", onDeviceChange));
+
+    function stop(reason: VivaAudioCaptureEndReason = "stopped") {
+      const alreadyStopped = stopped;
+      stopped = true;
+      sampleHandler = null;
+      // Unconditional: `releaseAll` owns run-once, so a second `stop()` cannot
+      // release anything twice and does not depend on this flag to be safe.
+      void releaseAll();
+      if (alreadyStopped) return;
+      const notify = endedHandler;
+      endedHandler = null;
+      notify?.(reason);
+    }
+
+    return {
+      sampleRateHz: context.sampleRate,
+      start(onSamples, startOptions) {
+        if (stopped) return;
+        sampleHandler = onSamples;
+        endedHandler = startOptions?.onEnded ?? null;
+        try {
+          streamSource.connect(processor);
+          processor.connect(context.destination);
+        } catch (error) {
+          // A capture that could not be wired never started, so it reports no
+          // `onEnded`; it runs the same idempotent release and rethrows.
+          sampleHandler = null;
+          endedHandler = null;
+          stopped = true;
+          void releaseAll();
+          throw error;
+        }
+      },
+      stop,
+    };
+  } catch (error) {
+    await releaseAll();
+    throw error;
   }
-
-  return {
-    sampleRateHz: context.sampleRate,
-    start(onSamples, startOptions) {
-      if (stopped) return;
-      sampleHandler = onSamples;
-      endedHandler = startOptions?.onEnded ?? null;
-      streamSource.connect(processor);
-      processor.connect(context.destination);
-    },
-    stop,
-  };
 }
 
 const EMPTY_FLOAT32 = new Float32Array(0);
