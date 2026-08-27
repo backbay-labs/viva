@@ -41,5 +41,11 @@ path = "src/lib.rs"
 name = "agent-service"
 path = "src/main.rs"
 
+# `SERVICE-013`'s "development commands" half, kept out of the service binary so
+# no normal startup can reach a fixture seed. Refuses without VIVA_DEV_FIXTURE_SEED=1.
+[[bin]]
+name = "viva-dev-seed-fixture"
+path = "src/bin/dev_seed_fixture.rs"
+
 [lints]
 workspace = true
