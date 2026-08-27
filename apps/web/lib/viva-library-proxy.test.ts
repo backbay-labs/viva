@@ -1,5 +1,6 @@
 import * as bunTest from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { NextRequest } from "next/server";
 import { DELETE, GET, POST } from "../app/api/viva-library/[[...path]]/route";
 import {
@@ -2925,6 +2926,179 @@ describe("Viva library destructive capability consumption", () => {
       method: "DELETE",
       nextUrl: new URL(`${CANONICAL}/api/viva-library/${path.join("/")}?user_id=user-1`),
     } as unknown as NextRequest;
+  }
+});
+
+/**
+ * Task 7A (`WEBAPI-016`), D-04 Branch A. The central ledger records `CONFIRM_DELETE`, so this
+ * deployment has confirmation plus permanent delete and NO restore surface at all. Plan 13 owns the
+ * named accessible confirmation UI; this lane owns only the API absence/behaviour proof.
+ *
+ * The recorded D-05 selector is `HARD_PURGE_TEXT`, so the permanent-delete receipt asserted below
+ * is Plan 09's — `{ study_set_id, status, policy, deleted_at }` with the constant policy
+ * `hard_purge_text` — not a shape invented here.
+ */
+describe("Viva library D-04 confirmation delete branch", () => {
+  const CANONICAL = "https://web.example";
+  const AGENT_ORIGIN = "https://agent.example";
+  const STORE_ORIGIN = "https://session-store.example";
+  const trackedEnv = [
+    "NODE_ENV",
+    "VIVA_AGENT_HTTP_URL",
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_AGENT_REST_BEARER_TOKEN",
+    "VIVA_SESSION_ALLOWED_STUDY_SET_IDS",
+    "VIVA_SESSION_ALLOWED_USER_IDS",
+    "VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET",
+    "VIVA_SESSION_SECURITY_STORE_MODE",
+    "VIVA_SESSION_SECURITY_STORE_REST_TOKEN",
+    "VIVA_SESSION_SECURITY_STORE_REST_URL",
+    "VIVA_SESSION_TRUSTED_PROXY_HOPS",
+    "VIVA_WEB_CANONICAL_ORIGIN",
+    "VIVA_WEB_SINGLE_INSTANCE",
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+
+  beforeEach(() => {
+    for (const name of trackedEnv) savedEnv.set(name, process.env[name]);
+    resetVivaSessionSecurityStoreForTests();
+    process.env.VIVA_AGENT_HTTP_URL = AGENT_ORIGIN;
+    process.env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN = "viva-fixture-agent-library-read-bearer";
+    process.env.VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN = "viva-fixture-agent-library-delete-bearer";
+    delete process.env.VIVA_AGENT_REST_BEARER_TOKEN;
+    process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
+    process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+    process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = "viva-fixture-bootstrap-signing-key-01";
+    process.env.VIVA_WEB_CANONICAL_ORIGIN = CANONICAL;
+    // A REST-backed store, so a security-store call would be an observable fetch rather than an
+    // invisible in-process map write. "Zero security-store calls" is then a real assertion.
+    restoreEnv("NODE_ENV", "production");
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_URL = STORE_ORIGIN;
+    process.env.VIVA_SESSION_SECURITY_STORE_REST_TOKEN = "viva-fixture-session-security-store-cred";
+    process.env.VIVA_SESSION_TRUSTED_PROXY_HOPS = "1";
+    delete process.env.VIVA_SESSION_SECURITY_STORE_MODE;
+    delete process.env.VIVA_WEB_SINGLE_INSTANCE;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    resetVivaSessionSecurityStoreForTests();
+    for (const [name, value] of savedEnv) restoreEnv(name, value);
+    savedEnv.clear();
+  });
+
+  test("D-04 confirmation delete has no restore surface", async () => {
+    const calls: Array<{ init?: RequestInit; url: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ init, url });
+      if (url.startsWith(STORE_ORIGIN)) {
+        return new Response(
+          JSON.stringify({
+            operation: JSON.parse(String(init?.body)).operation,
+            request_id: JSON.parse(String(init?.body)).request_id,
+            result: { ok: true },
+            schema_version: 1,
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        );
+      }
+      // Plan 09's selected D-05 permanent-delete receipt, plus an upstream-injected capability the
+      // BFF must strip. Nothing here carries an undo deadline, a deletion generation, or a token.
+      return new Response(
+        JSON.stringify({
+          deleted_at: "2026-08-23T12:00:00Z",
+          policy: "hard_purge_text",
+          restore_control_token: "viva-control1.upstream-forged.capability",
+          status: "deleted",
+          study_set_id: "biology-midterm",
+        }),
+        { headers: { "content-type": "application/json" }, status: 200 },
+      );
+    }) as typeof fetch;
+    const controlToken = signVivaLibraryControlToken({
+      scope: "study_set_delete",
+      studySetId: "biology-midterm",
+      userId: "user-1",
+    });
+    if (!controlToken) throw new Error("fixture must sign a study-set delete control capability");
+
+    const confirmedDelete = await DELETE(
+      branchRequest("DELETE", ["study-sets", "biology-midterm"], {
+        "x-viva-library-control-token": controlToken,
+      }),
+      { params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }) },
+    );
+    const receipt = await confirmedDelete.json();
+
+    expect(confirmedDelete.status).toBe(200);
+    // Exactly Plan 09's D-05 `HARD_PURGE_TEXT` receipt, after Task 5's bounded read and Task 6's
+    // recursive strip: no undo deadline, no deletion generation, no restore capability.
+    expect(receipt).toEqual({
+      deleted_at: "2026-08-23T12:00:00Z",
+      policy: "hard_purge_text",
+      status: "deleted",
+      study_set_id: "biology-midterm",
+    });
+    const serializedReceipt = JSON.stringify(receipt);
+    for (const branchBField of ["undo_expires_at", "deletion_id", "restore_control_token"]) {
+      expect(serializedReceipt).not.toContain(branchBField);
+    }
+
+    const restoreCallsBefore = calls.length;
+    const restore = await POST(
+      branchRequest(
+        "POST",
+        ["biology-midterm", "restore"],
+        { "x-viva-control-token": controlToken },
+        JSON.stringify({ deletion_id: "018f6e2c-3b8a-4a17-9c2d-6e7f8091a2b3" }),
+      ),
+      { params: Promise.resolve({ path: ["biology-midterm", "restore"] }) },
+    );
+    const restoreBody = await restore.json();
+
+    expect(restore.status).toBe(403);
+    expect(restoreBody).toEqual({
+      error: "viva_library_control_scope_not_allowed",
+      failure_class: "access_denied",
+      stage: "pre_loop",
+    });
+    // Rejected before the security store and before the agent: no new call of either kind.
+    expect(calls.length).toBe(restoreCallsBefore);
+    expect(calls.filter((call) => call.url.startsWith(STORE_ORIGIN))).toHaveLength(1);
+    expect(calls.filter((call) => call.url.startsWith(AGENT_ORIGIN))).toHaveLength(1);
+
+    // Branch B artifacts must not exist in the selected route implementation.
+    const routeSource = readFileSync(
+      new URL("../app/api/viva-library/[[...path]]/route.ts", import.meta.url),
+      "utf8",
+    );
+    for (const branchBSymbol of ["restore_control_token", "register_restore", "consume_restore"]) {
+      expect(routeSource).not.toContain(branchBSymbol);
+    }
+  });
+
+  function branchRequest(
+    method: "DELETE" | "POST",
+    path: string[],
+    headers: Record<string, string>,
+    body?: string,
+  ): NextRequest {
+    const url = `${CANONICAL}/api/viva-library/${path.join("/")}?user_id=user-1`;
+    const request = new Request(url, {
+      ...(body === undefined ? {} : { body }),
+      headers: new Headers({
+        "content-type": "application/json",
+        origin: CANONICAL,
+        "sec-fetch-site": "same-origin",
+        "x-forwarded-for": "203.0.113.10",
+        ...headers,
+      }),
+      method,
+    }) as unknown as NextRequest;
+    Object.defineProperty(request, "nextUrl", { value: new URL(url) });
+    return request;
   }
 });
 
