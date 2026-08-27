@@ -434,22 +434,25 @@ async function authorizeBrowserLibraryRequest(
   const browserSnapshotRequest =
     request.method === "GET" && path.join("/") === "study-sets/library";
   const controlToken = request.headers.get("x-viva-library-control-token")?.trim() || null;
-  const sameOriginControlRequest =
-    request.method === "DELETE" &&
-    Boolean(controlTarget?.studySetId) &&
-    isVivaLibraryControlToken(controlToken);
-  const missingControlCapabilityRequest =
-    request.method === "DELETE" && Boolean(controlTarget?.studySetId) && !controlToken;
-  if (!browserSnapshotRequest && !sameOriginControlRequest && !missingControlCapabilityRequest) {
+  // One predicate decides that a request is destructive, and it depends on the METHOD and TARGET
+  // only. Deciding it from the capability instead would let an unusable capability (absent, wrong
+  // prefix, unverifiable) escape the destructive branch and be proxied upstream as an ordinary
+  // DELETE, taking the browser-supplied capability header with it.
+  const destructiveControlRequest =
+    request.method === "DELETE" && Boolean(controlTarget?.studySetId);
+  if (!browserSnapshotRequest && !destructiveControlRequest) {
     return { ok: true };
   }
-  if (missingControlCapabilityRequest) {
+  if (destructiveControlRequest && !isVivaLibraryControlToken(controlToken)) {
+    // Not even shaped like a capability this deployment could have minted, so it fails HMAC
+    // verification by construction. Absent and malformed share the one coarse 403 the error table
+    // pins for every capability rejection, and neither reaches the store or the agent.
     return {
       ok: false,
       response: vivaLibraryProxyJsonError(403, "viva_library_control_capability_required"),
     };
   }
-  if (sameOriginControlRequest) {
+  if (destructiveControlRequest) {
     // Verify and SPEND the capability before any delete authority is resolved, so an unspendable
     // capability can never reach the agent and a spent one can never be replayed.
     const userId = request.nextUrl.searchParams.get("user_id")?.trim() || "";

@@ -53,13 +53,23 @@ describe("Viva library proxy", () => {
     savedScopedEnv.clear();
   });
 
-  test("forwards caller control tokens without injecting the private server bearer", async () => {
+  /**
+   * Task 7 (`WEBAPI-009`) replaced this fixture's original subject. It used to assert that a DELETE
+   * carrying an arbitrary caller-supplied `x-viva-library-control-token` was RELAYED upstream with
+   * the header attached and no `authorization` at all — which is exactly the bypass the destructive
+   * sequence exists to close, because `viva1.control-token` is not a capability this deployment
+   * could have minted (`viva-control1.` is the only prefix it signs). The private WS bearer
+   * non-injection it really guarded is preserved and strengthened below: it is now asserted on both
+   * the refused path and the accepted path, so it is never vacuous.
+   */
+  test("never injects the private server bearer on a destructive delete, refused or accepted", async () => {
     const calls: Array<{ input: string; init?: RequestInit }> = [];
     try {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_VOICE_WS_BEARER_TOKEN = "server-secret";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = LIBRARY_BOOTSTRAP_SECRET;
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({ input: String(input), init });
         return new Response(JSON.stringify({ ok: true }), {
@@ -68,37 +78,60 @@ describe("Viva library proxy", () => {
         });
       }) as typeof fetch;
 
-      const request = {
-        headers: new Headers({
-          origin: LIBRARY_CANONICAL_ORIGIN,
-          "x-viva-library-control-token": "viva1.control-token",
-        }),
-        method: "DELETE",
-        nextUrl: new URL(
-          "http://localhost:3000/api/viva-library/study-sets/biology-midterm?user_id=user-1",
-        ),
-      } as unknown as NextRequest;
+      const refused = await DELETE(destructiveDelete("viva1.control-token"), {
+        params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
+      });
+      const refusedBody = await refused.json();
 
-      const response = await DELETE(request, {
+      // A caller-supplied string that this deployment never signed buys no authority at all.
+      expect(refused.status).toBe(403);
+      expect(refusedBody).toEqual({ error: "viva_library_control_capability_required" });
+      expect(refused.headers.get("cache-control")).toBe("no-store");
+      expect(calls).toEqual([]);
+
+      const controlToken = signVivaLibraryControlToken({
+        scope: "study_set_delete",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      if (!controlToken) throw new Error("test fixture must sign study-set delete control token");
+      const accepted = await DELETE(destructiveDelete(controlToken), {
         params: Promise.resolve({ path: ["study-sets", "biology-midterm"] }),
       });
 
-      expect(response.status).toBe(200);
+      expect(accepted.status).toBe(200);
       expect(calls).toHaveLength(1);
       expect(calls[0]?.input).toBe("http://agent.test/study-sets/biology-midterm?user_id=user-1");
       const headers = new Headers(calls[0]?.init?.headers);
-      expect(headers.get("x-viva-library-control-token")).toBe("viva1.control-token");
+      // The scoped delete credential, never the broad private WS bearer, and never the browser's
+      // own capability.
+      expect(headers.get("authorization")).toBe(`Bearer ${LIBRARY_DELETE_BEARER}`);
+      expect(headers.get("authorization")).not.toContain("server-secret");
+      expect(headers.get("x-viva-library-control-token")).toBe(null);
       expect(headers.get("origin")).toBe("http://localhost:3000");
-      expect(headers.get("authorization")).toBe(null);
-      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(accepted.headers.get("cache-control")).toBe("no-store");
     } finally {
       globalThis.fetch = originalFetch;
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_VOICE_WS_BEARER_TOKEN", originalBearer);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+      restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
     }
   });
+
+  function destructiveDelete(controlToken: string): NextRequest {
+    return {
+      headers: new Headers({
+        origin: LIBRARY_CANONICAL_ORIGIN,
+        "x-viva-library-control-token": controlToken,
+      }),
+      method: "DELETE",
+      nextUrl: new URL(
+        "http://localhost:3000/api/viva-library/study-sets/biology-midterm?user_id=user-1",
+      ),
+    } as unknown as NextRequest;
+  }
 
   test("blocks same-origin allowed study-set deletes without a signed control capability", async () => {
     const calls: string[] = [];
@@ -1087,21 +1120,33 @@ describe("Viva library proxy", () => {
     }
   });
 
+  // Subject: a thrown fetch becomes a sanitized 502 that leaks neither the credential nor the
+  // upstream host. The DELETE is only the vehicle, so it must carry a capability the deployment
+  // really signed — an unmintable prefix would 403 before fetch and make the test vacuous.
   test("converts agent fetch failures to sanitized uncached proxy errors", async () => {
     try {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = LIBRARY_BOOTSTRAP_SECRET;
+      let fetchAttempts = 0;
       globalThis.fetch = (async () => {
+        fetchAttempts += 1;
         throw new Error(
           "connection refused for viva-fixture-legacy-rest-bearer at http://agent.test",
         );
       }) as typeof fetch;
+      const controlToken = signVivaLibraryControlToken({
+        scope: "study_set_delete",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      if (!controlToken) throw new Error("test fixture must sign study-set delete control token");
 
       const request = {
         headers: new Headers({
           origin: LIBRARY_CANONICAL_ORIGIN,
-          "x-viva-library-control-token": "viva1.control-token",
+          "x-viva-library-control-token": controlToken,
         }),
         method: "DELETE",
         nextUrl: new URL(
@@ -1114,6 +1159,7 @@ describe("Viva library proxy", () => {
       });
       const body = await response.json();
 
+      expect(fetchAttempts).toBe(1);
       expect(response.status).toBe(502);
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(body).toEqual({ error: "viva_library_proxy_unavailable" });
@@ -1124,6 +1170,7 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+      restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
     }
   });
 
@@ -1464,11 +1511,15 @@ describe("Viva library proxy", () => {
     }
   });
 
+  // Subject: an upstream control-route status is preserved rather than relabelled with an ingestion
+  // terminal reason. As above, the DELETE must carry a really-signed capability or it would 403
+  // before reaching upstream and prove nothing about relabelling.
   test("preserves upstream control-route failures without pre-loop ingestion labels", async () => {
     try {
       process.env.VIVA_AGENT_HTTP_URL = "http://agent.test";
       process.env.VIVA_SESSION_ALLOWED_USER_IDS = "user-1";
       process.env.VIVA_SESSION_ALLOWED_STUDY_SET_IDS = "biology-midterm";
+      process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET = LIBRARY_BOOTSTRAP_SECRET;
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (init?.method === "DELETE") {
@@ -1499,10 +1550,16 @@ describe("Viva library proxy", () => {
       });
       const exportBody = await exportResponse.json();
 
+      const controlToken = signVivaLibraryControlToken({
+        scope: "study_set_delete",
+        studySetId: "biology-midterm",
+        userId: "user-1",
+      });
+      if (!controlToken) throw new Error("test fixture must sign study-set delete control token");
       const deleteRequest = {
         headers: new Headers({
           origin: LIBRARY_CANONICAL_ORIGIN,
-          "x-viva-library-control-token": "viva1.control-token",
+          "x-viva-library-control-token": controlToken,
         }),
         method: "DELETE",
         nextUrl: new URL(
@@ -1525,6 +1582,7 @@ describe("Viva library proxy", () => {
       restoreEnv("VIVA_AGENT_HTTP_URL", originalAgentUrl);
       restoreEnv("VIVA_SESSION_ALLOWED_USER_IDS", originalAllowedUsers);
       restoreEnv("VIVA_SESSION_ALLOWED_STUDY_SET_IDS", originalAllowedStudySets);
+      restoreEnv("VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET", originalBootstrapSecret);
     }
   });
 });
@@ -2805,6 +2863,47 @@ describe("Viva library destructive capability consumption", () => {
     } finally {
       console.warn = originalWarn;
     }
+  });
+
+  test("one-time delete refuses an unusable capability instead of proxying it upstream", async () => {
+    const calls: Array<{ init?: RequestInit; url: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(input) });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json" },
+        status: 200,
+      });
+    }) as typeof fetch;
+
+    // A capability that is PRESENT but unusable is exactly as unauthorized as an absent one. Each
+    // of these once fell through the destructive branch and was relayed to the agent as an ordinary
+    // proxied DELETE, carrying the browser-supplied header with it.
+    const foreignPrefix = await studySetDelete("totally-bogus-capability");
+    const truncatedPrefix = await studySetDelete("viva-control1");
+    const nearMissPrefix = await studySetDelete("viva-control2.claims.signature");
+    const whitespaceOnly = await studySetDelete("   ");
+    const rejections = [foreignPrefix, truncatedPrefix, nearMissPrefix, whitespaceOnly];
+
+    expect(rejections.map((response) => response.status)).toEqual([403, 403, 403, 403]);
+    for (const rejection of rejections) {
+      // The single coarse body the error table pins for malformed, expired, wrong scope, and replay.
+      expect(await rejection.json()).toEqual({
+        error: "viva_library_control_capability_required",
+      });
+    }
+    // No upstream contact at all, so the browser capability cannot have been relayed either.
+    expect(calls).toEqual([]);
+    expect(
+      calls.map(({ init }) => new Headers(init?.headers).get("x-viva-library-control-token")),
+    ).toEqual([]);
+
+    // Positive control in the same fixture: the guard refuses only unusable capabilities, and a
+    // genuine one still spends once and reaches the agent.
+    const accepted = await studySetDelete(studySetDeleteToken());
+    expect(accepted.status).toBe(200);
+    expect(calls.map(({ url }) => url)).toEqual([
+      "http://agent.test/study-sets/biology-midterm?user_id=user-1",
+    ]);
   });
 
   function memoryStore(): SessionSecurityStore {
