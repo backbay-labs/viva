@@ -1730,3 +1730,146 @@ function recapPayload(): AgentStudySessionRecap {
     voice_session_id: "voice-session-fixture",
   };
 }
+
+/**
+ * `WEBSESSION-RECOVERY-01` Step 6: recovery copy is truthful about where the
+ * learner's spoken answer actually is. It never claims the server received a
+ * turn the browser has not seen acknowledged.
+ */
+describe("recovery runtime copy", () => {
+  const retainedTurn = {
+    acceptedThroughSequence: 3,
+    endRequested: true,
+    finalSequence: 3,
+    retainedBytes: 8_192,
+    retainedFromSequence: 0,
+    turnId: "turn-retained",
+  } as const;
+
+  test("every in-flight recovery state says Reconnecting and disables duplicate retries", () => {
+    for (const reconnect of [
+      { attempt: 1, delayMs: 550, kind: "scheduled" },
+      { attempt: 2, kind: "refreshing_credential" },
+      { attempt: 3, kind: "connecting" },
+    ] as const) {
+      const copy = projectRuntimeCopy({
+        close: { code: 1006, wasClean: false },
+        readiness: trustedReadiness,
+        ready: ready("synthetic"),
+        reconnect,
+        status: "closed",
+        termination: { closeCode: 1006, kind: "transport", retryable: true },
+      });
+
+      expect({ capsule: copy.capsuleLabel, kind: reconnect.kind }).toEqual({
+        capsule: "Reconnecting…",
+        kind: reconnect.kind,
+      });
+      expect({ disabled: copy.primaryActionDisabled, kind: reconnect.kind }).toEqual({
+        disabled: true,
+        kind: reconnect.kind,
+      });
+      expect(copy.primaryActionIntent).toBe("disabled");
+      expect(copy.cause).toBe("session_disconnected");
+    }
+  });
+
+  test("exhausted recovery says Connection lost and exposes exactly one manual retry", () => {
+    const copy = projectRuntimeCopy({
+      close: { code: 1006, wasClean: false },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    expect(copy.capsuleLabel).toBe("Connection lost");
+    expect(copy.primaryActionDisabled).toBe(false);
+    expect(copy.primaryActionIntent).toBe("retry_agent");
+    expect(copy.cause).toBe("unexpected_close");
+    expect(copy.marginaliaText).not.toContain("retained on this device");
+  });
+
+  test("a retained spoken answer is described as retained on this device, never as received", () => {
+    const copy = projectRuntimeCopy({
+      close: { code: 1006, wasClean: false },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempts: 3, kind: "exhausted" },
+      retainedAudioTurn: retainedTurn,
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    expect(copy.marginaliaText).toContain(
+      "Your spoken answer is retained on this device for retry",
+    );
+    expect(copy.marginaliaText).not.toContain("received");
+    expect(copy.marginaliaText).not.toContain("turn-retained");
+    expect(copy.readinessNotes.some((note) => note.label === "Retained answer")).toBe(true);
+  });
+
+  test("terminal and recap copy always outrank recovery copy", () => {
+    const terminal = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempt: 1, delayMs: 550, kind: "scheduled" },
+      retainedAudioTurn: retainedTurn,
+      status: "closed",
+      terminalReason: "session_cap",
+    });
+    const recapped = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      recap: { kind: "complete", recap: recapPayload() },
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+    });
+
+    expect(terminal.capsuleLabel).toBe("Session cap reached");
+    expect(terminal.capsuleLabel).not.toBe("Reconnecting…");
+    expect(recapped.cause).toBe("recap_success");
+    expect(recapped.capsuleLabel).not.toBe("Connection lost");
+  });
+
+  test("an unresolved typed answer renames the manual recovery, never auto-resends it", () => {
+    const pending = projectRuntimeCopy({
+      close: { code: 1006, wasClean: false },
+      pendingTypedAnswer: true,
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+    const resolved = projectRuntimeCopy({
+      close: { code: 1006, wasClean: false },
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempts: 3, kind: "exhausted" },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+
+    expect(pending.nextActionLabel).toBe("Reconnect and retry answer");
+    expect(pending.primaryActionIntent).toBe("retry_agent");
+    expect(resolved.nextActionLabel).toBe("Reconnect");
+  });
+
+  test("an idle recovery state changes nothing", () => {
+    const withIdle = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      reconnect: { attempts: 0, kind: "idle" },
+      status: "open",
+    });
+    const without = projectRuntimeCopy({
+      readiness: trustedReadiness,
+      ready: ready("synthetic"),
+      status: "open",
+    });
+
+    expect(withIdle).toEqual(without);
+  });
+});

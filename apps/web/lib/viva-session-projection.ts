@@ -27,6 +27,8 @@ import type {
   VivaAgentReadinessProbe,
   VivaAgentReadyEndpoint,
   VivaAgentRecapState,
+  VivaAgentReconnectState,
+  VivaAgentRetainedAudioTurn,
   VivaAgentStructuredError,
 } from "./viva-agent-client";
 
@@ -135,6 +137,7 @@ type RuntimeProjectionContext = {
   status: VivaAgentConnectionStatus;
   mic: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
   terminalReason?: AgentTerminalSessionReason;
 };
 
@@ -207,8 +210,11 @@ export function projectRuntimeCopy({
   lastServerError,
   mic = "unknown",
   close,
+  pendingTypedAnswer = false,
   readinessProbe,
   recap,
+  reconnect,
+  retainedAudioTurn,
   structuredErrors = [],
   termination,
   terminalReason,
@@ -222,7 +228,10 @@ export function projectRuntimeCopy({
   lastServerError?: Pick<VivaServerError, "code" | "retryable">;
   mic?: RuntimeMicState;
   close?: VivaAgentCloseDiagnostics;
+  pendingTypedAnswer?: boolean;
   recap?: VivaAgentRecapState;
+  reconnect?: VivaAgentReconnectState;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
   structuredErrors?: readonly VivaAgentStructuredError[];
   termination?: VivaVoiceTermination;
   terminalReason?: AgentTerminalSessionReason;
@@ -235,6 +244,7 @@ export function projectRuntimeCopy({
     readiness,
     readinessProbe,
     ready: readinessFacts,
+    retainedAudioTurn,
     status,
     terminalReason,
     websocketReady: Boolean(ready) && status === "open",
@@ -243,6 +253,16 @@ export function projectRuntimeCopy({
   if (terminalReason) {
     return controlledTerminalCopy(terminalReason, context);
   }
+
+  // Terminal and recap copy always outrank recovery copy: a session that has
+  // already said its last word is never described as "Reconnecting…".
+  if (recap) {
+    const recapOutcome = projectVoiceOutcomeCopy({ recap });
+    if (recapOutcome) return runtimeCopyFromOutcome(recapOutcome, context);
+  }
+
+  const recovery = projectRecoveryCopy({ pendingTypedAnswer, reconnect, retainedAudioTurn });
+  if (recovery) return runtimeCopyFromOutcome(recovery, context);
 
   // The ONE typed outcome switch. Auth, protocol, service, and transport copy is
   // derived from Plan 05's codes — never from a regex over diagnostic text, and
@@ -256,17 +276,7 @@ export function projectRuntimeCopy({
     termination,
   });
   if (outcome && outcome.scope === "session" && outcome.cause !== "turn_deferred") {
-    return runtimeCopy(
-      {
-        capsuleLabel: outcome.capsuleLabel,
-        cause: outcome.cause,
-        marginaliaText: outcome.marginaliaText,
-        marginaliaTitle: outcome.marginaliaTitle,
-        statusLabel: outcome.statusLabel,
-      },
-      context,
-      outcome.action,
-    );
+    return runtimeCopyFromOutcome(outcome, context);
   }
 
   if (!readiness.canConnect) {
@@ -529,6 +539,71 @@ export type VoiceOutcomeCopy = Readonly<{
   }>;
   retryQuestionId?: string;
 }>;
+
+function runtimeCopyFromOutcome(
+  outcome: VoiceOutcomeCopy,
+  context: RuntimeProjectionContext,
+): RuntimeCopy {
+  return runtimeCopy(
+    {
+      capsuleLabel: outcome.capsuleLabel,
+      cause: outcome.cause as RuntimeCopyCause,
+      marginaliaText: outcome.marginaliaText,
+      marginaliaTitle: outcome.marginaliaTitle,
+      statusLabel: outcome.statusLabel,
+    },
+    context,
+    outcome.action,
+  );
+}
+
+/**
+ * `WEBSESSION-RECOVERY-01` Step 6. Recovery copy is truthful about WHERE the
+ * learner's spoken answer is: while a turn is retained it says so, and it never
+ * claims the server received a turn the browser has not seen acknowledged.
+ */
+export function projectRecoveryCopy(input: {
+  pendingTypedAnswer?: boolean;
+  reconnect?: VivaAgentReconnectState;
+  retainedAudioTurn?: VivaAgentRetainedAudioTurn | null;
+}): VoiceOutcomeCopy | null {
+  const reconnect = input.reconnect;
+  if (!reconnect || reconnect.kind === "idle") return null;
+  const retained = input.retainedAudioTurn
+    ? " Your spoken answer is retained on this device for retry."
+    : "";
+
+  if (reconnect.kind === "exhausted") {
+    return {
+      // Typed content is NEVER auto-resent after an ambiguous close: the answer
+      // stays visible and the learner reconnects and retries it deliberately.
+      action: {
+        disabled: false,
+        intent: "retry_agent",
+        nextActionLabel: input.pendingTypedAnswer ? "Reconnect and retry answer" : "Reconnect",
+      },
+      capsuleLabel: "Connection lost",
+      cause: "unexpected_close",
+      marginaliaText: `Viva could not reopen this session after three attempts.${retained}`,
+      marginaliaTitle: "The connection to the Conductor was lost.",
+      scope: "session",
+      statusLabel: "connection lost",
+    };
+  }
+
+  // Scheduled, refreshing, and connecting are all one learner-visible state, and
+  // the retry control is DISABLED throughout it so a second attempt cannot be
+  // stacked on the one already running.
+  return {
+    action: { disabled: true, intent: "disabled", nextActionLabel: "Reconnecting…" },
+    capsuleLabel: "Reconnecting…",
+    cause: "session_disconnected",
+    marginaliaText: `Viva is reopening this session; nothing was graded from the interrupted turn.${retained}`,
+    marginaliaTitle: "Reopening the session.",
+    scope: "session",
+    statusLabel: "reconnecting",
+  };
+}
 
 export function projectVoiceOutcomeCopy(input: {
   deferredTurn?: VivaAgentDeferredTurn;
@@ -912,6 +987,16 @@ function runtimeReadinessNotes(
         context.mic === "denied"
           ? "Browser microphone permission is denied."
           : "Browser microphone capture is unsupported here.",
+    });
+  }
+
+  if (context.retainedAudioTurn) {
+    // The turn id is a correlation handle, not learner material, and it is
+    // deliberately NOT rendered: the note states only that bytes are held here.
+    notes.push({
+      label: "Retained answer",
+      state: "blocked",
+      text: "One spoken answer is held on this device until the Conductor accepts it.",
     });
   }
 

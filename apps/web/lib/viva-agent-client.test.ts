@@ -29,9 +29,14 @@ import {
   fetchVivaLibrarySnapshot,
   initialVivaAgentSessionState,
   parseVivaAgentMessage,
+  reconnectDelayMs,
+  VIVA_AGENT_RECONNECT_DELAYS_MS,
+  VIVA_AGENT_RECONNECT_JITTER_MS,
   VIVA_STUDY_PROJECTION_TIMEOUT_MS,
+  type VivaAgentReconnectInputState,
   vivaAgentHttpBaseUrl,
   vivaAgentProtocols,
+  vivaAgentReconnectDecision,
   vivaAgentReducer,
   vivaAgentWsUrl,
   vivaApiBaseUrl,
@@ -2813,3 +2818,388 @@ function recapFrame(input: { partial: boolean; partialReason?: string }) {
     version: VIVA_VOICE_PROTOCOL_VERSION,
   };
 }
+
+/**
+ * `WEBSESSION-RECOVERY-01` / `WEBSESSION-AUDIO-01`: the bounded-recovery decision
+ * and the cross-generation replay of Plan 03's retained turn. Nothing here
+ * builds a second queue — every replay goes back through `retryPendingAudio()`.
+ */
+describe("bounded voice recovery", () => {
+  function openLedgerController() {
+    FakeWebSocket.instances = [];
+    const controller = createVivaAgentSessionController({
+      audioQueuePumpIntervalMs: 0,
+      generationIdFactory: ({ reason, sequence }) => `${reason}-${sequence}`,
+      session: sessionFixture as AgentSessionConfig,
+      sessionToken: SIGNED_SESSION_CREDENTIAL,
+      url: "ws://localhost:4318/ws",
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+    const socket = controller.connect() as unknown as FakeWebSocket;
+    socket.open();
+    socket.message(JSON.stringify(readyFixture));
+    return { controller, socket };
+  }
+
+  function reconnectState(
+    overrides: Partial<VivaAgentReconnectInputState> = {},
+  ): VivaAgentReconnectInputState {
+    return {
+      recap: undefined,
+      status: "closed" as const,
+      structuredErrors: [],
+      terminalReason: undefined,
+      termination: { closeCode: 1006, kind: "transport" as const, retryable: true },
+      ...overrides,
+    };
+  }
+
+  test("every first retry clears the server's 250 ms lease grace", () => {
+    expect(VIVA_AGENT_RECONNECT_DELAYS_MS).toEqual([500, 1_000, 2_000]);
+    expect(VIVA_AGENT_RECONNECT_JITTER_MS).toBe(100);
+    expect(reconnectDelayMs(1, 0)).toBe(500);
+    expect(reconnectDelayMs(1, 0.999_999)).toBe(599);
+    expect(reconnectDelayMs(2, 0)).toBe(1_000);
+    expect(reconnectDelayMs(2, 0.999_999)).toBe(1_099);
+    expect(reconnectDelayMs(3, 0)).toBe(2_000);
+    expect(reconnectDelayMs(3, 0.999_999)).toBe(2_099);
+    // A hostile random never escapes the band.
+    expect(reconnectDelayMs(1, -5)).toBe(500);
+    expect(reconnectDelayMs(1, 5)).toBe(599);
+    expect(reconnectDelayMs(1, Number.NaN)).toBe(500);
+    for (const attempt of [1, 2, 3] as const) {
+      expect(reconnectDelayMs(attempt, 0)).toBeGreaterThan(250);
+    }
+  });
+
+  test("a retryable transport close schedules exactly three bounded attempts", () => {
+    expect(
+      vivaAgentReconnectDecision({
+        attempts: 0,
+        explicitlyStopped: false,
+        random: 0.5,
+        state: reconnectState(),
+      }),
+    ).toEqual({ action: "schedule", attempt: 1, delayMs: 550 });
+    expect(
+      vivaAgentReconnectDecision({
+        attempts: 1,
+        explicitlyStopped: false,
+        random: 0,
+        state: reconnectState(),
+      }),
+    ).toEqual({ action: "schedule", attempt: 2, delayMs: 1_000 });
+    expect(
+      vivaAgentReconnectDecision({
+        attempts: 2,
+        explicitlyStopped: false,
+        random: 0,
+        state: reconnectState(),
+      }),
+    ).toEqual({ action: "schedule", attempt: 3, delayMs: 2_000 });
+    expect(
+      vivaAgentReconnectDecision({
+        attempts: 3,
+        explicitlyStopped: false,
+        random: 0,
+        state: reconnectState(),
+      }),
+    ).toEqual({ action: "exhausted" });
+  });
+
+  test("every stop condition refuses to schedule a retry", () => {
+    const cases: Array<[string, VivaAgentReconnectInputState, boolean]> = [
+      [
+        "complete recap",
+        reconnectState({
+          recap: { kind: "complete", recap: recapFrame({ partial: false }).event.recap as never },
+        }),
+        false,
+      ],
+      [
+        "partial recap",
+        reconnectState({
+          recap: {
+            kind: "partial",
+            partialReason: "turn_cap",
+            recap: recapFrame({ partial: false }).event.recap as never,
+          },
+          terminalReason: "turn_cap",
+        }),
+        false,
+      ],
+      ["terminal reason", reconnectState({ terminalReason: "drained" }), false],
+      [
+        "terminal structured error",
+        reconnectState({
+          structuredErrors: [
+            { terminalReason: "provider_malformed_stream", terminality: "terminal" },
+          ],
+        }),
+        false,
+      ],
+      [
+        "terminal termination",
+        reconnectState({
+          termination: {
+            closeCode: 1011,
+            kind: "terminal",
+            retryable: false,
+            terminalReason: "session_cap",
+          },
+        }),
+        false,
+      ],
+      [
+        "nonretryable auth",
+        reconnectState({
+          termination: {
+            closeCode: 1008,
+            errorCode: "VOICE_AUTH_INVALID",
+            kind: "auth",
+            retryable: false,
+          },
+        }),
+        false,
+      ],
+      [
+        "protocol",
+        reconnectState({
+          termination: {
+            closeCode: 1008,
+            errorCode: "VOICE_CLIENT_FRAME_TOO_LARGE",
+            kind: "protocol",
+            retryable: false,
+          },
+        }),
+        false,
+      ],
+      [
+        "clean 1000",
+        reconnectState({ termination: { closeCode: 1000, kind: "normal", retryable: false } }),
+        false,
+      ],
+      ["still open", reconnectState({ status: "open", termination: undefined }), false],
+      [
+        "retryable auth",
+        reconnectState({
+          termination: {
+            closeCode: 1008,
+            errorCode: "VOICE_AUTH_EXPIRED",
+            kind: "auth",
+            retryable: true,
+          },
+        }),
+        true,
+      ],
+      [
+        "service",
+        reconnectState({
+          termination: {
+            closeCode: 1011,
+            errorCode: "VOICE_INTERNAL_SERIALIZATION",
+            kind: "service",
+            retryable: true,
+          },
+        }),
+        true,
+      ],
+      ["transport", reconnectState(), true],
+    ];
+
+    for (const [label, state, schedules] of cases) {
+      const decision = vivaAgentReconnectDecision({
+        attempts: 0,
+        explicitlyStopped: false,
+        random: 0,
+        state,
+      });
+      expect({ label, schedules: decision.action === "schedule" }).toEqual({ label, schedules });
+    }
+
+    // An explicit learner close or stop wins over ANY retryable classification.
+    expect(
+      vivaAgentReconnectDecision({
+        attempts: 0,
+        explicitlyStopped: true,
+        random: 0,
+        state: reconnectState(),
+      }),
+    ).toEqual({ action: "stop", reason: "explicit_stop" });
+  });
+
+  test("the retained turn is reported with its original identity after an interrupted stream", () => {
+    const { controller, socket } = openLedgerController();
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([1, 2, 3, 4]),
+      sequence: 0,
+      turnId: "turn-recovery-1",
+    });
+    socket.bufferedAmount = VIVA_VOICE_MAX_TEXT_FRAME_BYTES;
+    const pending = controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([5, 6, 7, 8]),
+      sequence: 1,
+      turnId: "turn-recovery-1",
+    });
+    expect(pending.status).toBe("pending");
+
+    socket.close({ code: 1006, reason: "", wasClean: false });
+
+    expect(controller.getRetainedAudioTurn()).toEqual({
+      acceptedThroughSequence: 0,
+      endRequested: false,
+      finalSequence: null,
+      retainedBytes: 8,
+      retainedFromSequence: 0,
+      turnId: "turn-recovery-1",
+    });
+  });
+
+  test("replay on a new generation resends the original turn id and original sequence bytes", () => {
+    const { controller, socket } = openLedgerController();
+    const first = new Uint8Array([1, 2, 3, 4]);
+    const second = new Uint8Array([5, 6, 7, 8]);
+    controller.sendAudioChunk({ pcm16Bytes: first, sequence: 0, turnId: "turn-replay" });
+    socket.bufferedAmount = VIVA_VOICE_MAX_TEXT_FRAME_BYTES;
+    controller.sendAudioChunk({ pcm16Bytes: second, sequence: 1, turnId: "turn-replay" });
+    socket.close({ code: 1006, reason: "", wasClean: false });
+
+    const next = controller.refreshSession({
+      reason: "socket_retry",
+      sessionToken: REFRESHED_SESSION_CREDENTIAL,
+    }) as unknown as FakeWebSocket;
+    next.open();
+    next.message(JSON.stringify(readyFixture));
+
+    const replay = controller.retryPendingAudio();
+    expect(replay.status).toBe("sent");
+
+    const replayed = next.sent
+      .map((frame) => parseVivaClientFrame(JSON.parse(frame)))
+      .filter((frame) => frame.type === "audio_chunk");
+    expect(replayed).toHaveLength(2);
+    expect(replayed.map((frame) => frame.turn_id)).toEqual(["turn-replay", "turn-replay"]);
+    expect(replayed.map((frame) => frame.sequence)).toEqual([0, 1]);
+    expect(replayed.map((frame) => frame.frame.pcm16_base64)).toEqual([
+      pcm16LeBytesToBase64(first),
+      pcm16LeBytesToBase64(second),
+    ]);
+    // Still retained: only an `audio_turn_accepted` releases it.
+    expect(controller.getRetainedAudioTurn()?.turnId).toBe("turn-replay");
+  });
+
+  test("a turn closed after audio_end is replayed whole and admitted exactly once", () => {
+    const { controller, socket } = openLedgerController();
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([9, 9, 9, 9]),
+      sequence: 0,
+      turnId: "turn-after-end",
+    });
+    controller.endAudioTurn({ finalSequence: 0, turnId: "turn-after-end" });
+    expect(socket.sent.map((frame) => parseVivaClientFrame(JSON.parse(frame)).type).at(-1)).toBe(
+      "audio_end",
+    );
+
+    socket.close({ code: 1006, reason: "", wasClean: false });
+    expect(controller.getRetainedAudioTurn()).toEqual({
+      acceptedThroughSequence: 0,
+      endRequested: true,
+      finalSequence: 0,
+      retainedBytes: 4,
+      retainedFromSequence: 0,
+      turnId: "turn-after-end",
+    });
+
+    const next = controller.refreshSession({ reason: "socket_retry" }) as unknown as FakeWebSocket;
+    next.open();
+    next.message(JSON.stringify(readyFixture));
+    expect(controller.retryPendingAudio().status).toBe("sent");
+
+    const kinds = next.sent.map((frame) => parseVivaClientFrame(JSON.parse(frame)).type);
+    expect(kinds.filter((kind) => kind === "audio_chunk")).toHaveLength(1);
+    expect(kinds.filter((kind) => kind === "audio_end")).toHaveLength(1);
+
+    next.message(
+      JSON.stringify({
+        client_generation_id: "socket_retry-2",
+        final_sequence: 0,
+        turn_id: "turn-after-end",
+        type: "audio_turn_accepted",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+    expect(controller.getRetainedAudioTurn()).toBeNull();
+    expect(controller.getState().acceptedAudioTurn).toEqual({
+      finalSequence: 0,
+      turnId: "turn-after-end",
+    });
+
+    // A second replay attempt after the ack has nothing to resend, so no second
+    // admission can be manufactured.
+    const kindsAfterAck = next.sent.map((frame) => parseVivaClientFrame(JSON.parse(frame)).type);
+    expect(kindsAfterAck.filter((kind) => kind === "audio_end")).toHaveLength(1);
+  });
+
+  test("cancelling a consumed assembly releases the ledger without a scoped cancel frame", () => {
+    const { controller, socket } = openLedgerController();
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([1, 1, 1, 1]),
+      sequence: 0,
+      turnId: "turn-consumed",
+    });
+    controller.endAudioTurn({ finalSequence: 0, turnId: "turn-consumed" });
+    const sentBeforeCancel = socket.sent.length;
+
+    controller.cancelAudioTurn("turn-consumed");
+
+    expect(socket.sent).toHaveLength(sentBeforeCancel);
+    expect(controller.getRetainedAudioTurn()).toBeNull();
+  });
+
+  test("cancelling a turn the server has not consumed still sends the scoped cancel", () => {
+    const { controller, socket } = openLedgerController();
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([1, 1, 1, 1]),
+      sequence: 0,
+      turnId: "turn-open",
+    });
+
+    controller.cancelAudioTurn("turn-open");
+
+    const cancels = socket.sent
+      .map((frame) => parseVivaClientFrame(JSON.parse(frame)))
+      .filter((frame) => frame.type === "cancel");
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]?.type === "cancel" ? cancels[0].turn_id : null).toBe("turn-open");
+    expect(controller.getRetainedAudioTurn()).toBeNull();
+  });
+
+  test("stale callbacks from a replaced generation change nothing at all", () => {
+    const { controller, socket } = openLedgerController();
+    controller.sendAudioChunk({
+      pcm16Bytes: new Uint8Array([2, 2, 2, 2]),
+      sequence: 0,
+      turnId: "turn-stale",
+    });
+    socket.close({ code: 1006, reason: "", wasClean: false });
+
+    const next = controller.refreshSession({ reason: "socket_retry" }) as unknown as FakeWebSocket;
+    next.open();
+    next.message(JSON.stringify(readyFixture));
+    const before = controller.getState();
+    const retainedBefore = controller.getRetainedAudioTurn();
+
+    socket.message(
+      JSON.stringify({
+        event: { phase: "recap", terminal_reason: "drained", type: "session_phase" },
+        type: "event",
+        version: VIVA_VOICE_PROTOCOL_VERSION,
+      }),
+    );
+    socket.error();
+    socket.close({ code: 1011, reason: "", wasClean: false });
+
+    expect(controller.getState()).toEqual(before);
+    expect(controller.getRetainedAudioTurn()).toEqual(retainedBefore);
+  });
+});

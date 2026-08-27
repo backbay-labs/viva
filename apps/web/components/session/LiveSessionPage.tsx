@@ -25,13 +25,18 @@ import {
   fetchAuthenticatedStudyProjection,
   fetchVivaAgentReadinessProbe,
   isVivaAudioSendRejectedError,
+  reconnectDelayMs,
+  VIVA_AGENT_RECONNECT_DELAYS_MS,
   type VivaAgentAudioOutput,
   type VivaAgentGenerationReason,
   type VivaAgentReadinessProbe,
+  type VivaAgentReconnectState,
+  type VivaAgentRetainedAudioTurn,
   type VivaAudioChunkInput,
   type VivaAudioSendResult,
   type VivaClientSendError,
   vivaAgentHttpBaseUrl,
+  vivaAgentReconnectDecision,
 } from "../../lib/viva-agent-client";
 import {
   createBrowserVivaAudioCaptureSource,
@@ -233,6 +238,22 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   const [interruptAcknowledged, setInterruptAcknowledged] = useState(false);
   const routeIdentityRef = useRef(routeIdentity);
   const browserLifecycleAttemptRef = useRef(0);
+  // `WEBSESSION-RECOVERY-01`: this page is the SINGLE owner of reconnect state.
+  // The controller keeps socket/generation state; the hook creates no timer.
+  const [reconnect, setReconnect] = useState<VivaAgentReconnectState>({
+    attempts: 0,
+    kind: "idle",
+  });
+  const reconnectRef = useRef(reconnect);
+  reconnectRef.current = reconnect;
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptTokenRef = useRef(0);
+  const recoveryAbortRef = useRef<AbortController | null>(null);
+  const explicitlyStoppedRef = useRef(false);
+  const replayedGenerationRef = useRef<string | null>(null);
+  const [retainedAudioTurn, setRetainedAudioTurn] = useState<VivaAgentRetainedAudioTurn | null>(
+    null,
+  );
 
   // The signed session config is built from the projection alone; the only
   // caller-supplied member is `user_id`, taken from the COMMITTED credential's
@@ -305,6 +326,16 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
   }, []);
   const cancelActiveAudioTurn = useCallback(() => {
     audioTurnDriverRef.current?.cancel();
+  }, []);
+  /**
+   * The explicit-discard path: a terminal recap, a session cap, an explicit turn
+   * cancel, or the learner ending the session. Only these release a turn whose
+   * `audio_end` already reached the server.
+   */
+  const discardActiveAudioTurn = useCallback(() => {
+    if (audioTurnDriverRef.current?.cancel({ discardSubmitted: true })) return;
+    const retained = agentRef.current.getRetainedAudioTurn();
+    if (retained) agentRef.current.cancelAudioTurn(retained.turnId);
   }, []);
 
   const getPlayback = useCallback(() => {
@@ -564,6 +595,119 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     agentRef.current.refreshSession({ reason, sessionToken: current.accessToken });
   }, []);
 
+  const clearRecoveryTimer = useCallback(() => {
+    const timer = reconnectTimerRef.current;
+    if (timer === null) return;
+    depsRef.current.reconnectClock.clearTimeout(timer);
+    reconnectTimerRef.current = null;
+  }, []);
+
+  /**
+   * One bounded recovery attempt, in the fixed order the plan pins:
+   * lease-grace delay -> D-07 credential renewal -> authenticated projection
+   * refetch -> replacement generation. An attempt token supersedes a stale
+   * async step, so a late renewal can never open a generation for an attempt
+   * that has already been replaced, and no later step runs if an earlier one
+   * was aborted, superseded, or failed.
+   */
+  const runRecoveryAttemptRef = useRef<(attempt: 1 | 2 | 3) => void>(() => {});
+  const scheduleRecoveryAttempt = useCallback(
+    (attempt: 1 | 2 | 3, delayMs: number) => {
+      clearRecoveryTimer();
+      setReconnect({ attempt, delayMs, kind: "scheduled" });
+      const clock = depsRef.current.reconnectClock;
+      reconnectTimerRef.current = clock.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (!mountedRef.current) return;
+        runRecoveryAttemptRef.current(attempt);
+      }, delayMs);
+    },
+    [clearRecoveryTimer],
+  );
+
+  const consumeFailedRecoveryAttempt = useCallback(
+    (attempt: 1 | 2 | 3) => {
+      if (attempt >= VIVA_AGENT_RECONNECT_DELAYS_MS.length) {
+        setReconnect({ attempts: 3, kind: "exhausted" });
+        return;
+      }
+      const next = (attempt + 1) as 1 | 2 | 3;
+      scheduleRecoveryAttempt(
+        next,
+        reconnectDelayMs(next, depsRef.current.reconnectClock.random()),
+      );
+    },
+    [scheduleRecoveryAttempt],
+  );
+
+  const runRecoveryAttempt = useCallback(
+    (attempt: 1 | 2 | 3) => {
+      const token = reconnectAttemptTokenRef.current + 1;
+      reconnectAttemptTokenRef.current = token;
+      const isCurrent = () => mountedRef.current && reconnectAttemptTokenRef.current === token;
+      const abort = new AbortController();
+      recoveryAbortRef.current?.abort();
+      recoveryAbortRef.current = abort;
+      setReconnect({ attempt, kind: "refreshing_credential" });
+      void (async () => {
+        // Step 1: renew through the SELECTED D-07 path, so a consumed and
+        // replay-protected access token is never reused on a new generation.
+        const renewal = await runCredentialRenewal({
+          entry: false,
+          isCurrent,
+          reason: "transport_reconnect",
+          signal: abort.signal,
+        });
+        if (!isCurrent() || abort.signal.aborted) return;
+        if (renewal?.status !== "renewed") {
+          // The ledger is untouched and no socket is opened; the page shows its
+          // sanitized credential-unavailable state with an explicit retry.
+          consumeFailedRecoveryAttempt(attempt);
+          return;
+        }
+
+        // Step 2: refetch and identity-validate the projection with the NEW
+        // access token before any socket exists to consume it.
+        const identity = routeIdentityRef.current;
+        const studySetId = identity.studySetId?.trim();
+        const voiceSessionId = identity.sessionId?.trim();
+        if (!studySetId || !voiceSessionId) {
+          consumeFailedRecoveryAttempt(attempt);
+          return;
+        }
+        const projection = await depsRef.current.fetchStudyProjection({
+          accessToken: renewal.credential.accessToken,
+          signal: abort.signal,
+          studySetId,
+          voiceSessionId,
+        });
+        if (!isCurrent() || abort.signal.aborted) return;
+        if (
+          projection.status !== "ready" ||
+          projection.projection.studySet.id !== studySetId ||
+          projection.projection.session.id !== voiceSessionId
+        ) {
+          setProjectionStage(
+            projection.status === "failed"
+              ? { cause: projection.cause, kind: "failed" }
+              : { cause: "identity_mismatch", kind: "failed" },
+          );
+          consumeFailedRecoveryAttempt(attempt);
+          return;
+        }
+        setStudyProjection(projection.projection);
+        setProjectionStage({ kind: "ready" });
+
+        // Step 3: only now open the replacement generation, through the SAME
+        // controller so Plan 03's retained ledger survives the rotation.
+        setReconnect({ attempt, kind: "connecting" });
+        openGenerationWithCurrentCredential("socket_retry");
+      })();
+    },
+    [consumeFailedRecoveryAttempt, openGenerationWithCurrentCredential, runCredentialRenewal],
+  );
+  runRecoveryAttemptRef.current = runRecoveryAttempt;
+
   const renewAndReopen = useCallback(
     (reason: VivaAgentGenerationReason, renewalReason: "browser_restore" | "auth_expired") => {
       const attempt = browserLifecycleAttemptRef.current;
@@ -633,6 +777,102 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     },
     [cancelActiveAudioTurn, renewAndReopen, resetPlaybackForGeneration],
   );
+
+  const agentTermination = agent.derived.termination;
+  const agentTerminalReason = agent.derived.terminalReason;
+  const agentRecapState = agent.derived.recapState;
+  const agentStructuredErrors = agent.derived.structuredErrors;
+  const agentStatus = agent.status;
+
+  // Classify-then-schedule. NO timer is registered until a close has actually
+  // been classified by Plan 05's typed termination.
+  useEffect(() => {
+    if (!agentTermination) return;
+    const clock = depsRef.current.reconnectClock;
+    const decision = vivaAgentReconnectDecision({
+      attempts: reconnectAttemptsUsed(reconnectRef.current),
+      explicitlyStopped: explicitlyStoppedRef.current,
+      random: clock.random(),
+      state: {
+        recap: agentRecapState,
+        status: agentStatus,
+        structuredErrors: agentStructuredErrors,
+        terminalReason: agentTerminalReason,
+        termination: agentTermination,
+      },
+    });
+    if (decision.action === "stop") {
+      clearRecoveryTimer();
+      return;
+    }
+    if (decision.action === "exhausted") {
+      clearRecoveryTimer();
+      setReconnect({ attempts: 3, kind: "exhausted" });
+      return;
+    }
+    scheduleRecoveryAttempt(decision.attempt, decision.delayMs);
+  }, [
+    agentRecapState,
+    agentStatus,
+    agentStructuredErrors,
+    agentTerminalReason,
+    agentTermination,
+    clearRecoveryTimer,
+    scheduleRecoveryAttempt,
+  ]);
+
+  // The attempt budget resets on a REACHED READY generation, never merely on a
+  // socket that started opening: a replacement that fails during its handshake
+  // must consume its attempt rather than restart the whole budget.
+  const agentGenerationId = agent.agentState.generation?.id;
+  const agentReachedReady = Boolean(agent.agentState.ready) && agent.status === "open";
+  useEffect(() => {
+    if (!agentReachedReady) return;
+    clearRecoveryTimer();
+    reconnectAttemptTokenRef.current += 1;
+    setReconnect((current) => (current.kind === "idle" ? current : { attempts: 0, kind: "idle" }));
+  }, [agentReachedReady, clearRecoveryTimer]);
+
+  // `WEBSESSION-AUDIO-01`: exactly one replay per ready generation, and only
+  // when Plan 03 still holds a turn. Nothing here re-chunks or re-numbers.
+  useEffect(() => {
+    if (!agentReachedReady || !agentGenerationId) return;
+    if (replayedGenerationRef.current === agentGenerationId) return;
+    replayedGenerationRef.current = agentGenerationId;
+    if (!agentRef.current.getRetainedAudioTurn()) return;
+    agentRef.current.retryPendingAudio();
+  }, [agentGenerationId, agentReachedReady]);
+
+  // What Plan 03 still holds, mirrored for copy. Compared field by field so a
+  // fresh read of an unchanged ledger cannot loop the renderer. `agentState` is
+  // the deliberate trigger: the ledger is the CONTROLLER's, so every agent state
+  // change is the only signal the browser has that it may have moved.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: agentState is the change trigger, not a read value.
+  useEffect(() => {
+    setRetainedAudioTurn((previous) => {
+      const next = agentRef.current.getRetainedAudioTurn();
+      if (previous === next) return previous;
+      if (!previous || !next) return next;
+      return sameRetainedAudioTurn(previous, next) ? previous : next;
+    });
+  }, [agent.agentState]);
+
+  // A session that has said its last word releases the retained turn: the bytes
+  // can no longer be admitted, so holding them would be a false promise.
+  const sessionTerminal = Boolean(agentRecapState) || agentTerminalReason !== undefined;
+  useEffect(() => {
+    if (!sessionTerminal) return;
+    if (!agentRef.current.getRetainedAudioTurn()) return;
+    discardActiveAudioTurn();
+    setRetainedAudioTurn(null);
+  }, [discardActiveAudioTurn, sessionTerminal]);
+
+  useEffect(() => {
+    return () => {
+      clearRecoveryTimer();
+      recoveryAbortRef.current?.abort();
+    };
+  }, [clearRecoveryTimer]);
 
   useEffect(() => {
     const handlePageShow = (event: PageTransitionEvent) => {
@@ -908,10 +1148,17 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
+    // The one explicit manual recovery: it clears the bounded budget so the
+    // automatic loop is available again, and it never duplicates a scheduled
+    // attempt (the scheduled state disables this control).
+    clearRecoveryTimer();
+    reconnectAttemptTokenRef.current += 1;
+    explicitlyStoppedRef.current = false;
+    setReconnect({ attempts: 0, kind: "idle" });
     resetPlaybackForGeneration();
     agentRef.current.reset();
     agentRef.current.connect("socket_retry");
-  }, [resetPlaybackForGeneration]);
+  }, [clearRecoveryTimer, resetPlaybackForGeneration]);
   const refreshSession = useCallback(() => {
     browserLifecycleAttemptRef.current += 1;
     setSourceOpen(false);
@@ -949,19 +1196,26 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
-    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
+    // An explicit learner stop is final: no automatic reconnect may follow it.
+    explicitlyStoppedRef.current = true;
+    clearRecoveryTimer();
+    stopCaptureForRecap(captureRef, captureStartedRef, levelRef, discardActiveAudioTurn);
     agentRef.current.stop();
-  }, [cancelActiveAudioTurn]);
+  }, [clearRecoveryTimer, discardActiveAudioTurn]);
   const cancelCheckingTurn = useCallback(() => {
     setSourceOpen(false);
     setHintShown(false);
     setTextRetryOpen(false);
     setSubmittedTextAnswer(undefined);
-    cancelActiveAudioTurn();
+    // An explicit learner cancel IS a discard: the turn is thrown away on
+    // purpose, so its retained bytes go with it.
+    discardActiveAudioTurn();
     levelRef.current.user = 0;
     agentRef.current.cancel();
-  }, [cancelActiveAudioTurn]);
+  }, [discardActiveAudioTurn]);
 
+  // Capture stops here; the retained turn is released by the terminal effect
+  // above, which owns the single discard for a session that has ended.
   useEffect(() => {
     if (!agent.derived.recap) return;
     stopCaptureForRecap(captureRef, captureStartedRef, levelRef, cancelActiveAudioTurn);
@@ -1083,8 +1337,15 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
             mic: micState,
             readiness: projectionReadiness,
             readinessProbe,
+            pendingTypedAnswer: typedAnswerUnresolved({
+              canSubmitAnswer: agent.derived.canSubmitAnswer,
+              finalTranscript: agent.derived.finalTranscript,
+              submittedTextAnswer,
+            }),
             ready: agent.agentState.ready,
             recap: agent.derived.recapState,
+            reconnect,
+            retainedAudioTurn,
             status: agent.status,
             structuredErrors: agent.derived.structuredErrors,
             termination: agent.derived.termination,
@@ -1105,6 +1366,11 @@ export function LiveSessionPage({ dependencies }: LiveSessionPageProps = {}) {
       agent.status,
       micState,
       readinessProbe,
+      reconnect,
+      retainedAudioTurn,
+      submittedTextAnswer,
+      agent.derived.canSubmitAnswer,
+      agent.derived.finalTranscript,
     ],
   );
   const websocketReady = Boolean(agent.agentState.ready) && agent.status === "open";
@@ -1501,6 +1767,22 @@ export function textAnswerStateForSession(input: {
   };
 }
 
+/**
+ * `WEBSESSION-RECOVERY-01` Step 5: whether learner-entered text is still
+ * unresolved. It stays visible and is NEVER auto-resent — only the server
+ * advancing the turn (a final transcript, or a fresh submittable turn) resolves
+ * it, and after an ambiguous close the learner retries it deliberately.
+ */
+export function typedAnswerUnresolved(input: {
+  canSubmitAnswer: boolean;
+  finalTranscript?: string;
+  submittedTextAnswer?: string;
+}): boolean {
+  if (!input.submittedTextAnswer) return false;
+  if (input.finalTranscript !== undefined) return false;
+  return !input.canSubmitAnswer;
+}
+
 export function shouldShowNoSpeechNudge(input: {
   textAnswerState?: TextAnswerState;
   textRetryOpen: boolean;
@@ -1783,6 +2065,27 @@ export function captureLevelForBloom(input: {
   return input.meter.push(input.samples);
 }
 
+/** How many of the three bounded attempts the current state has already used. */
+export function reconnectAttemptsUsed(state: VivaAgentReconnectState): 0 | 1 | 2 | 3 {
+  if (state.kind === "idle") return 0;
+  if (state.kind === "exhausted") return 3;
+  return state.attempt;
+}
+
+function sameRetainedAudioTurn(
+  a: VivaAgentRetainedAudioTurn,
+  b: VivaAgentRetainedAudioTurn,
+): boolean {
+  return (
+    a.turnId === b.turnId &&
+    a.retainedFromSequence === b.retainedFromSequence &&
+    a.acceptedThroughSequence === b.acceptedThroughSequence &&
+    a.finalSequence === b.finalSequence &&
+    a.endRequested === b.endRequested &&
+    a.retainedBytes === b.retainedBytes
+  );
+}
+
 export type ActiveAudioTurn = {
   turnId: string;
   nextSequence: number;
@@ -1806,7 +2109,13 @@ export type LiveAudioTurnDriver = {
   captureFrame: (frame: { pcm16Bytes: Uint8Array }) => LiveAudioCaptureOutcome;
   submit: () => VivaAudioSendResult | null;
   release: (turnId: string) => boolean;
-  cancel: () => boolean;
+  /**
+   * Abandons the turn. Without `discardSubmitted`, only a turn that is still
+   * OPEN is cancelled: once `audio_end` is on the wire the assembly belongs to
+   * the server, and the bytes are exactly what `WEBSESSION-AUDIO-01` replays, so
+   * a plain cancel must neither scope a `cancel` at that turn nor drop it.
+   */
+  cancel: (options?: { discardSubmitted?: boolean }) => boolean;
   getTurn: () => ActiveAudioTurn | null;
   getLastResult: () => VivaAudioSendResult | null;
   isAwaitingAcceptance: () => boolean;
@@ -1921,13 +2230,22 @@ export function createLiveAudioTurnDriver(input: {
       lastResult = null;
       return true;
     },
-    cancel() {
-      const cancelledTurnId = turn?.turnId ?? awaitingTurnId;
-      if (cancelledTurnId === null) return false;
-      turn = null;
+    cancel(options: { discardSubmitted?: boolean } = {}) {
+      const openTurnId = turn?.turnId ?? null;
+      if (openTurnId !== null) {
+        turn = null;
+        awaitingTurnId = null;
+        lastResult = null;
+        input.controller.cancelAudioTurn(openTurnId);
+        return true;
+      }
+      // A submitted turn is released ONLY on an explicit discard — a terminal
+      // recap, a session cap, or the learner throwing the answer away.
+      const submittedTurnId = awaitingTurnId;
+      if (!options.discardSubmitted || submittedTurnId === null) return false;
       awaitingTurnId = null;
       lastResult = null;
-      input.controller.cancelAudioTurn(cancelledTurnId);
+      input.controller.cancelAudioTurn(submittedTurnId);
       return true;
     },
     getLastResult: () => lastResult,

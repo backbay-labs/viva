@@ -18,8 +18,10 @@ import {
   type AuthenticatedStudyProjectionResult,
   initialVivaAgentSessionState,
   type VivaAgentReadinessProbe,
+  type VivaAgentRetainedAudioTurn,
   type VivaAgentSessionController,
   type VivaAgentSessionControllerOptions,
+  type VivaAgentSessionState,
 } from "../../lib/viva-agent-client";
 import { LiveSessionPage, type LiveSessionPageDependencies } from "./LiveSessionPage";
 
@@ -68,6 +70,7 @@ function fakeControllerFactory(record: ControllerRecord) {
         retryable: true,
         status: "socket_closed",
       }),
+      getRetainedAudioTurn: () => null,
       getState: () => state,
       refreshSession: (input) => {
         record.refreshes.push(input?.sessionToken ?? null);
@@ -894,5 +897,553 @@ describe("LiveSessionPage authenticated projection (WEBSESSION-DATA-01/PROGRESSI
     expect(container.querySelector("select")).toBe(null);
     expect(container.querySelectorAll("input[type='text']")).toHaveLength(0);
     expect(controllers.connects).toEqual(["session_bootstrap"]);
+  });
+});
+
+/**
+ * A deterministic stand-in for the page's one scheduling seam. Nothing here
+ * races the real event loop: a test advances virtual time itself, so "no socket
+ * before 549 ms" is an assertion rather than a hope.
+ */
+type FakeReconnectClock = LiveSessionPageDependencies["reconnectClock"] & {
+  advance: (ms: number) => void;
+  pending: () => number[];
+  setRandom: (value: number) => void;
+};
+
+function createFakeReconnectClock(random = 0): FakeReconnectClock {
+  type Timer = { due: number; fn: () => void; id: number };
+  let now = 0;
+  let nextId = 1;
+  let randomValue = random;
+  const timers = new Map<number, Timer>();
+
+  const clock: FakeReconnectClock = {
+    advance(ms: number) {
+      const target = now + ms;
+      for (;;) {
+        const due = [...timers.values()]
+          .filter((timer) => timer.due <= target)
+          .sort((a, b) => a.due - b.due || a.id - b.id);
+        const next = due[0];
+        if (!next) break;
+        timers.delete(next.id);
+        now = Math.max(now, next.due);
+        next.fn();
+      }
+      now = target;
+    },
+    clearTimeout: ((id: unknown) => {
+      timers.delete(Number(id));
+    }) as typeof globalThis.clearTimeout,
+    pending: () => [...timers.values()].map((timer) => timer.due - now),
+    random: () => randomValue,
+    setRandom: (value: number) => {
+      randomValue = value;
+    },
+    setTimeout: ((fn: () => void, delay?: number) => {
+      const id = nextId++;
+      timers.set(id, { due: now + (delay ?? 0), fn, id });
+      return id as unknown as ReturnType<typeof globalThis.setTimeout>;
+    }) as typeof globalThis.setTimeout,
+  };
+  return clock;
+}
+
+type ProgrammableController = {
+  factory: LiveSessionPageDependencies["createAgentController"];
+  connects: string[];
+  refreshes: Array<string | null>;
+  retries: number;
+  cancelledTurns: string[];
+  retainedTurn: VivaAgentRetainedAudioTurn | null;
+  push: (next: Partial<VivaAgentSessionState>) => void;
+  state: () => VivaAgentSessionState;
+};
+
+/**
+ * One controller instance whose state a test can push, so the page's recovery
+ * effects observe real transitions instead of a frozen snapshot.
+ */
+function programmableController(): ProgrammableController {
+  const listeners = new Set<(next: VivaAgentSessionState) => void>();
+  let state = initialVivaAgentSessionState();
+  const socket = {} as WebSocket;
+  const closed = {
+    acceptedThroughSequence: null,
+    error: { code: "socket_closed", message: "closed" },
+    retainedFromSequence: 0,
+    retryable: true,
+    status: "socket_closed",
+  } as const;
+
+  const record: ProgrammableController = {
+    cancelledTurns: [],
+    connects: [],
+    factory: (() => ({
+      acknowledgeAudio: () => {},
+      cancel: () => {},
+      cancelAudioTurn: (turnId: string) => {
+        record.cancelledTurns.push(turnId);
+      },
+      close: () => {},
+      connect: (reason?: string) => {
+        record.connects.push(reason ?? "session_bootstrap");
+        return socket;
+      },
+      endAudioTurn: () => closed,
+      getRetainedAudioTurn: () => record.retainedTurn,
+      getState: () => state,
+      refreshSession: (input?: { reason?: string; sessionToken?: string | null }) => {
+        record.refreshes.push(input?.sessionToken ?? null);
+        record.connects.push(input?.reason ?? "token_refresh");
+        return socket;
+      },
+      reset: () => {},
+      retryPendingAudio: () => {
+        record.retries += 1;
+        return closed;
+      },
+      sendAudioChunk: () => closed,
+      sendText: () => true,
+      sendTurnIntent: () => ({ status: "sent", turnId: "turn-x" }),
+      stop: () => {},
+      subscribe: (listener: (next: VivaAgentSessionState) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    })) as unknown as LiveSessionPageDependencies["createAgentController"],
+    push: (next: Partial<VivaAgentSessionState>) => {
+      state = { ...state, ...next };
+      for (const listener of listeners) listener(state);
+    },
+    refreshes: [],
+    retainedTurn: null,
+    retries: 0,
+    state: () => state,
+  };
+  return record;
+}
+
+/** A complete v5 ready frame: the runtime copy reads its brain/store facts. */
+const READY_FRAME = {
+  brain: { configured: true, live_runtime: false, provider: "synthetic", selectable: true },
+  input_encoding: "pcm_s16le",
+  protocol: { preferred_version: 5, supported_versions: [5] },
+  sample_rate_hz: 24_000,
+  store: {
+    available: true,
+    backend: "in_memory",
+    durable: false,
+    nonce_replay_protection: true,
+    raw_audio_persistence: false,
+    transcript_persistence: false,
+    uuid_schema_translation: true,
+  },
+  type: "ready",
+  version: 5,
+} as unknown as VivaAgentSessionState["ready"];
+
+const RETAINED_TURN: VivaAgentRetainedAudioTurn = {
+  acceptedThroughSequence: 2,
+  endRequested: true,
+  finalSequence: 2,
+  retainedBytes: 6_144,
+  retainedFromSequence: 0,
+  turnId: "turn-retained-1",
+};
+
+describe("LiveSessionPage bounded recovery (WEBSESSION-RECOVERY-01 / WEBSESSION-AUDIO-01)", () => {
+  async function mountRecovery(
+    controller: ProgrammableController,
+    clock: FakeReconnectClock,
+    overrides: Partial<LiveSessionPageDependencies> = {},
+  ) {
+    const container = mountContainer();
+    const root = trackRoot(createRoot(container));
+    replaceBrowserSessionCredential(branchACredential());
+    const dependencies = testDependencies({
+      createAgentController: controller.factory,
+      reconnectClock: clock,
+      renewCredential: async ({ credential }) => ({ credential, status: "renewed" }),
+      ...overrides,
+    });
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <LiveSessionPage dependencies={dependencies} />
+        </StrictMode>,
+      );
+    });
+    await drain(clock);
+    return { container, root };
+  }
+
+  /** Runs the page's own zero-delay bootstrap chain on the fake clock. */
+  async function drain(clock: FakeReconnectClock, ms = 0, rounds = 4) {
+    for (let round = 0; round < rounds; round += 1) {
+      await act(async () => {
+        clock.advance(round === 0 ? ms : 0);
+        await new Promise<void>((resolve) => {
+          globalThis.setTimeout(resolve, 0);
+        });
+      });
+    }
+  }
+
+  function closeUncleanly(controller: ProgrammableController) {
+    controller.push({
+      close: { code: 1006, wasClean: false },
+      status: "closed",
+      termination: { closeCode: 1006, kind: "transport", retryable: true },
+    });
+  }
+
+  test("an unclean close reconnects after the lease grace, not before", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0.5);
+    await mountRecovery(controller, clock);
+    expect(controller.connects).toEqual(["session_bootstrap"]);
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 0);
+
+    await drain(clock, 549);
+    expect(controller.connects).toEqual(["session_bootstrap"]);
+
+    await drain(clock, 1);
+    // Renewal → projection refetch → replacement generation, all inside the one
+    // scheduled attempt. The first retry lands at 550 ms, past the 250 ms lease.
+    expect(controller.connects).toEqual(["session_bootstrap", "socket_retry"]);
+  });
+
+  test("three bounded attempts run at 500/1000/2000 ms and then stop", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountRecovery(controller, clock);
+
+    for (const delay of [500, 1_000, 2_000]) {
+      await act(async () => {
+        closeUncleanly(controller);
+      });
+      await drain(clock, 0);
+      await drain(clock, delay - 1);
+      const before = controller.connects.length;
+      await drain(clock, 1);
+      expect({ after: controller.connects.length, delay }).toEqual({ after: before + 1, delay });
+    }
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 0);
+    const afterThird = controller.connects.length;
+    await drain(clock, 10_000);
+    expect(controller.connects).toHaveLength(afterThird);
+    expect(container.innerHTML).toContain("Connection lost");
+
+    const retry = container.querySelector<HTMLButtonElement>("button.session-action--primary");
+    expect(retry?.disabled).toBe(false);
+  });
+
+  test("a replacement generation that reaches ready resets the attempt budget", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    await mountRecovery(controller, clock);
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 500);
+    expect(controller.connects).toHaveLength(2);
+
+    await act(async () => {
+      controller.push({
+        close: undefined,
+        generation: { id: "gen-ready", reason: "socket_retry", sequence: 2 },
+        ready: READY_FRAME,
+        status: "open",
+        termination: undefined,
+      });
+    });
+    await drain(clock, 0);
+
+    // Back to idle: the NEXT loss gets a full first attempt at 500 ms again.
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 499);
+    expect(controller.connects).toHaveLength(2);
+    await drain(clock, 1);
+    expect(controller.connects).toHaveLength(3);
+  });
+
+  test("no stop condition ever arms a retry timer", async () => {
+    const stops: Array<[string, Partial<VivaAgentSessionState>]> = [
+      ["terminal reason", { terminalReason: "session_cap" }],
+      [
+        "complete recap",
+        {
+          recap: {
+            kind: "complete",
+            recap: {
+              concepts: [],
+              deferred_turns: 0,
+              headline: "h",
+              next_action: "n",
+              review_schedule: [],
+              schema: "viva.study_session_recap.v2",
+              source_moments: [],
+              summary: "s",
+              voice_session_id: ROUTE_IDENTITY.sessionId,
+            },
+          },
+        },
+      ],
+      [
+        "terminal structured error",
+        {
+          structuredErrors: [
+            { terminalReason: "provider_malformed_stream", terminality: "terminal" },
+          ],
+          terminalReason: "provider_malformed_stream",
+        },
+      ],
+      [
+        "protocol termination",
+        {
+          termination: {
+            closeCode: 1008,
+            errorCode: "VOICE_CLIENT_FRAME_TOO_LARGE",
+            kind: "protocol",
+            retryable: false,
+          },
+        },
+      ],
+      ["clean 1000", { termination: { closeCode: 1000, kind: "normal", retryable: false } }],
+    ];
+
+    for (const [label, stop] of stops) {
+      const controller = programmableController();
+      const clock = createFakeReconnectClock(0);
+      await mountRecovery(controller, clock);
+      const before = controller.connects.length;
+
+      await act(async () => {
+        controller.push({ close: { code: 1006, wasClean: false }, status: "closed", ...stop });
+      });
+      await drain(clock, 10_000);
+
+      expect({ connects: controller.connects.length, label }).toEqual({
+        connects: before,
+        label,
+      });
+    }
+  });
+
+  test("recovery renews the credential and refetches the projection before opening a socket", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const renewals: string[] = [];
+    const projections: ProjectionRecord = { calls: [] };
+    await mountRecovery(controller, clock, {
+      fetchStudyProjection: recordingProjection(projections, () => ({
+        projection: thermoProjection(),
+        status: "ready",
+      })),
+      renewCredential: async ({ credential, reason }) => {
+        renewals.push(reason);
+        return { credential, status: "renewed" };
+      },
+    });
+    expect(renewals).toEqual(["session_entry"]);
+    expect(projections.calls).toHaveLength(1);
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 500);
+
+    expect(renewals).toEqual(["session_entry", "transport_reconnect"]);
+    expect(projections.calls).toHaveLength(2);
+    expect(controller.connects.at(-1)).toBe("socket_retry");
+  });
+
+  test("a failed renewal consumes one attempt, keeps the ledger, and opens no socket", async () => {
+    const controller = programmableController();
+    controller.retainedTurn = RETAINED_TURN;
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountRecovery(controller, clock, {
+      renewCredential: async ({ credential, reason }) =>
+        reason === "session_entry"
+          ? { credential, status: "renewed" }
+          : { credential, reason: "timeout", status: "retained" },
+    });
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 500);
+
+    expect(controller.connects).toEqual(["session_bootstrap"]);
+    expect(controller.retries).toBe(0);
+    // The ledger is retained for manual recovery, and the copy is the sanitized
+    // recovery state — never a fetch message, a close reason, or a claim that
+    // the server received the spoken answer.
+    expect(controller.cancelledTurns).toEqual([]);
+    expect(container.innerHTML).toContain("Reconnecting");
+    expect(container.innerHTML).toContain(
+      "Your spoken answer is retained on this device for retry",
+    );
+    expect(container.innerHTML).not.toContain("received");
+  });
+
+  test("the retained turn is replayed exactly once, only after the replacement is ready", async () => {
+    const controller = programmableController();
+    controller.retainedTurn = RETAINED_TURN;
+    const clock = createFakeReconnectClock(0);
+    await mountRecovery(controller, clock);
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 500);
+    expect(controller.connects.at(-1)).toBe("socket_retry");
+    expect(controller.retries).toBe(0);
+
+    await act(async () => {
+      controller.push({
+        close: undefined,
+        generation: { id: "gen-2", reason: "socket_retry", sequence: 2 },
+        ready: undefined,
+        status: "connecting",
+        termination: undefined,
+      });
+    });
+    await drain(clock, 0);
+    expect(controller.retries).toBe(0);
+
+    await act(async () => {
+      controller.push({ ready: READY_FRAME, status: "open" });
+    });
+    await drain(clock, 0);
+    expect(controller.retries).toBe(1);
+
+    // Idempotent per generation: even a readiness flap that re-fires the replay
+    // effect for the SAME generation must not resend the turn a second time.
+    await act(async () => {
+      controller.push({ phase: "listening" });
+    });
+    await drain(clock, 0);
+    await act(async () => {
+      controller.push({ ready: undefined, status: "connecting" });
+    });
+    await drain(clock, 0);
+    await act(async () => {
+      controller.push({ ready: READY_FRAME, status: "open" });
+    });
+    await drain(clock, 0);
+    expect(controller.retries).toBe(1);
+    expect(controller.cancelledTurns).toEqual([]);
+  });
+
+  test("exhaustion keeps the retained answer and offers one explicit replay", async () => {
+    const controller = programmableController();
+    controller.retainedTurn = RETAINED_TURN;
+    const clock = createFakeReconnectClock(0);
+    const { container } = await mountRecovery(controller, clock);
+
+    for (const delay of [500, 1_000, 2_000]) {
+      await act(async () => {
+        closeUncleanly(controller);
+      });
+      await drain(clock, delay);
+    }
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 10_000);
+
+    expect(container.innerHTML).toContain("Connection lost");
+    expect(container.innerHTML).toContain(
+      "Your spoken answer is retained on this device for retry",
+    );
+    expect(container.innerHTML).not.toContain("turn-retained-1");
+    expect(controller.cancelledTurns).toEqual([]);
+
+    const retry = container.querySelector<HTMLButtonElement>("button.session-action--primary");
+    if (!retry) throw new Error("expected one manual recovery action");
+    const connectsBefore = controller.connects.length;
+    await act(async () => {
+      retry.click();
+    });
+    await drain(clock, 0);
+    expect(controller.connects.length).toBeGreaterThan(connectsBefore);
+
+    await act(async () => {
+      controller.push({
+        generation: { id: "gen-manual", reason: "socket_retry", sequence: 9 },
+        ready: READY_FRAME,
+        status: "open",
+      });
+    });
+    await drain(clock, 0);
+    expect(controller.retries).toBe(1);
+  });
+
+  test("a terminal recap discards the retained turn through the controller", async () => {
+    const controller = programmableController();
+    controller.retainedTurn = RETAINED_TURN;
+    const clock = createFakeReconnectClock(0);
+    await mountRecovery(controller, clock);
+
+    await act(async () => {
+      controller.push({
+        phase: "recap",
+        recap: {
+          kind: "partial",
+          partialReason: "turn_cap",
+          recap: {
+            concepts: [],
+            deferred_turns: 1,
+            headline: "h",
+            next_action: "n",
+            review_schedule: [],
+            schema: "viva.study_session_recap.v2",
+            source_moments: [],
+            summary: "s",
+            voice_session_id: ROUTE_IDENTITY.sessionId,
+          },
+        },
+        terminalReason: "turn_cap",
+      });
+    });
+    await drain(clock, 0);
+
+    expect(controller.cancelledTurns).toEqual([RETAINED_TURN.turnId]);
+    expect(controller.retries).toBe(0);
+  });
+
+  test("unmount cancels the pending retry and opens nothing", async () => {
+    const controller = programmableController();
+    const clock = createFakeReconnectClock(0);
+    const { root } = await mountRecovery(controller, clock);
+
+    await act(async () => {
+      closeUncleanly(controller);
+    });
+    await drain(clock, 0);
+    expect(clock.pending().length).toBeGreaterThan(0);
+
+    await act(async () => {
+      root.unmount();
+    });
+    const before = controller.connects.length;
+    await act(async () => {
+      clock.advance(10_000);
+    });
+    expect(controller.connects).toHaveLength(before);
   });
 });

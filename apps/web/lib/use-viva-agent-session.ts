@@ -31,6 +31,7 @@ import {
   type VivaAgentDiagnostic,
   type VivaAgentGenerationReason,
   type VivaAgentRecapState,
+  type VivaAgentRetainedAudioTurn,
   type VivaAgentSessionController,
   type VivaAgentSessionState,
   type VivaAgentStructuredError,
@@ -43,6 +44,7 @@ export type VivaAgentAudioCommands = {
   endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
   cancelAudioTurn: (turnId: string) => void;
   retryPendingAudio: () => VivaAudioSendResult;
+  getRetainedAudioTurn: () => VivaAgentRetainedAudioTurn | null;
 };
 
 /* --------------------------------------------------------------------- *
@@ -419,6 +421,7 @@ export function createVivaAgentAudioCommands(
   return {
     cancelAudioTurn: (turnId) => getController()?.cancelAudioTurn(turnId),
     endAudioTurn: (input) => getController()?.endAudioTurn(input) ?? disconnectedAudioSendResult(0),
+    getRetainedAudioTurn: () => getController()?.getRetainedAudioTurn() ?? null,
     retryPendingAudio: () => getController()?.retryPendingAudio() ?? disconnectedAudioSendResult(0),
     sendAudioChunk: (input) =>
       getController()?.sendAudioChunk(input) ?? disconnectedAudioSendResult(0),
@@ -528,6 +531,7 @@ export function useVivaAgentSession(options: UseVivaAgentSessionOptions) {
     reset: () => controllerRef.current?.reset(),
     cancelAudioTurn: audio.cancelAudioTurn,
     endAudioTurn: audio.endAudioTurn,
+    getRetainedAudioTurn: audio.getRetainedAudioTurn,
     retryPendingAudio: audio.retryPendingAudio,
     sendAudioChunk: audio.sendAudioChunk,
     sendText: (text: string) => controllerRef.current?.sendText(text) ?? false,

@@ -44,7 +44,6 @@ import {
 } from "@viva/core";
 import { pcm16LeBytesToBase64 } from "./viva-audio-capture";
 import type { VivaLibraryExport, VivaLibrarySnapshot } from "./viva-library";
-import { isRedactedVivaLogValue, redactForVivaLog } from "./viva-redaction";
 
 /**
  * Retention high-water mark for the browser send queue. Once the socket has this
@@ -329,6 +328,97 @@ export type VivaAgentSessionState = {
   staleEvents: number;
 } & VivaAgentProtocolStateFields;
 
+/* --------------------------------------------------------------------- *
+ * `WEBSESSION-RECOVERY-01`: the bounded reconnect policy, kept pure so the
+ * whole stop-condition table is provable without a socket, a DOM, or a clock.
+ * -------------------------------------------------------------------- */
+
+/** Three attempts, no more. The first already clears the server's 250 ms lease grace. */
+export const VIVA_AGENT_RECONNECT_DELAYS_MS = [500, 1_000, 2_000] as const;
+export const VIVA_AGENT_RECONNECT_JITTER_MS = 100;
+
+export type VivaAgentReconnectState =
+  | { kind: "idle"; attempts: 0 }
+  | { kind: "scheduled"; attempt: 1 | 2 | 3; delayMs: number }
+  | { kind: "refreshing_credential"; attempt: 1 | 2 | 3 }
+  | { kind: "connecting"; attempt: 1 | 2 | 3 }
+  | { kind: "exhausted"; attempts: 3 };
+
+/**
+ * Jitter is added, never subtracted, so even the fastest first retry (500 ms)
+ * stays clear of the 250 ms lease grace. A hostile or non-finite `random` is
+ * clamped rather than trusted.
+ */
+export function reconnectDelayMs(attempt: 1 | 2 | 3, random: number): number {
+  const bounded = Number.isFinite(random) ? Math.min(0.999_999, Math.max(0, random)) : 0;
+  return (
+    VIVA_AGENT_RECONNECT_DELAYS_MS[attempt - 1] +
+    Math.floor(bounded * VIVA_AGENT_RECONNECT_JITTER_MS)
+  );
+}
+
+export type VivaAgentReconnectStopReason =
+  | "recap"
+  | "terminal"
+  | "not_retryable"
+  | "explicit_stop"
+  | "still_open";
+
+export type VivaAgentReconnectDecision =
+  | { action: "schedule"; attempt: 1 | 2 | 3; delayMs: number }
+  | { action: "exhausted" }
+  | { action: "stop"; reason: VivaAgentReconnectStopReason };
+
+export type VivaAgentReconnectInputState = Pick<
+  VivaAgentSessionState,
+  "recap" | "status" | "structuredErrors" | "terminalReason" | "termination"
+>;
+
+/**
+ * The single place that decides whether a closed session may be retried.
+ *
+ * Retryability is read off Plan 05's typed termination — never off a close
+ * reason, a socket status guess, or a message. A recap (complete OR partial), a
+ * terminal reason, a terminal structured error, a nonretryable auth/protocol
+ * termination, a clean 1000, and an explicit learner stop are all final.
+ */
+export function vivaAgentReconnectDecision(input: {
+  attempts: 0 | 1 | 2 | 3;
+  explicitlyStopped: boolean;
+  random: number;
+  state: VivaAgentReconnectInputState;
+}): VivaAgentReconnectDecision {
+  if (input.explicitlyStopped) return { action: "stop", reason: "explicit_stop" };
+  if (input.state.recap) return { action: "stop", reason: "recap" };
+  if (input.state.terminalReason !== undefined) return { action: "stop", reason: "terminal" };
+  if (input.state.structuredErrors.some((entry) => entry.terminality === "terminal")) {
+    return { action: "stop", reason: "terminal" };
+  }
+  const termination = input.state.termination;
+  if (!termination) return { action: "stop", reason: "still_open" };
+  if (!termination.retryable) return { action: "stop", reason: "not_retryable" };
+  if (input.state.status !== "closed" && input.state.status !== "error") {
+    return { action: "stop", reason: "still_open" };
+  }
+  if (input.attempts >= VIVA_AGENT_RECONNECT_DELAYS_MS.length) return { action: "exhausted" };
+  const attempt = (input.attempts + 1) as 1 | 2 | 3;
+  return { action: "schedule", attempt, delayMs: reconnectDelayMs(attempt, input.random) };
+}
+
+/**
+ * What Plan 03's bounded ledger still holds, published read-only so the page can
+ * tell a learner their spoken answer is retained ON THIS DEVICE without ever
+ * touching the bytes or opening a second queue.
+ */
+export type VivaAgentRetainedAudioTurn = Readonly<{
+  turnId: string;
+  retainedFromSequence: number;
+  acceptedThroughSequence: number | null;
+  finalSequence: number | null;
+  endRequested: boolean;
+  retainedBytes: number;
+}>;
+
 export type VivaAgentSessionControllerOptions = VivaAgentClientOptions & {
   generationIdFactory?: (input: { reason: VivaAgentGenerationReason; sequence: number }) => string;
   session: AgentSessionConfig;
@@ -356,6 +446,7 @@ export type VivaAgentSessionController = {
   endAudioTurn: (input: Readonly<{ turnId: string; finalSequence: number }>) => VivaAudioSendResult;
   cancelAudioTurn: (turnId: string) => void;
   retryPendingAudio: () => VivaAudioSendResult;
+  getRetainedAudioTurn: () => VivaAgentRetainedAudioTurn | null;
   acknowledgeAudio: (consumed: readonly VivaAgentAudioOutput[]) => void;
   cancel: () => void;
   stop: () => void;
@@ -1301,6 +1392,24 @@ export function createVivaAgentSessionController(
     audioLedger = null;
   }
 
+  /**
+   * `WEBSESSION-AUDIO-01`: rebinds the retained turn onto the CURRENT generation
+   * so a replay re-serializes the same turn id, the same sequence numbers, and
+   * the same bytes onto the replacement socket. Only the serialization
+   * bookkeeping is reset — the retained chunks are untouched, so this is a
+   * replay of the original turn, not a new one, and there is still exactly one
+   * queue.
+   */
+  function rebindRetainedTurnToActiveGeneration() {
+    const ledger = audioLedger;
+    const generationId = activeGeneration?.id;
+    if (!ledger || !generationId || ledger.generationId === generationId) return;
+    ledger.generationId = generationId;
+    ledger.serializedChunkCount = 0;
+    ledger.lastSerializedSequence = null;
+    ledger.endSerialized = false;
+  }
+
   function applyAudioTurnAccepted(frame: AgentAudioTurnAcceptedFrame) {
     const ledger = audioLedger;
     const matchesInFlightTurn =
@@ -1563,9 +1672,20 @@ export function createVivaAgentSessionController(
       const ledger = audioLedger;
       // A cancellation for another turn is never permission to discard this one.
       if (!ledger || ledger.turnId !== turnId) return;
+      // Once `audio_end` is on the wire the server owns the assembly: a scoped
+      // `cancel` for it would address a turn the server has already consumed.
+      // The local bytes are still released — the learner asked to discard — but
+      // no frame is sent. (Plan 08 made the server tolerate a late cancel; the
+      // browser still must not send one.)
+      const assemblyConsumed = ledger.endSerialized;
       releaseAudioLedger();
       const generationId = activeGeneration?.id;
-      if (generationId && generationId === ledger.generationId && socket?.readyState === 1) {
+      if (
+        !assemblyConsumed &&
+        generationId &&
+        generationId === ledger.generationId &&
+        socket?.readyState === 1
+      ) {
         socket.send(
           JSON.stringify({
             client_generation_id: generationId,
@@ -1580,7 +1700,20 @@ export function createVivaAgentSessionController(
       }
     },
     retryPendingAudio() {
+      rebindRetainedTurnToActiveGeneration();
       return pumpAudioQueue();
+    },
+    getRetainedAudioTurn() {
+      const ledger = audioLedger;
+      if (!ledger) return null;
+      return {
+        acceptedThroughSequence: ledger.lastSerializedSequence,
+        endRequested: ledger.endRequested,
+        finalSequence: ledger.finalSequence,
+        retainedBytes: ledger.retainedBytes,
+        retainedFromSequence: retainedFromSequence(ledger),
+        turnId: ledger.turnId,
+      };
     },
     acknowledgeAudio(consumed: readonly VivaAgentAudioOutput[]) {
       // Drop exactly the frames the consumer enqueued to the playback sink — by

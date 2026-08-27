@@ -45,6 +45,7 @@ import {
   submitSpokenCaptureTurn,
   textAnswerPayload,
   textAnswerStateForSession,
+  typedAnswerUnresolved,
 } from "./LiveSessionPage";
 
 describe("drainAgentAudio", () => {
@@ -967,7 +968,14 @@ describe("live audio turn driver", () => {
     }
   });
 
-  test("cancels a submitted turn that is still awaiting acceptance", () => {
+  /**
+   * `WEBSESSION-AUDIO-01`, cancel-after-submit. Once `audio_end` is on the wire
+   * the assembly belongs to the server, so a plain cancel must NOT fall back to
+   * the awaiting turn id: doing so scoped a `cancel` at an assembly the server
+   * had already consumed, and it also threw away bytes the recovery path still
+   * needs for an idempotent replay.
+   */
+  test("a plain cancel never targets a turn whose audio_end already went out", () => {
     const { calls, seam } = recordingSeam();
     const driver = createLiveAudioTurnDriver({
       controller: seam,
@@ -976,10 +984,43 @@ describe("live audio turn driver", () => {
     driver.captureFrame(frame(960));
     driver.submit();
 
-    expect(driver.cancel()).toBe(true);
+    expect(driver.cancel()).toBe(false);
 
-    expect(calls.at(-1)).toEqual({ kind: "cancel", turnId: "turn-h" });
+    expect(calls.filter((call) => call.kind === "cancel")).toEqual([]);
+    // The submitted turn stays claimed so a later ack can release it and a later
+    // capture callback cannot open a second concurrent input turn.
+    expect(driver.isAwaitingAcceptance()).toBe(true);
+    expect(driver.captureFrame(frame(960))).toEqual({
+      chunk: null,
+      end: null,
+      ignored: "awaiting_acceptance",
+    });
+  });
+
+  test("an explicit discard releases the submitted turn through the controller", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-h2"),
+    });
+    driver.captureFrame(frame(960));
+    driver.submit();
+
+    expect(driver.cancel({ discardSubmitted: true })).toBe(true);
+
+    expect(calls.at(-1)).toEqual({ kind: "cancel", turnId: "turn-h2" });
     expect(driver.isAwaitingAcceptance()).toBe(false);
+  });
+
+  test("a discard with nothing submitted or open is a no-op", () => {
+    const { calls, seam } = recordingSeam();
+    const driver = createLiveAudioTurnDriver({
+      controller: seam,
+      createTurnId: fixedTurnIds("turn-h3"),
+    });
+
+    expect(driver.cancel({ discardSubmitted: true })).toBe(false);
+    expect(calls).toEqual([]);
   });
 
   test("ignores empty and odd-byte capture callbacks without opening a turn", () => {
@@ -1019,6 +1060,32 @@ describe("live audio turn driver", () => {
     expect(errors).toEqual(["audio_queue_limit:Audio turn exceeds the maximum retained turn size"]);
     expect(errors.join(" ")).not.toContain("ESIz");
     expect(driver.getTurn()).toBe(null);
+  });
+
+  test("typed content stays unresolved across an ambiguous close and is never auto-resent", () => {
+    // Submitted, socket lost mid-turn: no final transcript, no submittable turn.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: false,
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(true);
+    // The server advanced the turn: the answer is resolved, not pending.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: false,
+        finalTranscript: "NADH donates electrons",
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(false);
+    // A fresh submittable turn means the previous one is no longer in flight.
+    expect(
+      typedAnswerUnresolved({
+        canSubmitAnswer: true,
+        submittedTextAnswer: "NADH donates electrons",
+      }),
+    ).toBe(false);
+    expect(typedAnswerUnresolved({ canSubmitAnswer: false })).toBe(false);
   });
 
   test("mints opaque turn ids that carry no learner material", () => {
