@@ -973,10 +973,20 @@ pub(super) async fn record_turn_outcome(
             .execute(&mut *tx)
             .await
             .map_err(pg_error)?;
-        // `A-22`: the same session-scoped status write the retired
-        // `record_concept_status` made, so the two backends hold the same rows for
-        // the same turn and the `concept_status` browser event of a genuinely
-        // evaluated turn is backed by a durable write, not by a digest alone.
+        // `A-22` — SCOPE EXTENSION, awaiting coordinator ratification.
+        //
+        // The same session-scoped status write the retired `record_concept_status`
+        // made, so the two backends hold the same rows for the same turn and the
+        // `concept_status` browser event of a genuinely evaluated turn is backed by
+        // a durable write, not by a digest alone.
+        //
+        // A-22's text obliges this authority to populate the attempt row and write
+        // the event-authorization digest, and says nothing about the sibling
+        // `concept_status` event — so this write is not covered by a ratified
+        // amendment line. The necessity is memory-side (that backend's
+        // `authorize_concept_status` refuses without the row) and the full record is
+        // on the twin write in `memory/learning.rs`; this backend carries it because
+        // the shared conformance suite holds the two to the same published counts.
         let status_event = sqlx::query(
             "INSERT INTO concept_status_events (
                  user_id,

@@ -1043,12 +1043,28 @@ pub(super) fn record_turn_outcome(
                 status: &transition.to_status,
             },
         )?;
-        // `A-22`: the digest alone is not what this backend's gate reads. It
-        // requires the persisted status write as well, so the turn-outcome
-        // authority records the same session-scoped row the retired
-        // `record_concept_status` wrote — otherwise the `concept_status` browser
-        // event of a genuinely evaluated turn is refused for a write that did
-        // happen.
+        // `A-22` — SCOPE EXTENSION, awaiting coordinator ratification.
+        //
+        // A-22's text obliges this authority to "populate the attempt row's
+        // evaluation payload and write the event-authorization digest" — it says
+        // nothing about the sibling `concept_status` event, and this write is
+        // therefore not covered by a ratified amendment line. It is here because
+        // the obligation is unsatisfiable in practice without it: A-22's stated
+        // purpose is that a genuinely evaluated turn reaches the browser, and
+        // `authorize_concept_status` in this backend refuses a `concept_status`
+        // event unless a session-scoped `concept_statuses` row exists (see
+        // `memory/authorization.rs`), whose only writer was the same retired
+        // `record_concept_status`. Without this row the evaluated turn is admitted
+        // and then dies one frame later. Recorded rather than assumed: reverting
+        // this write (and its Postgres twin) turns the two Group C replays red
+        // again and un-forces the four cross-lane assertion flips this unit's
+        // report asks the coordinator to sanction.
+        //
+        // The digest alone is not what this backend's gate reads. It requires the
+        // persisted status write as well, so the turn-outcome authority records the
+        // same session-scoped row the retired `record_concept_status` wrote —
+        // otherwise the `concept_status` browser event of a genuinely evaluated
+        // turn is refused for a write that did happen.
         //
         // Guarded on the digest exactly as that retired writer was, because the
         // two backends must publish the same count for the same turn: Postgres
