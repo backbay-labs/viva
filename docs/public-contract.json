@@ -1,6 +1,6 @@
 {
   "schema": "viva.public_contract.v1",
-  "source_manifest_sha256": "5bcf4c87efa5f3a56fe722a783d3d28fbe296f6c42022968e220737a912cecc9",
+  "source_manifest_sha256": "2ffa33ebf91090275d1a6d4fbddf92029aac6199309c473c88a4057fe96f8e14",
   "protocol": {
     "version": 5,
     "supported_versions": [
