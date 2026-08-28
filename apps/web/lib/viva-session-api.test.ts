@@ -182,7 +182,7 @@ describe("Viva same-origin session API", () => {
     expect(serialized).not.toContain("agent.example");
   });
 
-  test("resume mints ask the agent for no durable write because their session already exists", async () => {
+  test("resume mints name their own operation and still ask the agent for no durable write", async () => {
     const calls: string[] = [];
     const agentAccessToken = signedAgentAccessToken();
     globalThis.fetch = (async (input: RequestInfo | URL) => {
@@ -201,9 +201,16 @@ describe("Viva same-origin session API", () => {
     expect(response.status).toBe(200);
     expect(body.session?.session_id).toBe("server-session");
     expect(calls).toHaveLength(1);
+    // `A-38.2`: a resume names the mint operation it is performing. Naming nothing made
+    // this request indistinguishable from a plain library read, which the session-mint
+    // credential has no authority for, so the agent's public-bind admission refused it
+    // before any gate — the third sibling of the `A-32` deadlock family.
+    expect(calls[0]).toBe(
+      "https://agent.example/study-sets/library?user_id=synthetic-user&mint_resume_for=biology-midterm",
+    );
     // `A-32`: only a start records. A resume names a `voice_sessions` row the start
-    // mint already committed, so it must not ask the agent to open another one.
-    expect(calls[0]).toBe("https://agent.example/study-sets/library?user_id=synthetic-user");
+    // mint already committed, and the start selector would not replay it — it mints a
+    // fresh session id — so a resume must never carry that selector.
     expect(calls[0]).not.toContain("record_start_for");
   });
 
@@ -2546,6 +2553,33 @@ describe("Viva D-07 Branch A rotating refresh credentials", () => {
       });
     }
     expect(calls).toEqual([]);
+  });
+
+  test("refresh mints name the resume operation exactly as the start route's resume does", async () => {
+    const calls: string[] = [];
+    let agentAccessToken = signedAgentAccessToken({ nonce: "issued-nonce" });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(
+        200,
+        librarySnapshot({ resumeToken: agentAccessToken, startToken: agentAccessToken }),
+      );
+    }) as typeof fetch;
+    const issued = await issuedCredentials();
+
+    agentAccessToken = signedAgentAccessToken({ nonce: "rotated-nonce" });
+    const rotated = await refreshSession(
+      sessionRequest("/api/viva-session/refresh", refreshPayload(issued.refresh_token)),
+    );
+
+    expect(rotated.status).toBe(200);
+    // `A-38.2`: `handleVivaSessionRefresh` mints with the resume action, so it stood in
+    // the same deadlock and takes the same operation marker. The start that issued the
+    // credential names its write; the refresh that rotates it names none.
+    expect(calls).toEqual([
+      "https://agent.example/study-sets/library?user_id=synthetic-user&record_start_for=biology-midterm",
+      "https://agent.example/study-sets/library?user_id=synthetic-user&mint_resume_for=biology-midterm",
+    ]);
   });
 
   test("rotating refresh credential replay revokes the replacement and returns the coarse terminal", async () => {

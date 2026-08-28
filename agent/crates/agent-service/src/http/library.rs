@@ -42,6 +42,20 @@ pub(super) struct LibrarySnapshotQuery {
     /// [`crate::config::SessionMintAccess`]), and this field narrows the write that
     /// authority already permits to the single study set the mint is starting.
     record_start_for: Option<String>,
+    /// `A-38.2`: the resume-mint selector — the same operation, minus the write.
+    ///
+    /// A resume names a `voice_sessions` row that already exists, so it asks this
+    /// route for the signed token inside `actions.resume` and for nothing durable.
+    /// It cannot borrow [`Self::record_start_for`] to say so:
+    /// [`recorded_signed_start_action`] mints a fresh identifier before it writes, so
+    /// that selector would insert a *second* open session on every resume and move
+    /// `open_session_id` onto a session the learner never entered.
+    ///
+    /// Like its sibling it selects rather than authorizes — any caller can type it —
+    /// and like its sibling it names an operation the scoped session-mint credential
+    /// holds. What it buys is the start mint's admission minus the record gate, which
+    /// reads [`Self::record_start_for`] alone.
+    mint_resume_for: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -154,9 +168,10 @@ pub(super) async fn library_snapshot(
     // So the scoped credential authenticates the operation it exists for. Two
     // conditions make a request that operation, and both are load-bearing:
     //
-    // * it names the study set it is starting. A request presenting the credential
-    //   without naming a start is a plain library read, is not the operation this
-    //   credential is for, and falls through to the ordinary check that refuses it.
+    // * it names the study set it is starting — or, since `A-38.2`, resuming. A
+    //   request presenting the credential without naming either is a plain library
+    //   read, is not the operation this credential is for, and falls through to the
+    //   ordinary check that refuses it.
     // * it names the service's own `trusted_user_id`. Who a snapshot may be read for
     //   is a rule this route already had, and `A-34` does not touch it: a mint that
     //   named another learner would hand back their library *and* record an open
@@ -172,11 +187,26 @@ pub(super) async fn library_snapshot(
     // the write below (at most the one set it named) and the surfaces it never
     // reaches: `require_library_control_access` gates export and both deletes and
     // never consults it.
-    let mint_operation = query
-        .record_start_for
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    //
+    // `A-38.2`: two selectors name that operation, because the mint performs two.
+    //
+    // `record_start_for` is the start — a mint that also records. `mint_resume_for` is
+    // the resume — a mint that records nothing, because the row it hands a token for
+    // was committed by the start. Naming neither is a plain library read, which is the
+    // `A-34.2` pin above and is untouched. Naming BOTH names no single operation, and
+    // is refused rather than resolved in either direction: the fail-closed answer is
+    // the one that cannot smuggle a durable write into a resume.
+    //
+    // The resume admission is strictly less authority than the one `A-34.2` ratified:
+    // the same credential, the same trusted subject, the same whole-snapshot response,
+    // and no write at all — the record gate below reads `record_start_for` alone.
+    let start_selector = trimmed_selector(query.record_start_for.as_deref());
+    let resume_selector = trimmed_selector(query.mint_resume_for.as_deref());
+    let mint_operation = match (start_selector, resume_selector) {
+        (Some(_), Some(_)) => None,
+        (start, resume) => start.or(resume),
+    };
+    let names_a_mint_selector = start_selector.is_some() || resume_selector.is_some();
     let mint_authorized = mint_operation.is_some()
         && user_id == state.trusted_user_id
         && state
@@ -199,7 +229,10 @@ pub(super) async fn library_snapshot(
     //   asking for the mint's write authority, which this credential does not hold, so
     //   it is not this operation and falls through to the ordinary check that refuses
     //   it. `A-34.2`'s converse pin — the mint credential cannot plain-read — is
-    //   untouched: this compares against a different credential entirely.
+    //   untouched: this compares against a different credential entirely. `A-38.2`
+    //   reads the same way for the resume selector: a request naming a resume asks for
+    //   a `session_token`, which is exactly what `A-38.1` withholds from this
+    //   credential, so naming either selector puts a request outside this admission.
     // * it names the service's own `trusted_user_id`, the narrowing `A-36.2` ratified
     //   for the mint. The projection never reads for a subject its verified token does
     //   not name, so its mirror cannot read for a subject the query string names.
@@ -214,7 +247,7 @@ pub(super) async fn library_snapshot(
     // capability) consult neither scoped credential — so an admitted read is handed no
     // mutation token and no export. The fourth is `session_token`, and it needs the
     // explicit withholding below.
-    let library_read_authorized = mint_operation.is_none()
+    let library_read_authorized = !names_a_mint_selector
         && user_id == state.trusted_user_id
         && state
             .projection_read_access
@@ -274,7 +307,11 @@ pub(super) async fn library_snapshot(
     // is why it is read from that decision rather than recomputed. A caller admitted
     // as the mint records; every other caller — admitted by the REST bearer, by the
     // loopback trust, or by nothing at all — reads.
-    let record_start_for = mint_authorized.then_some(mint_operation).flatten();
+    //
+    // `A-38.2`: it reads the START selector specifically, not whichever operation was
+    // admitted. That is the whole difference between the two mint operations, and it
+    // is why the resume can be admitted without widening the write by one row.
+    let record_start_for = mint_authorized.then_some(start_selector).flatten();
     // `A-36.3` review fix: read-only has to mean read-only on the wire too.
     //
     // A start or resume action carries a `session_token`, and
@@ -795,6 +832,13 @@ pub(super) fn signed_library_control_token(state: &AppState, user_id: &str) -> O
         None,
     )
     .ok()
+}
+
+/// One reading for both mint selectors: whitespace is not a study-set id, and a
+/// blank query value is the shape deployment tooling produces for an unset one, so
+/// neither names an operation.
+fn trimmed_selector(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 pub(super) fn requested_library_user_id(query: &LibrarySnapshotQuery, state: &AppState) -> String {
