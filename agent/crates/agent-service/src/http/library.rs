@@ -142,25 +142,43 @@ pub(super) async fn library_snapshot(
     // `A-34`: the mint operation carries its own authority.
     //
     // A public bind sets `unauthenticated_paste_allowed` to false, so this route
-    // demands a credential — and the credential it demands is the deployment's REST
-    // bearer, which the session mint deliberately does not hold: the two are
-    // byte-distinct by configuration (`CredentialCollision` is startup-fatal). That
-    // left `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` required exactly where it could
-    // not be used, refusing the mint at this check before the record gate below saw
-    // it, and putting the projection back in the `A-32` deadlock.
+    // demands a credential — and the credential it demands is
+    // `VoiceWsAccess::required_bearer` (`VIVA_VOICE_WS_BEARER_TOKEN`, the WebSocket
+    // upgrade credential this route reuses to authenticate REST reads), which the
+    // session mint deliberately does not hold: the two are byte-distinct by
+    // configuration (`CredentialCollision` is startup-fatal). That left
+    // `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` required exactly where it could not be
+    // used, refusing the mint at this check before the record gate below saw it, and
+    // putting the projection back in the `A-32` deadlock.
     //
-    // So the scoped credential authenticates the operation it exists for, and only
-    // that operation: a request that both presents it and names the study set it is
-    // starting is the mint, and is admitted as the mint. A request presenting it
-    // without naming a start is a plain library read, is not the operation this
-    // credential is for, and falls through to the ordinary check that refuses it —
-    // the mint never becomes a second way to read, export, or delete the library.
+    // So the scoped credential authenticates the operation it exists for. Two
+    // conditions make a request that operation, and both are load-bearing:
+    //
+    // * it names the study set it is starting. A request presenting the credential
+    //   without naming a start is a plain library read, is not the operation this
+    //   credential is for, and falls through to the ordinary check that refuses it.
+    // * it names the service's own `trusted_user_id`. Who a snapshot may be read for
+    //   is a rule this route already had, and `A-34` does not touch it: a mint that
+    //   named another learner would hand back their library *and* record an open
+    //   session under their name, which is authority no deadlock fix needs. Every
+    //   cross-user request — mint credential or not — meets the same rule it met
+    //   before, on either bind shape.
+    //
+    // What is admitted is an operation, not a narrowed read: the mint's response is
+    // the whole snapshot for that one subject, because the signed start the caller
+    // came for is an action *inside* that snapshot. A selector naming a set that
+    // does not exist is still the mint operation, is still answered with the
+    // snapshot, and still writes nothing. The narrowing this credential does get is
+    // the write below (at most the one set it named) and the surfaces it never
+    // reaches: `require_library_control_access` gates export and both deletes and
+    // never consults it.
     let mint_operation = query
         .record_start_for
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let mint_authorized = mint_operation.is_some()
+        && user_id == state.trusted_user_id
         && state
             .session_mint_access
             .as_ref()

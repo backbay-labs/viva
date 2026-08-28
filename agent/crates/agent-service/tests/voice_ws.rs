@@ -5102,6 +5102,63 @@ fn public_bind_signed_start_state(
     ))
 }
 
+/// Seeds a second learner's study set, startable on every count the route checks:
+/// server-owned, ingestion `Ready`, one live source span, one active question.
+///
+/// `A-34.2` review fix: a set that *cannot* start would make the cross-user guard
+/// pass for the wrong reason — the route would refuse to mint because there is
+/// nothing to mint, not because the subject is not this credential's. Startable, a
+/// leak in the gate both answers `200` with another learner's library and records a
+/// durable session under their name, so the guard measures the gate itself.
+fn seed_other_learners_startable_set(store: &data::InMemoryStudyStore) {
+    // Source spans and documents are keyed by their own ids across the whole store,
+    // so this set carries its own: reusing the fixture's would reassign them to this
+    // set and quietly strip `biology-midterm` of the question that makes it start.
+    let source = StudySourceReference {
+        source_id: "src-user-2-slide-1".to_owned(),
+        document_id: "user-2-lec-1".to_owned(),
+        ..agent_domain::fixture_source_reference()
+    };
+    let question = StudyQuestion {
+        question_id: "q-user-2-private".to_owned(),
+        source: source.clone(),
+        ..agent_domain::fixture_question()
+    };
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        user_id: OTHER_LEARNER.to_owned(),
+        title: "Private User 2 Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![question.concept_id.clone()],
+        question_ids: vec![question.question_id.clone()],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        document_id: source.document_id.clone(),
+        title: "User 2 Lecture 1".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: false,
+    });
+    store.upsert_source_span(data::SourceSpanRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        source,
+        tombstoned: false,
+    });
+    store.upsert_question(data::StudyQuestionRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        question,
+        active: true,
+    });
+}
+
+/// The subject the session mint may never name: a learner who is not the service's
+/// configured `trusted_user_id`.
+const OTHER_LEARNER: &str = "user-2";
+const OTHER_LEARNER_STUDY_SET: &str = "private-user-2-set";
+
 /// Reads the library snapshot exactly as a caller does. `record_start_for` is the
 /// explicit start-mint selector: `None` is a plain listing read, `Some(id)` is the
 /// request `POST /api/viva-session/start` makes for the one set it is starting.
@@ -5141,11 +5198,24 @@ async fn library_snapshot_response(
     record_start_for: Option<&str>,
     bearer: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
+    library_snapshot_response_for_user(app, "user-1", record_start_for, bearer).await
+}
+
+/// The same read naming an arbitrary subject. `user_id` is a request parameter, not
+/// a claim, so which subject a credential may name is its own measurement: the
+/// `A-34.2` review fix is that the session mint may name the trusted user and no
+/// other, on either bind shape.
+async fn library_snapshot_response_for_user(
+    app: &axum::Router,
+    user_id: &str,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let uri = match record_start_for {
         Some(study_set_id) => {
-            format!("/study-sets/library?user_id=user-1&record_start_for={study_set_id}")
+            format!("/study-sets/library?user_id={user_id}&record_start_for={study_set_id}")
         }
-        None => "/study-sets/library?user_id=user-1".to_owned(),
+        None => format!("/study-sets/library?user_id={user_id}"),
     };
     let mut request = Request::builder()
         .method("GET")
@@ -5734,16 +5804,22 @@ async fn a_public_bind_signed_start_records_the_voice_session_its_projection_req
     assert_eq!(projection["session"]["mode"], "quiz");
 }
 
-/// `A-34.2`: mint authority is not library-read authority.
+/// `A-34.2`: the mint credential authenticates the mint operation, so a request
+/// that is not that operation gets nothing from it.
 ///
-/// The route admits the session-mint credential for the operation it is the
-/// credential *for*. A snapshot that names no start is a plain library read, and on
-/// a public bind that read belongs to the deployment's own REST credential — never
-/// to the mint. The identical request, minus the mint operation, is refused, and
-/// the export surface stays closed to it too, so the scope granted here is the mint
-/// and nothing wider.
+/// Naming no start makes the request a plain library read, and on a public bind that
+/// read belongs to the deployment's own upgrade bearer — never to the mint. The
+/// identical request, minus the mint operation, is refused; the export surface, which
+/// never consults this credential at all, stays closed to it too.
+///
+/// `A-34.2` review fix — what this test does *not* claim: it does not say the mint
+/// credential is unable to read. Once the operation *is* named the response is the
+/// whole snapshot, deliberately, and
+/// [`the_mint_operation_is_answered_with_the_whole_snapshot_and_writes_only_the_named_set`]
+/// pins that. The property here is the narrower and true one: no mint operation, no
+/// admission.
 #[tokio::test]
-async fn the_session_mint_credential_is_not_library_read_authority() {
+async fn the_session_mint_credential_is_refused_without_the_mint_operation() {
     let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
     let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
     let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
@@ -5753,7 +5829,7 @@ async fn the_session_mint_credential_is_not_library_read_authority() {
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "the mint credential must not read the library: {body}"
+        "the mint credential must not be admitted for a request that is not the mint: {body}"
     );
     assert_eq!(body["error"], "library_snapshot_auth_failed");
     assert!(
@@ -5791,6 +5867,60 @@ async fn the_session_mint_credential_is_not_library_read_authority() {
     assert!(
         inner.snapshot().sessions.is_empty(),
         "a refused read left a durable session behind",
+    );
+}
+
+/// `A-34.2` review fix: what the admitted mint actually gets, stated plainly.
+///
+/// The admission is authentication of an *operation*, not a read narrowed to the set
+/// the caller named — the signed start it came for is an action inside the snapshot,
+/// so the snapshot is the response. Two consequences follow that no other test pinned,
+/// and a name like "the mint is not library-read authority" quietly denied:
+///
+/// * a selector matching nothing is still the mint operation. It is admitted, it is
+///   answered with the full snapshot, and it writes nothing.
+/// * the trusted user's other sets come back complete, signed start actions included.
+///   A signed start is not a durable session: the record gate below the admission is
+///   what the mint buys, and it fires for the one named set or for none at all.
+///
+/// A future change that narrows the response, or that treats an unmatched selector as
+/// a refusal, is welcome to — but it will change this test, not slip past it.
+#[tokio::test]
+async fn the_mint_operation_is_answered_with_the_whole_snapshot_and_writes_only_the_named_set() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("no-such-study-set"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a selector matching nothing is still the mint operation: {payload}"
+    );
+    assert!(
+        payload["privacy"].is_object() && payload["sessions"].is_array(),
+        "the mint is answered with the whole snapshot, not a narrowed view: {payload}"
+    );
+    let biology = library_study_set(&payload, "biology-midterm");
+    assert_eq!(biology["question_count"], 1);
+    assert_eq!(
+        biology["actions"]["start"]["available"], true,
+        "the snapshot signs its start actions whether or not one is recorded: {biology}"
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "a selector matching nothing recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a selector matching nothing left a durable session behind",
     );
 }
 
@@ -5885,6 +6015,119 @@ async fn public_bind_start_projection_and_socket_complete_the_entry_flow() {
 
     socket.close(None).await.unwrap();
     let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// `A-34.2` review fix: the mint names the trusted user, and no other.
+///
+/// The route states its own cross-user rule — "cross-user library snapshots require
+/// authenticated REST access" — and that rule predates the session mint entirely.
+/// `A-34.2` orders one new admission: the mint operation, on a bind that would
+/// otherwise refuse it. It orders no relaxation of who that operation may name, so
+/// the mint credential must leave the cross-user rule exactly where it found it, on
+/// both bind shapes:
+///
+/// * loopback, where an unauthenticated cross-user read is already `403`;
+/// * public, where every read must present the deployment's upgrade bearer.
+///
+/// The set named here is startable, so a gate that admitted this request would not
+/// merely leak another learner's library — it would open and durably record a voice
+/// session under their name, which is why the store is asserted empty too.
+#[tokio::test]
+async fn the_session_mint_credential_is_not_cross_user_authority() {
+    for (shape, build, expected_status, expected_error) in [
+        (
+            "loopback",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::FORBIDDEN,
+            "library_snapshot_auth_required",
+        ),
+        (
+            "public bind",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                public_bind_signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::UNAUTHORIZED,
+            "library_snapshot_auth_failed",
+        ),
+    ] {
+        let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        seed_other_learners_startable_set(&inner);
+        let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+        let app = build_router(build(store.clone(), inner.clone()));
+
+        let (status, body) = library_snapshot_response_for_user(
+            &app,
+            OTHER_LEARNER,
+            Some(OTHER_LEARNER_STUDY_SET),
+            Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "the mint credential must not name another learner on the {shape} bind: {body}"
+        );
+        assert_eq!(body["error"], expected_error, "on the {shape} bind");
+        assert!(
+            body.get("study_sets").is_none(),
+            "the refusal must not carry another learner's library on the {shape} bind: {body}"
+        );
+
+        assert!(
+            store.writes().is_empty(),
+            "the {shape} bind recorded a cross-user session: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "the {shape} bind left a durable cross-user session behind",
+        );
+    }
+}
+
+/// `A-34.2` review fix, the other side of the cross-user guard: the credential that
+/// *is* entitled to read another learner's library reads it, and still does not mint.
+///
+/// This is also what gives the guard above its force. It proves the seeded set is
+/// startable — a set the route would refuse to start anyway would make that guard
+/// pass for the wrong reason — and it proves the deadlock fix did not turn the
+/// deployment's upgrade bearer into a write authority: the record gate answers to
+/// the session-mint credential alone, whoever else the route admits.
+#[tokio::test]
+async fn the_upgrade_bearer_reads_another_learners_library_and_still_does_not_mint() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_other_learners_startable_set(&inner);
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response_for_user(
+        &app,
+        OTHER_LEARNER,
+        Some(OTHER_LEARNER_STUDY_SET),
+        Some(FIXTURE_WS_UPGRADE_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the deployment's own bearer reads any subject: {payload}"
+    );
+    let start = library_study_set(&payload, OTHER_LEARNER_STUDY_SET)["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the seeded cross-user set must be startable, or the guard above proves nothing: {start}"
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "the upgrade bearer minted a session it has no authority to record: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the upgrade bearer left a durable session behind",
+    );
 }
 
 /// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard
