@@ -1339,6 +1339,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*env_value\("VIVA_AGENT_OPERATOR_BEARER_TOKEN"\)\.map\(RedactedSecret::from\),\s*$/,
       /^\s*env_value\("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN"\)\.map\(RedactedSecret::from\);\s*$/,
       /^\s*env_value\("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN"\)\.map\(RedactedSecret::from\);\s*$/,
+      // A-34.3: the session-mint credential parse restored to the sibling RedactedSecret spelling.
+      /^\s*env_value\("VIVA_AGENT_SESSION_MINT_BEARER_TOKEN"\)\.map\(RedactedSecret::from\);\s*$/,
       /^\s*verify_session_token_at\(token,\ \&RedactedSecret::from\(secret\),\ now,\ None\)\s*$/,
     ]),
   },
@@ -1536,7 +1538,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "agent/crates/agent-service/src/lib.rs",
     marker: "redacted_secret",
     patterns: Object.freeze([
-      /^\s*RecorderLimits,\ RedactedSecret,\ ServiceConfig,\ ServiceConfigError,\ SessionTokenClaims,\s*$/,
+      // A-34.3: the grouped re-export re-wrapped when SessionMintAccess folded back in.
+      /^\s*RecorderLimits,\ RedactedSecret,\ ServiceConfig,\ ServiceConfigError,\ SessionMintAccess,\s*$/,
     ]),
   },
   {

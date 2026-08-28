@@ -25,7 +25,7 @@ use crate::{
     config::{
         bac_510_max_turn_duration, FailureControlClaim, FailureControlClaimRequest,
         FailureControlConfig, OperatorAccess, ProjectionReadAccess, RecorderLimits,
-        SessionTokenClaims, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
+        SessionMintAccess, SessionTokenClaims, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
     },
     ws::{
         admission::{VoiceDrainSignal, VoiceLimitState, VoiceRuntimeSnapshot, VoiceRuntimeTracker},
@@ -48,6 +48,10 @@ pub struct AppState {
     /// session-token secret are both configured. Absent means the route refuses
     /// every request rather than falling back to a broader credential.
     pub projection_read_access: Option<ProjectionReadAccess>,
+    /// `A-32`: the scoped credential the server-side session mint presents, and the
+    /// only authority that may turn a library snapshot read into a durable
+    /// `voice_sessions` row. Absent means no request records a start.
+    pub session_mint_access: Option<SessionMintAccess>,
     pub trusted_proxies: TrustedProxyConfig,
     pub session_slots: Arc<Semaphore>,
     /// The configured global session capacity `session_slots` was built with.
@@ -102,6 +106,7 @@ impl AppState {
             ws_access,
             operator_access: OperatorAccess::default(),
             projection_read_access: None,
+            session_mint_access: None,
             trusted_proxies: TrustedProxyConfig::default(),
             session_slots: Arc::new(Semaphore::new(max_sessions)),
             max_sessions,
@@ -152,6 +157,11 @@ impl AppState {
         projection_read_access: ProjectionReadAccess,
     ) -> Self {
         self.projection_read_access = Some(projection_read_access);
+        self
+    }
+
+    pub fn with_session_mint_access(mut self, session_mint_access: SessionMintAccess) -> Self {
+        self.session_mint_access = Some(session_mint_access);
         self
     }
 

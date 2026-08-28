@@ -2482,7 +2482,14 @@ async function mintSessionFromLibrary(input: {
     };
   }
 
-  const upstream = agentLibraryUrl(agentBaseUrl, input.userId);
+  const upstream = agentLibraryUrl(agentBaseUrl, input.userId, {
+    // `A-32`: a start mint asks the agent to record the session it is about to hand
+    // the browser, for the one study set it is starting — that durable row is what
+    // the projection requires before the socket may open. A resume names a session
+    // that already exists, so it asks for no write, and no other reader of the
+    // library snapshot sends this selector at all.
+    recordStartForStudySetId: input.actionName === "start" ? input.studySetId : undefined,
+  });
   if (!upstream) {
     return {
       ok: false,
@@ -3780,10 +3787,19 @@ function sessionIdFromAction(value: unknown): string | null {
   return isRecord(value) ? requiredString(value.session_id) : null;
 }
 
-function agentLibraryUrl(agentBaseUrl: string, userId: string): URL | null {
+function agentLibraryUrl(
+  agentBaseUrl: string,
+  userId: string,
+  options: { recordStartForStudySetId?: string } = {},
+): URL | null {
   try {
     const url = new URL(`${trimTrailingSlash(agentBaseUrl)}/study-sets/library`);
     url.searchParams.set("user_id", userId);
+    // `A-32`: the agent records a `voice_sessions` row only for the study set this
+    // names, and only because this is the mint. Omitted, the snapshot is a read.
+    if (options.recordStartForStudySetId) {
+      url.searchParams.set("record_start_for", options.recordStartForStudySetId);
+    }
     return url;
   } catch {
     return null;

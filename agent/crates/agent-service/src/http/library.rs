@@ -5,8 +5,8 @@
 //! changed; only the file the code lives in and the visibility the move forces.
 
 use agent_domain::{
-    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary,
-    StudySetIngestionStatus,
+    LibrarySessionSummary, LibraryStudyDocumentSummary, LibraryStudySetSummary, SessionConfig,
+    SessionId, StudyMode, StudySetIngestionStatus, StudyStoreWriteOutcome,
 };
 use axum::{
     extract::{rejection::QueryRejection, Path, Query},
@@ -28,6 +28,20 @@ use crate::http::ingestion::store_json_error;
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct LibrarySnapshotQuery {
     user_id: Option<String>,
+    /// `A-32`: the start-mint selector. The library snapshot is a listing, and a
+    /// listing is a read — every start action it returns is signed, but only the
+    /// one study set this names has its session recorded durably. Absent (the
+    /// landing render, the panel refresh, the read-scoped proxy) the route writes
+    /// nothing at all, so repeating it cannot accumulate open sessions or invent a
+    /// session to resume. Present, it is `POST /api/viva-session/start` asking for
+    /// the one session it is about to hand the browser.
+    ///
+    /// It selects; it does not authorize. Any caller can type it — the browser
+    /// proxy copies a request's query string upstream verbatim — so the durable
+    /// write is gated on the scoped session-mint credential the mint presents (see
+    /// [`crate::config::SessionMintAccess`]), and this field narrows the write that
+    /// authority already permits to the single study set the mint is starting.
+    record_start_for: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,7 +139,53 @@ pub(super) async fn library_snapshot(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(&state.trusted_user_id);
-    if !state.unauthenticated_paste_allowed || user_id != state.trusted_user_id {
+    // `A-34`: the mint operation carries its own authority.
+    //
+    // A public bind sets `unauthenticated_paste_allowed` to false, so this route
+    // demands a credential — and the credential it demands is
+    // `VoiceWsAccess::required_bearer` (`VIVA_VOICE_WS_BEARER_TOKEN`, the WebSocket
+    // upgrade credential this route reuses to authenticate REST reads), which the
+    // session mint deliberately does not hold: the two are byte-distinct by
+    // configuration (`CredentialCollision` is startup-fatal). That left
+    // `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` required exactly where it could not be
+    // used, refusing the mint at this check before the record gate below saw it, and
+    // putting the projection back in the `A-32` deadlock.
+    //
+    // So the scoped credential authenticates the operation it exists for. Two
+    // conditions make a request that operation, and both are load-bearing:
+    //
+    // * it names the study set it is starting. A request presenting the credential
+    //   without naming a start is a plain library read, is not the operation this
+    //   credential is for, and falls through to the ordinary check that refuses it.
+    // * it names the service's own `trusted_user_id`. Who a snapshot may be read for
+    //   is a rule this route already had, and `A-34` does not touch it: a mint that
+    //   named another learner would hand back their library *and* record an open
+    //   session under their name, which is authority no deadlock fix needs. Every
+    //   cross-user request — mint credential or not — meets the same rule it met
+    //   before, on either bind shape.
+    //
+    // What is admitted is an operation, not a narrowed read: the mint's response is
+    // the whole snapshot for that one subject, because the signed start the caller
+    // came for is an action *inside* that snapshot. A selector naming a set that
+    // does not exist is still the mint operation, is still answered with the
+    // snapshot, and still writes nothing. The narrowing this credential does get is
+    // the write below (at most the one set it named) and the surfaces it never
+    // reaches: `require_library_control_access` gates export and both deletes and
+    // never consults it.
+    let mint_operation = query
+        .record_start_for
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mint_authorized = mint_operation.is_some()
+        && user_id == state.trusted_user_id
+        && state
+            .session_mint_access
+            .as_ref()
+            .is_some_and(|access| access.authorizes(&headers));
+    if !mint_authorized
+        && (!state.unauthenticated_paste_allowed || user_id != state.trusted_user_id)
+    {
         if state.ws_access.required_bearer.is_none() {
             return (
                 StatusCode::FORBIDDEN,
@@ -161,71 +221,90 @@ pub(super) async fn library_snapshot(
         }
     };
     let request_origin = request_origin(&headers).map(ToOwned::to_owned);
-    let study_sets = snapshot
-        .study_sets
-        .into_iter()
-        .map(|study_set| {
-            let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
-            let unavailable_reason = study_set_start_unavailable_reason(&study_set);
-            let start = match unavailable_reason {
-                Some(reason) => unavailable_action(reason),
-                None => {
-                    let session_id = Uuid::new_v4().to_string();
-                    signed_library_action(
-                        &state,
-                        &study_set.user_id,
-                        &study_set.id,
-                        session_id,
-                        request_origin.as_deref(),
-                    )
-                }
-            };
-            let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
-                (Some(reason), _) => unavailable_action(reason),
-                (None, Some(session_id)) => signed_library_action(
+    // `A-32`: at most one study set per request may record a start, and only the one
+    // the caller named. Everything else this route does is a read.
+    //
+    // The selector is a request, never a permission. It is honored only for a caller
+    // presenting the scoped session-mint credential — the credential
+    // `POST /api/viva-session/start` presents and the browser's read-scoped proxy
+    // does not hold — so a query string copied upstream from a browser, on a public
+    // bind or a loopback one, cannot open a durable session however it is written.
+    // An unauthorized selector is ignored, not refused: the snapshot is still a
+    // snapshot, and its start actions are still signed.
+    //
+    // `A-34`: this is the same decision the authentication above already made, which
+    // is why it is read from that decision rather than recomputed. A caller admitted
+    // as the mint records; every other caller — admitted by the REST bearer, by the
+    // loopback trust, or by nothing at all — reads.
+    let record_start_for = mint_authorized.then_some(mint_operation).flatten();
+    let mut study_sets = Vec::with_capacity(snapshot.study_sets.len());
+    for study_set in snapshot.study_sets {
+        let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
+        let unavailable_reason = study_set_start_unavailable_reason(&study_set);
+        let start = match unavailable_reason {
+            Some(reason) => unavailable_action(reason),
+            None if record_start_for == Some(study_set.id.as_str()) => {
+                recorded_signed_start_action(
                     &state,
                     &study_set.user_id,
                     &study_set.id,
-                    session_id,
                     request_origin.as_deref(),
-                ),
-                (None, None) => unavailable_action("no_open_session"),
-            };
-            let mutation_auth_unavailable_reason =
-                library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
-            let delete = if let Some(reason) = mutation_auth_unavailable_reason {
-                unavailable_action(reason)
-            } else if mutation_control_token.is_none() {
-                unavailable_action("control_token_unavailable")
-            } else if study_set.server_owned
-                && !study_set.documents.is_empty()
-                && study_set.documents.iter().any(|document| !document.deleted)
-            {
-                available_mutation_action(mutation_control_token.clone())
-            } else {
-                unavailable_action(unavailable_reason.unwrap_or("source_deleted"))
-            };
-
-            LibraryStudySetResponse {
-                id: study_set.id,
-                user_id: study_set.user_id,
-                title: study_set.title,
-                course: study_set.course,
-                ingestion_status: study_set.ingestion_status,
-                ingestion_error: study_set.ingestion_error,
-                server_owned: study_set.server_owned,
-                documents: study_set.documents,
-                concept_count: study_set.concept_count,
-                question_count: study_set.question_count,
-                actions: LibraryStudySetActions {
-                    start,
-                    resume,
-                    archive: unavailable_action("server_mutation_unavailable"),
-                    delete,
-                },
+                )
+                .await
             }
-        })
-        .collect::<Vec<_>>();
+            None => signed_library_action(
+                &state,
+                &study_set.user_id,
+                &study_set.id,
+                Uuid::new_v4().to_string(),
+                request_origin.as_deref(),
+            ),
+        };
+        let resume = match (unavailable_reason, study_set.open_session_id.clone()) {
+            (Some(reason), _) => unavailable_action(reason),
+            (None, Some(session_id)) => signed_library_action(
+                &state,
+                &study_set.user_id,
+                &study_set.id,
+                session_id,
+                request_origin.as_deref(),
+            ),
+            (None, None) => unavailable_action("no_open_session"),
+        };
+        let mutation_auth_unavailable_reason =
+            library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
+        let delete = if let Some(reason) = mutation_auth_unavailable_reason {
+            unavailable_action(reason)
+        } else if mutation_control_token.is_none() {
+            unavailable_action("control_token_unavailable")
+        } else if study_set.server_owned
+            && !study_set.documents.is_empty()
+            && study_set.documents.iter().any(|document| !document.deleted)
+        {
+            available_mutation_action(mutation_control_token.clone())
+        } else {
+            unavailable_action(unavailable_reason.unwrap_or("source_deleted"))
+        };
+
+        study_sets.push(LibraryStudySetResponse {
+            id: study_set.id,
+            user_id: study_set.user_id,
+            title: study_set.title,
+            course: study_set.course,
+            ingestion_status: study_set.ingestion_status,
+            ingestion_error: study_set.ingestion_error,
+            server_owned: study_set.server_owned,
+            documents: study_set.documents,
+            concept_count: study_set.concept_count,
+            question_count: study_set.question_count,
+            actions: LibraryStudySetActions {
+                start,
+                resume,
+                archive: unavailable_action("server_mutation_unavailable"),
+                delete,
+            },
+        });
+    }
 
     (
         StatusCode::OK,
@@ -519,6 +598,62 @@ pub(super) fn available_mutation_action(control_token: Option<String>) -> Librar
         session_token: None,
         control_token,
         unavailable_reason: None,
+    }
+}
+
+/// `A-32`: a started session IS a session.
+///
+/// The signed start mints a session id and, in the same step, records the
+/// `voice_sessions` row `authenticated_study_projection` requires — under the
+/// exact identity (`user_id`, `study_set_id`, `session_id`, `D-03B` quiz mode) the
+/// socket's own provisioning claims later. The projection therefore validates
+/// before any socket exists, which is what the browser's `connectionEligible`
+/// gate waits for; the socket's own `record_voice_session` is then an idempotent
+/// replay of this row, never a second session.
+///
+/// Reached only for a caller holding the scoped session-mint credential, and then
+/// only for the single study set its `record_start_for` selector names, so this is
+/// the mint and not the listing: every other library read signs its start actions
+/// through `signed_library_action` and writes nothing. Recording on every read
+/// would open one permanently-open session per startable set per page render and
+/// would flip `resume` onto a session the learner never entered.
+///
+/// Fail closed in both directions: no row is written unless a credential could
+/// actually be minted for it, and no credential is returned unless its row
+/// committed. A store that cannot record the session reports the start
+/// unavailable rather than handing out a credential whose projection can never
+/// validate.
+pub(super) async fn recorded_signed_start_action(
+    state: &AppState,
+    user_id: &str,
+    study_set_id: &str,
+    origin: Option<&str>,
+) -> LibraryAction {
+    let session_id = Uuid::new_v4().to_string();
+    let action = signed_library_action(state, user_id, study_set_id, session_id.clone(), origin);
+    if !action.available {
+        return action;
+    }
+    let recorded = state
+        .study_store
+        .record_voice_session(&SessionConfig {
+            session_id: Some(SessionId::new(session_id)),
+            user_id: Some(user_id.to_owned()),
+            study_set_id: Some(study_set_id.to_owned()),
+            // `D-03B QUIZ_ONLY`: the only mode this service starts, and the mode a
+            // later `session_config` is sanitized to, so the socket's replay
+            // matches this row instead of conflicting with it.
+            mode: Some(StudyMode::Quiz),
+            ..SessionConfig::default()
+        })
+        .await;
+    match recorded {
+        // A fresh v4 identifier can only insert; the replay arm is named because
+        // the outcome is the vocabulary this write speaks, not a value to discard.
+        Ok(StudyStoreWriteOutcome::Inserted | StudyStoreWriteOutcome::IdempotentReplay) => action,
+        // The store's own diagnostic never reaches the browser: the action carries
+        // one fixed reason, exactly like every other unavailable start.
+        Err(_) => unavailable_action("session_record_unavailable"),
     }
 }
 

@@ -17,16 +17,16 @@ use agent_domain::{
     RealtimeBrainCapabilities, RealtimeSession, RealtimeSessionTaskGuard, ReviewOutcomeV1,
     ReviewSchedulingContextV1, SessionConfig, SessionId, SessionTokenNonceClaim, StudyMemoryStore,
     StudyMode, StudyQuestion, StudySessionRecap, StudySetIngestionStatus, StudySourceReference,
-    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, TerminalSessionReason,
-    VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
+    StudyStoreBackend, StudyStoreCapabilities, StudyStoreWriteCounts, StudyStoreWriteOutcome,
+    TerminalSessionReason, VoiceUsageRecord, VIVA_REVIEW_SCHEDULE_SCHEMA_VERSION,
 };
 use agent_service::{
     begin_drain_and_wait, build_router, verify_session_token_at, AppState, ClientFrame,
     ClientTurnIntent, DrainOutcome, ExpectedSessionBinding, FailureControlConfig,
     FailureControlScenario, OperatorAccess, ProjectionReadAccess, RecorderLimits, RedactedSecret,
-    ServerFrame, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder, VoiceLimitConfig,
-    VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder, VoiceWsAccess, WsTimeouts,
-    VIVA_VOICE_PROTOCOL_VERSION,
+    ServerFrame, SessionMintAccess, VivaServerEvent, VoiceDrainSignal, VoiceEvidenceRecorder,
+    VoiceLimitConfig, VoiceRuntimeSnapshot, VoiceServerErrorCode, VoiceUsageRecorder,
+    VoiceWsAccess, WsTimeouts, VIVA_VOICE_PROTOCOL_VERSION,
 };
 use axum::{
     body::Body,
@@ -545,6 +545,16 @@ async fn ready_and_brain_health_routes_report_configured_synthetic_provider() {
 /// nothing outside this test binary.
 const FIXTURE_OPERATOR_CREDENTIAL: &str = "viva-fixture-operator-credential-0001";
 const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
+/// `A-32` review fix: the scoped credential `POST /api/viva-session/start` presents
+/// (`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`). It is byte-distinct from the read
+/// credential the browser proxy presents, which is the entire point.
+const FIXTURE_SESSION_MINT_CREDENTIAL: &str = "viva-fixture-session-mint-cred-000001";
+/// `A-34.2`: the WebSocket upgrade credential a non-loopback deployment configures
+/// (`VIVA_VOICE_WS_BEARER_TOKEN`). It is the credential `library_snapshot`'s own
+/// bearer check compares against, and `CredentialCollision` makes it byte-distinct
+/// from the session-mint credential at startup — which is why the mint could not
+/// satisfy that check.
+const FIXTURE_WS_UPGRADE_CREDENTIAL: &str = "viva-fixture-websocket-upgrade-cred-1";
 
 /// A public deployment under `D-07 TOKEN_ONLY_REFRESH`: there is no WebSocket
 /// bearer at all, so the absent-permissive WebSocket bearer check would leave
@@ -4469,6 +4479,1655 @@ async fn authenticated_projection_sanitizes_store_failures() {
             "the caller learns only this route's coarse code"
         );
     }
+}
+
+const STARTED_SESSION_SECRET: &str = "viva-fixture-started-session-secret1";
+const STARTED_SESSION_ORIGIN: &str = "http://localhost:3000";
+
+/// Logs every `record_voice_session` the service performs, with the outcome the
+/// store answered, so the write order and the exact `StudyStoreWriteOutcome`
+/// vocabulary can be asserted at the service boundary rather than inferred.
+struct StartedSessionAuditStore {
+    inner: Arc<data::InMemoryStudyStore>,
+    writes: Mutex<Vec<(String, Result<StudyStoreWriteOutcome, String>)>>,
+}
+
+impl StartedSessionAuditStore {
+    fn new(inner: Arc<data::InMemoryStudyStore>) -> Self {
+        Self {
+            inner,
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn writes(&self) -> Vec<(String, Result<StudyStoreWriteOutcome, String>)> {
+        self.writes.lock().expect("write log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for StartedSessionAuditStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    /// The one intercepted call: the outcome is logged and then returned unchanged.
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        let outcome = self.inner.record_voice_session(config).await;
+        self.writes.lock().expect("write log").push((
+            config
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            outcome
+                .as_ref()
+                .copied()
+                .map_err(|error| error.kind().as_str().to_owned()),
+        ));
+        outcome
+    }
+
+    async fn pending_answer_attempts_for_session(
+        &self,
+        voice_session_id: &str,
+    ) -> Result<usize, PortError> {
+        self.inner
+            .pending_answer_attempts_for_session(voice_session_id)
+            .await
+    }
+
+    async fn study_session_durable_counts(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::StudySessionDurableCounts, PortError> {
+        self.inner
+            .study_session_durable_counts(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn answer_attempt_was_recorded(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+    ) -> Result<bool, PortError> {
+        self.inner
+            .answer_attempt_was_recorded(user_id, study_set_id, voice_session_id, response_id)
+            .await
+    }
+
+    async fn claim_session_token_nonce(
+        &self,
+        claim: SessionTokenNonceClaim,
+    ) -> Result<(), PortError> {
+        self.inner.claim_session_token_nonce(claim).await
+    }
+
+    async fn close_voice_session(
+        &self,
+        voice_session_id: &str,
+        terminal_reason: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .close_voice_session(voice_session_id, terminal_reason)
+            .await
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn library_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<agent_domain::StudyLibrarySnapshot, PortError> {
+        self.inner.library_snapshot(user_id).await
+    }
+
+    async fn delete_study_set(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner.delete_study_set(user_id, study_set_id).await
+    }
+
+    async fn delete_session_history(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .delete_session_history(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn active_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<StudyQuestion>, PortError> {
+        self.inner.active_question(user_id, study_set_id).await
+    }
+
+    async fn authorize_question_started(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        question: &StudyQuestion,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_question_started(user_id, study_set_id, voice_session_id, question)
+            .await
+    }
+
+    async fn authorize_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: &AnswerEvaluation,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn authorize_source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        source: &StudySourceReference,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_source_reference(user_id, study_set_id, voice_session_id, source)
+            .await
+    }
+
+    async fn authorize_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: &ConceptStatus,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn authorize_manuscript_intent(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        intent: &agent_domain::ManuscriptIntent,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_manuscript_intent(user_id, study_set_id, voice_session_id, intent)
+            .await
+    }
+
+    async fn authorize_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: &StudySessionRecap,
+    ) -> Result<(), PortError> {
+        self.inner
+            .authorize_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_answer_attempt_envelope(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        envelope: AnswerAttemptEnvelope,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_attempt_envelope(user_id, study_set_id, voice_session_id, envelope)
+            .await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn review_scheduling_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        concept_id: &str,
+    ) -> Result<ReviewSchedulingContextV1, PortError> {
+        self.inner
+            .review_scheduling_context(user_id, study_set_id, concept_id)
+            .await
+    }
+
+    async fn persist_review_schedule_decision(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        decision: agent_domain::ReviewScheduleDecisionV1,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .persist_review_schedule_decision(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                decision,
+            )
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+
+    async fn record_voice_usage(
+        &self,
+        event: VoiceUsageRecord,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        self.inner.record_voice_usage(event).await
+    }
+
+    async fn record_turn_outcome(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        outcome: agent_domain::TurnOutcome,
+    ) -> Result<agent_domain::PersistedTurnOutcome, PortError> {
+        self.inner
+            .record_turn_outcome(user_id, study_set_id, voice_session_id, outcome)
+            .await
+    }
+
+    async fn session_learning_evidence(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::SessionLearningEvidence, PortError> {
+        self.inner
+            .session_learning_evidence(user_id, study_set_id, voice_session_id)
+            .await
+    }
+
+    async fn record_challenge_resolution(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        resolution: agent_domain::ChallengeResolution,
+    ) -> Result<agent_domain::ChallengeResolution, PortError> {
+        self.inner
+            .record_challenge_resolution(user_id, study_set_id, voice_session_id, resolution)
+            .await
+    }
+
+    async fn select_next_question(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        policy: agent_domain::ProgressionPolicyId,
+    ) -> Result<agent_domain::QuestionProgressionResult, PortError> {
+        self.inner
+            .select_next_question(user_id, study_set_id, voice_session_id, response_id, policy)
+            .await
+    }
+
+    async fn authenticated_study_projection(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+    ) -> Result<agent_domain::AuthenticatedStudyProjectionV1, PortError> {
+        self.inner
+            .authenticated_study_projection(user_id, study_set_id, voice_session_id)
+            .await
+    }
+}
+
+/// A store whose library snapshot answers but whose voice-session write cannot
+/// commit — the fail-closed case for the start mint.
+struct RefusingVoiceSessionStore {
+    inner: Arc<data::InMemoryStudyStore>,
+}
+
+#[async_trait::async_trait]
+impl StudyMemoryStore for RefusingVoiceSessionStore {
+    fn capabilities(&self) -> StudyStoreCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn write_counts(&self) -> StudyStoreWriteCounts {
+        self.inner.write_counts()
+    }
+
+    async fn record_voice_session(
+        &self,
+        config: &SessionConfig,
+    ) -> Result<StudyStoreWriteOutcome, PortError> {
+        Err(PortError::durability(
+            "memory",
+            config
+                .session_id
+                .as_ref()
+                .map_or("unknown", |session_id| session_id.as_str()),
+            "voice session write refused by the harness",
+        ))
+    }
+
+    async fn study_context(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+    ) -> Result<Option<serde_json::Value>, PortError> {
+        self.inner.study_context(user_id, study_set_id).await
+    }
+
+    async fn library_snapshot(
+        &self,
+        user_id: &str,
+    ) -> Result<agent_domain::StudyLibrarySnapshot, PortError> {
+        self.inner.library_snapshot(user_id).await
+    }
+
+    async fn record_answer_evaluation(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        evaluation: AnswerEvaluation,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_answer_evaluation(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                evaluation,
+            )
+            .await
+    }
+
+    async fn source_reference(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        source_id: &str,
+    ) -> Result<Option<StudySourceReference>, PortError> {
+        self.inner
+            .source_reference(user_id, study_set_id, source_id)
+            .await
+    }
+
+    async fn record_concept_status(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        concept_id: &str,
+        status: ConceptStatus,
+    ) -> Result<ConceptStatus, PortError> {
+        self.inner
+            .record_concept_status(
+                user_id,
+                study_set_id,
+                voice_session_id,
+                response_id,
+                concept_id,
+                status,
+            )
+            .await
+    }
+
+    async fn schedule_review_item(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        concept_id: &str,
+        due_at: &str,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .schedule_review_item(user_id, study_set_id, voice_session_id, concept_id, due_at)
+            .await
+    }
+
+    async fn record_recap(
+        &self,
+        user_id: &str,
+        study_set_id: &str,
+        voice_session_id: &str,
+        response_id: &str,
+        recap: StudySessionRecap,
+    ) -> Result<serde_json::Value, PortError> {
+        self.inner
+            .record_recap(user_id, study_set_id, voice_session_id, response_id, recap)
+            .await
+    }
+}
+
+/// The deployment shape `main.rs` builds for a public signed-start service: the
+/// session-token secret mints the start credential, the scoped library-read
+/// credential plus that same secret construct the projection route, and the scoped
+/// session-mint credential is the one authority allowed to record a started
+/// session.
+fn signed_start_state(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    signed_start_state_without_session_mint_authority(store, brain_store).with_session_mint_access(
+        SessionMintAccess::new(FIXTURE_SESSION_MINT_CREDENTIAL.into()),
+    )
+}
+
+/// The same deployment with no session-mint credential configured at all. `A-32`
+/// review fix: such a deployment has no caller entitled to record a start, so its
+/// library snapshot is a pure read for everyone.
+fn signed_start_state_without_session_mint_authority(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: None,
+            session_token_secret: Some(STARTED_SESSION_SECRET.into()),
+            allowed_origins: vec![STARTED_SESSION_ORIGIN.to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        STARTED_SESSION_SECRET.into(),
+        vec![STARTED_SESSION_ORIGIN.to_owned()],
+    ))
+}
+
+/// `A-34.2`: the same deployment as [`signed_start_state`], bound the way a real
+/// public deployment is.
+///
+/// `main.rs` builds `with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback())`,
+/// so on a non-loopback bind that flag is `false` and every library snapshot must
+/// present a credential. The upgrade bearer is configured, as a public bind's
+/// validation expects, and `CredentialCollision` guarantees it is byte-distinct
+/// from the session-mint credential.
+///
+/// This is the only bind shape on which `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` is
+/// required at all, so it is the shape the `A-32` deadlock fix has to work on.
+fn public_bind_signed_start_state(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some(FIXTURE_WS_UPGRADE_CREDENTIAL.into()),
+            session_token_secret: Some(STARTED_SESSION_SECRET.into()),
+            allowed_origins: vec![STARTED_SESSION_ORIGIN.to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_unauthenticated_paste_allowed(false)
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        STARTED_SESSION_SECRET.into(),
+        vec![STARTED_SESSION_ORIGIN.to_owned()],
+    ))
+    .with_session_mint_access(SessionMintAccess::new(
+        FIXTURE_SESSION_MINT_CREDENTIAL.into(),
+    ))
+}
+
+/// Seeds a second learner's study set, startable on every count the route checks:
+/// server-owned, ingestion `Ready`, one live source span, one active question.
+///
+/// `A-34.2` review fix: a set that *cannot* start would make the cross-user guard
+/// pass for the wrong reason — the route would refuse to mint because there is
+/// nothing to mint, not because the subject is not this credential's. Startable, a
+/// leak in the gate both answers `200` with another learner's library and records a
+/// durable session under their name, so the guard measures the gate itself.
+fn seed_other_learners_startable_set(store: &data::InMemoryStudyStore) {
+    // Source spans and documents are keyed by their own ids across the whole store,
+    // so this set carries its own: reusing the fixture's would reassign them to this
+    // set and quietly strip `biology-midterm` of the question that makes it start.
+    let source = StudySourceReference {
+        source_id: "src-user-2-slide-1".to_owned(),
+        document_id: "user-2-lec-1".to_owned(),
+        ..agent_domain::fixture_source_reference()
+    };
+    let question = StudyQuestion {
+        question_id: "q-user-2-private".to_owned(),
+        source: source.clone(),
+        ..agent_domain::fixture_question()
+    };
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        user_id: OTHER_LEARNER.to_owned(),
+        title: "Private User 2 Set".to_owned(),
+        course: None,
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec![question.concept_id.clone()],
+        question_ids: vec![question.question_id.clone()],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        document_id: source.document_id.clone(),
+        title: "User 2 Lecture 1".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: false,
+    });
+    store.upsert_source_span(data::SourceSpanRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        source,
+        tombstoned: false,
+    });
+    store.upsert_question(data::StudyQuestionRecord {
+        study_set_id: OTHER_LEARNER_STUDY_SET.to_owned(),
+        question,
+        active: true,
+    });
+}
+
+/// The subject the session mint may never name: a learner who is not the service's
+/// configured `trusted_user_id`.
+const OTHER_LEARNER: &str = "user-2";
+const OTHER_LEARNER_STUDY_SET: &str = "private-user-2-set";
+
+/// Reads the library snapshot exactly as a caller does. `record_start_for` is the
+/// explicit start-mint selector: `None` is a plain listing read, `Some(id)` is the
+/// request `POST /api/viva-session/start` makes for the one set it is starting.
+/// A mint request presents the scoped session-mint credential, because after the
+/// `A-32` review fix that credential — not the selector — is the write authority.
+async fn library_snapshot_json(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+) -> serde_json::Value {
+    let bearer = record_start_for.map(|_| FIXTURE_SESSION_MINT_CREDENTIAL);
+    library_snapshot_json_with_bearer(app, record_start_for, bearer).await
+}
+
+/// The same read with an explicit `Authorization` credential. Which credential a
+/// snapshot presents is the whole question the `A-32` review fix answers: the
+/// browser's read-scoped credential, and no credential at all, must both be unable
+/// to open a durable session however the query string is written.
+async fn library_snapshot_json_with_bearer(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
+) -> serde_json::Value {
+    let (status, payload) = library_snapshot_response(app, record_start_for, bearer).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the library snapshot is the mint path"
+    );
+    payload
+}
+
+/// The same read without the `200` assertion. On a non-loopback bind the status is
+/// the measurement: which credential the route admits, and for which operation, is
+/// the whole `A-34` question.
+async fn library_snapshot_response(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    library_snapshot_response_for_user(app, "user-1", record_start_for, bearer).await
+}
+
+/// The same read naming an arbitrary subject. `user_id` is a request parameter, not
+/// a claim, so which subject a credential may name is its own measurement: the
+/// `A-34.2` review fix is that the session mint may name the trusted user and no
+/// other, on either bind shape.
+async fn library_snapshot_response_for_user(
+    app: &axum::Router,
+    user_id: &str,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let uri = match record_start_for {
+        Some(study_set_id) => {
+            format!("/study-sets/library?user_id={user_id}&record_start_for={study_set_id}")
+        }
+        None => format!("/study-sets/library?user_id={user_id}"),
+    };
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("origin", STARTED_SESSION_ORIGIN);
+    if let Some(bearer) = bearer {
+        request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn library_study_set<'a>(
+    snapshot: &'a serde_json::Value,
+    study_set_id: &str,
+) -> &'a serde_json::Value {
+    snapshot["study_sets"]
+        .as_array()
+        .expect("study sets")
+        .iter()
+        .find(|set| set["id"] == study_set_id)
+        .unwrap_or_else(|| panic!("{study_set_id} missing from the library snapshot"))
+}
+
+/// Performs the product's own signed start: the library snapshot that
+/// `POST /api/viva-session/start` reads, naming the one study set it is starting,
+/// and returning the exact `session_id` and `session_token` pair the web tier hands
+/// the browser.
+async fn signed_start(app: &axum::Router, study_set_id: &str) -> (String, String) {
+    let payload = library_snapshot_json(app, Some(study_set_id)).await;
+    let start = library_study_set(&payload, study_set_id)["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the fixture set must offer a signed start: {start}"
+    );
+    (
+        start["session_id"]
+            .as_str()
+            .expect("minted session id")
+            .to_owned(),
+        start["session_token"]
+            .as_str()
+            .expect("minted session token")
+            .to_owned(),
+    )
+}
+
+async fn projection_after_start(
+    app: &axum::Router,
+    study_set_id: &str,
+    session_id: &str,
+    session_token: &str,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(projection_request(ProjectionRequest {
+            uri: &format!("/v1/study-sets/{study_set_id}/projection?voice_session_id={session_id}"),
+            bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+            session_token: Some(session_token),
+            origin: Some(STARTED_SESSION_ORIGIN),
+        }))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// `A-32`: the signed start IS the session. The mint records the `voice_sessions`
+/// row `authenticated_study_projection` requires, with the same identity the socket
+/// later claims, so the projection validates before any socket exists.
+///
+/// Without that write the deadlock lane 12 probed is exact: the start mints an id,
+/// the projection refuses it because no row exists, and the client never opens the
+/// socket that is the row's only other writer.
+#[tokio::test]
+async fn signed_start_records_the_voice_session_its_projection_requires() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let (session_id, session_token) = signed_start(&app, "biology-midterm").await;
+
+    let recorded = inner
+        .snapshot()
+        .sessions
+        .into_iter()
+        .filter(|session| session.voice_session_id == session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the signed start records exactly one voice session"
+    );
+    assert_eq!(recorded[0].user_id, "user-1");
+    assert_eq!(recorded[0].study_set_id, "biology-midterm");
+    assert_eq!(recorded[0].status, "open");
+    assert_eq!(recorded[0].mode, StudyMode::Quiz);
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "the mint performs exactly one insert, through the record_voice_session port"
+    );
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the started session must be projectable before any socket opens: {projection}"
+    );
+    assert_eq!(projection["session"]["id"], session_id);
+    assert_eq!(projection["session"]["mode"], "quiz");
+}
+
+/// `A-32`: a start that cannot be recorded is not a start. The service reports the
+/// action unavailable rather than handing out a credential whose projection can
+/// never validate.
+#[tokio::test]
+async fn signed_start_is_unavailable_when_the_voice_session_cannot_be_recorded() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(RefusingVoiceSessionStore {
+        inner: inner.clone(),
+    });
+    let app = build_router(signed_start_state(store, inner.clone()));
+
+    let payload = library_snapshot_json(&app, Some("biology-midterm")).await;
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], false,
+        "a store that cannot record the session must not advertise a start"
+    );
+    assert_eq!(start["unavailable_reason"], "session_record_unavailable");
+    assert!(
+        start["session_token"].is_null(),
+        "no credential is minted for a session that was never recorded"
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a refused start records nothing"
+    );
+}
+
+/// `A-32` review fix: recording belongs to the mint, not to the listing.
+///
+/// `GET /study-sets/library` is what the landing page renders from, what the panel
+/// re-reads after every control, and what the read-scoped proxy serves; it is an
+/// idempotent read and must stay one. Repeating it may not accumulate durable
+/// `voice_sessions` rows, and may not flip `resume` onto a session the learner
+/// never entered. Only a caller that names the study set it is starting — the one
+/// `POST /api/viva-session/start` makes — mints a durable session.
+#[tokio::test]
+async fn library_reads_record_nothing_until_a_start_is_actually_minted() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    for read in 1..=5 {
+        let payload = library_snapshot_json(&app, None).await;
+        let study_set = library_study_set(&payload, "biology-midterm");
+        assert_eq!(
+            study_set["actions"]["start"]["available"], true,
+            "read {read} must still advertise a signed start",
+        );
+        assert_eq!(
+            study_set["actions"]["resume"],
+            serde_json::json!({
+                "available": false,
+                "unavailable_reason": "no_open_session",
+            }),
+            "read {read} must not invent a session to resume",
+        );
+        assert!(
+            store.writes().is_empty(),
+            "read {read} wrote to the store: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "read {read} left durable sessions behind",
+        );
+    }
+
+    // The mint is the one call that writes, and it writes exactly once.
+    let (session_id, _) = signed_start(&app, "biology-midterm").await;
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "only the named start mint records a session",
+    );
+
+    // And the listing goes back to reading. It reports the session the mint opened
+    // — that is what `resume` is for — without opening another one.
+    let payload = library_snapshot_json(&app, None).await;
+    let study_set = library_study_set(&payload, "biology-midterm");
+    assert_eq!(study_set["actions"]["resume"]["available"], true);
+    assert_eq!(study_set["actions"]["resume"]["session_id"], session_id);
+    assert_eq!(
+        store.writes().len(),
+        1,
+        "a read after the mint writes nothing further: {:?}",
+        store.writes(),
+    );
+    assert_eq!(inner.snapshot().sessions.len(), 1);
+}
+
+/// `A-32` review fix: the mint selector names one study set, and only that set's
+/// start is recorded. A library holds many sets; minting a start for one of them
+/// may not open a session on every other one.
+#[tokio::test]
+async fn a_start_mint_records_only_the_study_set_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_second_startable_set(&inner, "chemistry-final");
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let payload = library_snapshot_json(&app, Some("chemistry-final")).await;
+    for study_set_id in ["biology-midterm", "chemistry-final"] {
+        assert_eq!(
+            library_study_set(&payload, study_set_id)["actions"]["start"]["available"],
+            true,
+            "{study_set_id} is startable, so every snapshot signs a start for it",
+        );
+    }
+    let named_session_id = library_study_set(&payload, "chemistry-final")["actions"]["start"]
+        ["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+
+    assert_eq!(
+        store.writes(),
+        vec![(
+            named_session_id.clone(),
+            Ok(StudyStoreWriteOutcome::Inserted)
+        )],
+        "the mint records the named set only",
+    );
+    let sessions = inner.snapshot().sessions;
+    assert_eq!(sessions.len(), 1, "exactly one session was opened");
+    assert_eq!(sessions[0].study_set_id, "chemistry-final");
+    assert_eq!(sessions[0].voice_session_id, named_session_id);
+    assert_eq!(
+        library_study_set(&payload, "biology-midterm")["actions"]["resume"],
+        serde_json::json!({
+            "available": false,
+            "unavailable_reason": "no_open_session",
+        }),
+        "an unnamed set is untouched by another set's mint",
+    );
+}
+
+/// `A-32` review fix: a selector is not authority.
+///
+/// `GET /study-sets/library` is browser-reachable through the read-scoped proxy,
+/// which copies the caller's query string upstream verbatim, and on a loopback bind
+/// the route accepts the trusted user with no `Authorization` header at all. A
+/// selector any caller can type must therefore never open a durable
+/// `voice_sessions` row: an unauthenticated read stays a read, no matter what it
+/// names, so nothing accumulates and `resume` never names a phantom.
+#[tokio::test]
+async fn an_unauthenticated_library_read_cannot_record_the_start_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    for read in 1..=3 {
+        let payload = library_snapshot_json_with_bearer(&app, Some("biology-midterm"), None).await;
+        let study_set = library_study_set(&payload, "biology-midterm");
+        assert_eq!(
+            study_set["actions"]["start"]["available"], true,
+            "read {read}: an unauthorized selector is ignored, not an error",
+        );
+        assert!(
+            store.writes().is_empty(),
+            "read {read} recorded a session with no mint authority: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "read {read} left a durable session behind",
+        );
+        assert_eq!(
+            study_set["actions"]["resume"],
+            serde_json::json!({
+                "available": false,
+                "unavailable_reason": "no_open_session",
+            }),
+            "read {read} invented a session to resume",
+        );
+    }
+}
+
+/// `A-32` review fix: the browser's own scoped credential is a READ credential.
+///
+/// `apps/web`'s library proxy presents `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` on
+/// every browser snapshot, so on a public bind that credential — not an absent one
+/// — is what a browser-shaped request carries. It authorizes reading the library;
+/// it does not authorize opening a session.
+#[tokio::test]
+async fn the_library_read_credential_cannot_record_the_start_it_names() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    let payload = library_snapshot_json_with_bearer(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    )
+    .await;
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the read credential still reads the library, and its start is still signed"
+    );
+    assert!(
+        store.writes().is_empty(),
+        "the read credential recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the read credential left a durable session behind",
+    );
+
+    // And the credential it minted is exactly as unusable as any unrecorded start:
+    // the projection still refuses it, so no client can proceed on a session the
+    // service never opened.
+    let (status, _) = projection_after_start(
+        &app,
+        "biology-midterm",
+        start["session_id"].as_str().expect("minted session id"),
+        start["session_token"].as_str().expect("minted token"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "an unrecorded start must not project",
+    );
+}
+
+/// `A-32` review fix: fail closed on an unconfigured deployment.
+///
+/// A service that configures no session-mint credential has no caller entitled to
+/// record a start, so no request can — not even one presenting the value another
+/// deployment would use. The deadlock fix engages where the scoped credential is
+/// configured; where it is not, the route is exactly the read it was before.
+#[tokio::test]
+async fn a_deployment_without_session_mint_authority_records_no_start() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state_without_session_mint_authority(
+        store.clone(),
+        inner.clone(),
+    ));
+
+    for bearer in [
+        None,
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    ] {
+        let payload =
+            library_snapshot_json_with_bearer(&app, Some("biology-midterm"), bearer).await;
+        assert_eq!(
+            library_study_set(&payload, "biology-midterm")["actions"]["start"]["available"],
+            true,
+            "the snapshot still reads and still signs its starts",
+        );
+    }
+    assert!(
+        store.writes().is_empty(),
+        "an unconfigured deployment recorded a start: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "an unconfigured deployment left a durable session behind",
+    );
+}
+
+/// A second ready, startable study set for the same learner: one active question
+/// over its own live source span, so `study_set_start_unavailable_reason` returns
+/// `None` for it without disturbing the fixture set. The span carries a distinct
+/// `source_id` because the in-memory store keys spans by that id alone.
+fn seed_second_startable_set(store: &data::InMemoryStudyStore, study_set_id: &str) {
+    let question_id = format!("q-{study_set_id}");
+    let document_id = format!("{study_set_id}-lecture");
+    let mut source = agent_domain::fixture_source_reference();
+    source.source_id = format!("src-{study_set_id}");
+    source.document_id = document_id.clone();
+    store.upsert_study_set(data::StudySetRecord {
+        study_set_id: study_set_id.to_owned(),
+        user_id: "user-1".to_owned(),
+        title: "Chemistry Final".to_owned(),
+        course: Some("Chemistry 101".to_owned()),
+        ingestion_status: StudySetIngestionStatus::Ready,
+        ingestion_error: None,
+        concept_ids: vec!["reaction-rates".to_owned()],
+        question_ids: vec![question_id.clone()],
+    });
+    store.upsert_document(data::StudyDocumentRecord {
+        study_set_id: study_set_id.to_owned(),
+        document_id,
+        title: "Lecture 1".to_owned(),
+        source_kind: "pdf".to_owned(),
+        processing_status: StudySetIngestionStatus::Ready,
+        tombstoned: false,
+    });
+    store.upsert_source_span(data::SourceSpanRecord {
+        study_set_id: study_set_id.to_owned(),
+        source: source.clone(),
+        tombstoned: false,
+    });
+    store.upsert_concept(data::ConceptRecord {
+        study_set_id: study_set_id.to_owned(),
+        concept_id: "reaction-rates".to_owned(),
+        label: "Reaction rates".to_owned(),
+        status: ConceptStatus::Review,
+        source_span_id: source.source_id.clone(),
+    });
+    let mut question = agent_domain::fixture_question();
+    question.question_id = question_id;
+    question.source = source;
+    store.upsert_question(data::StudyQuestionRecord {
+        study_set_id: study_set_id.to_owned(),
+        question,
+        active: true,
+    });
+}
+
+/// `A-32`, the full entry flow over a real socket: signed start, projection valid
+/// pre-socket, the socket opens with the same credential, its own provisioning
+/// replays the started session idempotently — one row, the `IdempotentReplay`
+/// outcome, no error — and the session proceeds to its first question.
+#[tokio::test]
+async fn signed_start_projection_and_socket_complete_the_entry_flow() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    // One store behind both the HTTP mint and the socket's provider, so the two
+    // writes and their outcomes are observed on the same port.
+    let state = signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (session_id, session_token) = signed_start(&app, "biology-midterm").await;
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connectionEligible requires a valid projection before the socket: {projection}"
+    );
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    // The browser presents the same canonical origin the start was minted from.
+    let mut request = token_only_request(&url, &session_token);
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+    let (mut socket, _) = connect_async(request)
+        .await
+        .expect("the minted credential opens the socket");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", &session_id, &session_token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the started session proceeds to its first question, got {question:?}"
+    );
+
+    let writes = store.writes();
+    assert_eq!(
+        writes,
+        vec![
+            (session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted)),
+            (
+                session_id.clone(),
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            ),
+        ],
+        "the socket's own provisioning is an idempotent replay of the started session"
+    );
+    assert_eq!(
+        inner
+            .snapshot()
+            .sessions
+            .iter()
+            .filter(|session| session.voice_session_id == session_id)
+            .count(),
+        1,
+        "the replay must not create a second session"
+    );
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// `A-34.2`: the deadlock fix has to work on the bind that requires it.
+///
+/// Before this fix the mint's own request was refused by `library_snapshot`'s
+/// bearer check — `VoiceWsAccess::validate_bearer_headers`, which compares against
+/// the WebSocket upgrade credential — before the `A-32` record gate ever saw it.
+/// The session-mint credential is byte-distinct from that one by configuration, so
+/// on the only bind shape where `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` is required,
+/// the start answered `401` and the projection stayed in the exact deadlock `A-32`
+/// exists to break.
+///
+/// The mint is a credential for an operation. Naming the set it is starting, it
+/// mints and records; the row, its identity, and the pre-socket projection are the
+/// same ones the loopback shape already proves.
+#[tokio::test]
+async fn a_public_bind_signed_start_records_the_voice_session_its_projection_requires() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mint's own credential must reach the mint on a public bind: {payload}"
+    );
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the public-bind mint must offer a signed start: {start}"
+    );
+    let session_id = start["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+    let session_token = start["session_token"]
+        .as_str()
+        .expect("minted session token")
+        .to_owned();
+
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "the public-bind mint performs exactly one insert",
+    );
+    let recorded = inner
+        .snapshot()
+        .sessions
+        .into_iter()
+        .filter(|session| session.voice_session_id == session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the public-bind start records exactly one voice session"
+    );
+    assert_eq!(recorded[0].user_id, "user-1");
+    assert_eq!(recorded[0].study_set_id, "biology-midterm");
+    assert_eq!(recorded[0].status, "open");
+    assert_eq!(recorded[0].mode, StudyMode::Quiz);
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the public-bind start must be projectable before any socket opens: {projection}"
+    );
+    assert_eq!(projection["session"]["id"], session_id);
+    assert_eq!(projection["session"]["mode"], "quiz");
+}
+
+/// `A-34.2`: the mint credential authenticates the mint operation, so a request
+/// that is not that operation gets nothing from it.
+///
+/// Naming no start makes the request a plain library read, and on a public bind that
+/// read belongs to the deployment's own upgrade bearer — never to the mint. The
+/// identical request, minus the mint operation, is refused; the export surface, which
+/// never consults this credential at all, stays closed to it too.
+///
+/// `A-34.2` review fix — what this test does *not* claim: it does not say the mint
+/// credential is unable to read. Once the operation *is* named the response is the
+/// whole snapshot, deliberately, and
+/// [`the_mint_operation_is_answered_with_the_whole_snapshot_and_writes_only_the_named_set`]
+/// pins that. The property here is the narrower and true one: no mint operation, no
+/// admission.
+#[tokio::test]
+async fn the_session_mint_credential_is_refused_without_the_mint_operation() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, body) =
+        library_snapshot_response(&app, None, Some(FIXTURE_SESSION_MINT_CREDENTIAL)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the mint credential must not be admitted for a request that is not the mint: {body}"
+    );
+    assert_eq!(body["error"], "library_snapshot_auth_failed");
+    assert!(
+        !body.to_string().contains(FIXTURE_SESSION_MINT_CREDENTIAL),
+        "the refusal must not echo the credential: {body}"
+    );
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", STARTED_SESSION_ORIGIN)
+                .header(
+                    "authorization",
+                    format!("Bearer {FIXTURE_SESSION_MINT_CREDENTIAL}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        export.status(),
+        StatusCode::UNAUTHORIZED,
+        "the mint credential must not export the library either",
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "a refused read recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a refused read left a durable session behind",
+    );
+}
+
+/// `A-34.2` review fix: what the admitted mint actually gets, stated plainly.
+///
+/// The admission is authentication of an *operation*, not a read narrowed to the set
+/// the caller named — the signed start it came for is an action inside the snapshot,
+/// so the snapshot is the response. Two consequences follow that no other test pinned,
+/// and a name like "the mint is not library-read authority" quietly denied:
+///
+/// * a selector matching nothing is still the mint operation. It is admitted, it is
+///   answered with the full snapshot, and it writes nothing.
+/// * the trusted user's other sets come back complete, signed start actions included.
+///   A signed start is not a durable session: the record gate below the admission is
+///   what the mint buys, and it fires for the one named set or for none at all.
+///
+/// A future change that narrows the response, or that treats an unmatched selector as
+/// a refusal, is welcome to — but it will change this test, not slip past it.
+#[tokio::test]
+async fn the_mint_operation_is_answered_with_the_whole_snapshot_and_writes_only_the_named_set() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("no-such-study-set"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a selector matching nothing is still the mint operation: {payload}"
+    );
+    assert!(
+        payload["privacy"].is_object() && payload["sessions"].is_array(),
+        "the mint is answered with the whole snapshot, not a narrowed view: {payload}"
+    );
+    let biology = library_study_set(&payload, "biology-midterm");
+    assert_eq!(biology["question_count"], 1);
+    assert_eq!(
+        biology["actions"]["start"]["available"], true,
+        "the snapshot signs its start actions whether or not one is recorded: {biology}"
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "a selector matching nothing recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a selector matching nothing left a durable session behind",
+    );
+}
+
+/// `A-34.2`, the whole entry flow in the public-bind shape: the mint's credential
+/// opens a start, the projection answers before any socket exists, the socket
+/// admits the minted credential through the token-only upgrade even though a
+/// WebSocket bearer is configured, and its own provisioning is an idempotent replay
+/// of the started session rather than a second one.
+#[tokio::test]
+async fn public_bind_start_projection_and_socket_complete_the_entry_flow() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    // One store behind both the HTTP mint and the socket's provider, so the two
+    // writes and their outcomes are observed on the same port.
+    let state = public_bind_signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the public-bind mint is the entry flow's first step: {payload}"
+    );
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    let session_id = start["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+    let session_token = start["session_token"]
+        .as_str()
+        .expect("minted session token")
+        .to_owned();
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connectionEligible requires a valid projection before the socket: {projection}"
+    );
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let mut request = token_only_request(&url, &session_token);
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+    let (mut socket, _) = connect_async(request)
+        .await
+        .expect("the minted credential opens the socket on a public bind");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", &session_id, &session_token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the started session proceeds to its first question, got {question:?}"
+    );
+
+    assert_eq!(
+        store.writes(),
+        vec![
+            (session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted)),
+            (
+                session_id.clone(),
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            ),
+        ],
+        "the socket's own provisioning is an idempotent replay of the started session"
+    );
+    assert_eq!(
+        inner
+            .snapshot()
+            .sessions
+            .iter()
+            .filter(|session| session.voice_session_id == session_id)
+            .count(),
+        1,
+        "the replay must not create a second session"
+    );
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// `A-34.2` review fix: the mint names the trusted user, and no other.
+///
+/// The route states its own cross-user rule — "cross-user library snapshots require
+/// authenticated REST access" — and that rule predates the session mint entirely.
+/// `A-34.2` orders one new admission: the mint operation, on a bind that would
+/// otherwise refuse it. It orders no relaxation of who that operation may name, so
+/// the mint credential must leave the cross-user rule exactly where it found it, on
+/// both bind shapes:
+///
+/// * loopback, where an unauthenticated cross-user read is already `403`;
+/// * public, where every read must present the deployment's upgrade bearer.
+///
+/// The set named here is startable, so a gate that admitted this request would not
+/// merely leak another learner's library — it would open and durably record a voice
+/// session under their name, which is why the store is asserted empty too.
+#[tokio::test]
+async fn the_session_mint_credential_is_not_cross_user_authority() {
+    for (shape, build, expected_status, expected_error) in [
+        (
+            "loopback",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::FORBIDDEN,
+            "library_snapshot_auth_required",
+        ),
+        (
+            "public bind",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                public_bind_signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::UNAUTHORIZED,
+            "library_snapshot_auth_failed",
+        ),
+    ] {
+        let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        seed_other_learners_startable_set(&inner);
+        let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+        let app = build_router(build(store.clone(), inner.clone()));
+
+        let (status, body) = library_snapshot_response_for_user(
+            &app,
+            OTHER_LEARNER,
+            Some(OTHER_LEARNER_STUDY_SET),
+            Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "the mint credential must not name another learner on the {shape} bind: {body}"
+        );
+        assert_eq!(body["error"], expected_error, "on the {shape} bind");
+        assert!(
+            body.get("study_sets").is_none(),
+            "the refusal must not carry another learner's library on the {shape} bind: {body}"
+        );
+
+        assert!(
+            store.writes().is_empty(),
+            "the {shape} bind recorded a cross-user session: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "the {shape} bind left a durable cross-user session behind",
+        );
+    }
+}
+
+/// `A-34.2` review fix, the other side of the cross-user guard: the credential that
+/// *is* entitled to read another learner's library reads it, and still does not mint.
+///
+/// This is also what gives the guard above its force. It proves the seeded set is
+/// startable — a set the route would refuse to start anyway would make that guard
+/// pass for the wrong reason — and it proves the deadlock fix did not turn the
+/// deployment's upgrade bearer into a write authority: the record gate answers to
+/// the session-mint credential alone, whoever else the route admits.
+#[tokio::test]
+async fn the_upgrade_bearer_reads_another_learners_library_and_still_does_not_mint() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    seed_other_learners_startable_set(&inner);
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response_for_user(
+        &app,
+        OTHER_LEARNER,
+        Some(OTHER_LEARNER_STUDY_SET),
+        Some(FIXTURE_WS_UPGRADE_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the deployment's own bearer reads any subject: {payload}"
+    );
+    let start = library_study_set(&payload, OTHER_LEARNER_STUDY_SET)["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the seeded cross-user set must be startable, or the guard above proves nothing: {start}"
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "the upgrade bearer minted a session it has no authority to record: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the upgrade bearer left a durable session behind",
+    );
 }
 
 /// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard

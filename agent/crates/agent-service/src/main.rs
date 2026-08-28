@@ -4,6 +4,7 @@ use std::sync::Arc;
 use agent_service::{
     begin_drain_and_wait, build_brain, build_router, build_study_store,
     validate_runtime_store_preflight, AppState, DrainOutcome, ProjectionReadAccess, ServiceConfig,
+    SessionMintAccess,
 };
 
 #[tokio::main]
@@ -35,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
                 config.ws_access.allowed_origins.clone(),
             )
         });
+    let projection_configured = projection_read_access.is_some();
     let state = AppState::with_study_store(
         brain,
         config.provider.as_str(),
@@ -55,6 +57,26 @@ async fn main() -> anyhow::Result<()> {
     .with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback());
     let state = match projection_read_access {
         Some(access) => state.with_projection_read_access(access),
+        None => state,
+    };
+    // `A-32`: only the scoped session-mint credential may record a started voice
+    // session. A deployment that configures none has no such caller, so its library
+    // snapshot stays a pure read.
+    //
+    // A projection route with no way to record a session is the A-32 deadlock by
+    // construction — the projection requires a `voice_sessions` row the mint can
+    // then never write — so the combination is named at startup instead of failing
+    // silently once a learner presses start. The name is an environment key, never
+    // a credential value.
+    if projection_configured && config.session_mint_credential.is_none() {
+        tracing::warn!(
+            missing = "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+            "the authenticated projection is configured but no caller may record a started session; \
+             a signed start will mint a credential whose projection can never validate"
+        );
+    }
+    let state = match config.session_mint_credential {
+        Some(credential) => state.with_session_mint_access(SessionMintAccess::new(credential)),
         None => state,
     };
     let shutdown_state = state.clone();

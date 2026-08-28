@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+# The package declares a second binary (the development fixture seed below), which
+# makes an unqualified `cargo run -p agent-service` ambiguous without this key. That
+# argv is what `scripts/dev-agent.mjs` builds for `bun run dev:agent`, what
+# `scripts/frontend-harness.mjs` spawns for the browser gates, and what
+# `agent/README.md` and `docs/deployment-runbook.md` tell an operator to type, so the
+# service binary stays the one `cargo run` means.
+default-run = "agent-service"
 
 [dependencies]
 agent-adapters = { path = "../agent-adapters" }
@@ -40,6 +47,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "agent-service"
 path = "src/main.rs"
+
+# `SERVICE-013`'s "development commands" half, kept out of the service binary so
+# no normal startup can reach a fixture seed. Refuses without VIVA_DEV_FIXTURE_SEED=1.
+[[bin]]
+name = "viva-dev-seed-fixture"
+path = "src/bin/dev_seed_fixture.rs"
 
 [lints]
 workspace = true

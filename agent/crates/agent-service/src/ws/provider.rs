@@ -419,9 +419,17 @@ pub(super) async fn open_failure_control_session(
     config: SessionConfig,
     scenario: FailureControlScenario,
 ) -> Result<RealtimeSession, BrainError> {
-    // The write outcome is deliberately unread here: this rehearsal harness reports
-    // no store counts, and only whether the row committed at all gates the session.
-    let _outcome = state
+    // `A-32`: this socket's own provisioning is explicitly idempotent-on-existing.
+    // The signed start already recorded this session under the same identity, so a
+    // replay is the expected outcome here and is not a second session; a first
+    // insert is equally accepted, because the same code path serves a session whose
+    // start was never recorded through the mint. Only a refusal to write at all
+    // gates the session, and the outcome is reported rather than discarded — an
+    // operator diagnosing the start/projection/socket order needs to see which of
+    // the two this was. The behavioural proof that the second write is the
+    // idempotent outcome, and that it creates no second row, is the auditing store's
+    // write log in `signed_start_projection_and_socket_complete_the_entry_flow`.
+    let outcome = state
         .study_store
         .record_voice_session(&config)
         .await
@@ -438,6 +446,13 @@ pub(super) async fn open_failure_control_session(
                 metadata: format!("error_kind={}", error.kind()),
             }))
         })?;
+    tracing::debug!(
+        session_provisioning_outcome = match outcome {
+            StudyStoreWriteOutcome::Inserted => "inserted",
+            StudyStoreWriteOutcome::IdempotentReplay => "idempotent_replay",
+        },
+        "recorded the voice session for this socket"
+    );
 
     let (input, mut input_rx) = mpsc::channel::<BrainInput>(32);
     let (event_tx, events) = mpsc::channel::<BrainEvent>(32);

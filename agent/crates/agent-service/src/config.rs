@@ -93,6 +93,41 @@ impl OperatorAccess {
     }
 }
 
+/// `A-32`: the authority that may turn a library snapshot read into a durable
+/// session.
+///
+/// `GET /study-sets/library` is a listing. Plan 11 reaches it two ways with two
+/// different scoped credentials: the browser's read-scoped proxy presents
+/// `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN`, and the server-side mint behind
+/// `POST /api/viva-session/start` presents `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`.
+/// Only the second may open a `voice_sessions` row, so a selector in the query
+/// string is a request, never a permission — the read path can name whatever it
+/// likes and still write nothing. This is the agent half of the scope enforcement
+/// Plan 11 hands to this plan for the scoped credentials it already sends.
+///
+/// Absent means no caller holds the authority and no request records a start.
+#[derive(Clone, Debug)]
+pub struct SessionMintAccess {
+    credential: RedactedSecret,
+}
+
+impl SessionMintAccess {
+    pub fn new(credential: RedactedSecret) -> Self {
+        Self { credential }
+    }
+
+    /// True only for a request carrying exactly the configured credential in the
+    /// `Authorization` position, compared in constant time. Every other request —
+    /// absent credential, read credential, delete credential, operator credential
+    /// — is a read.
+    pub fn authorizes(&self, headers: &HeaderMap) -> bool {
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return false;
+        };
+        constant_time_eq(self.credential.as_str().as_bytes(), provided.as_bytes())
+    }
+}
+
 /// The header the browser access credential rides in on the projection route. It is
 /// never `Authorization`: that position belongs to the Plan 11 service credential.
 pub const VIVA_SESSION_TOKEN_HEADER: &str = "x-viva-session-token";
@@ -359,6 +394,10 @@ pub struct ServiceConfig {
     pub operator_access: OperatorAccess,
     pub library_read_bearer: Option<RedactedSecret>,
     pub library_delete_bearer: Option<RedactedSecret>,
+    /// `A-32`: `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`, the scoped credential the
+    /// server-side session mint presents. It is the only authority that may record
+    /// a started voice session; see [`SessionMintAccess`].
+    pub session_mint_credential: Option<RedactedSecret>,
     pub trusted_proxies: TrustedProxyConfig,
     pub recorder_limits: RecorderLimits,
     pub ws_timeouts: WsTimeouts,
@@ -383,6 +422,7 @@ impl Default for ServiceConfig {
             operator_access: OperatorAccess::default(),
             library_read_bearer: None,
             library_delete_bearer: None,
+            session_mint_credential: None,
             trusted_proxies: TrustedProxyConfig::default(),
             recorder_limits: RecorderLimits::default(),
             ws_timeouts: WsTimeouts::default(),
@@ -441,6 +481,8 @@ impl ServiceConfig {
             env_value("VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN").map(RedactedSecret::from);
         config.library_delete_bearer =
             env_value("VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN").map(RedactedSecret::from);
+        config.session_mint_credential =
+            env_value("VIVA_AGENT_SESSION_MINT_BEARER_TOKEN").map(RedactedSecret::from);
         if let Some(cidrs) = env_value("VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS") {
             config.trusted_proxies = TrustedProxyConfig::parse(&cidrs)
                 .map_err(|_| ServiceConfigError::InvalidTrustedProxyCidr)?;
@@ -601,6 +643,10 @@ impl ServiceConfig {
                 "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
                 self.library_delete_bearer.is_some(),
             ),
+            (
+                "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                self.session_mint_credential.is_some(),
+            ),
         ] {
             if !configured {
                 return Err(ServiceConfigError::PublicBindMissingCredential(
@@ -629,6 +675,10 @@ impl ServiceConfig {
                 "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
                 self.library_delete_bearer.as_ref(),
             ),
+            (
+                "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                self.session_mint_credential.as_ref(),
+            ),
         ];
         for (key, credential) in credentials {
             if let Some(credential) = credential {
@@ -646,6 +696,10 @@ impl ServiceConfig {
             (
                 "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
                 self.library_delete_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                self.session_mint_credential.as_ref(),
             ),
         ] {
             if credential.is_some() && self.ws_access.session_token_secret.is_none() {
@@ -671,6 +725,10 @@ impl ServiceConfig {
             (
                 "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
                 self.library_delete_bearer.as_ref(),
+            ),
+            (
+                "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                self.session_mint_credential.as_ref(),
             ),
         ];
         for (index, (left_key, left)) in scoped.iter().enumerate() {
@@ -2236,6 +2294,7 @@ mod tests {
             operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
             library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
             library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
+            session_mint_credential: Some(FIXTURE_SESSION_MINT_CREDENTIAL.into()),
             ws_access: VoiceWsAccess {
                 session_token_secret: Some(FIXTURE_SESSION_SIGNING_SECRET.into()),
                 ..bearer_only.ws_access.clone()
@@ -2272,6 +2331,9 @@ mod tests {
             "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN" => {
                 Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.to_owned())
             }
+            "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN" => {
+                Some(FIXTURE_SESSION_MINT_CREDENTIAL.to_owned())
+            }
             _ => None,
         })
         .expect("public bind with every scoped credential should validate");
@@ -2299,6 +2361,7 @@ mod tests {
             operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
             library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
             library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
+            session_mint_credential: Some(FIXTURE_SESSION_MINT_CREDENTIAL.into()),
             ..ServiceConfig::default()
         };
 
@@ -2317,6 +2380,7 @@ mod tests {
             operator_access: OperatorAccess::new(Some(FIXTURE_OPERATOR_CREDENTIAL.into())),
             library_read_bearer: Some(FIXTURE_LIBRARY_READ_CREDENTIAL.into()),
             library_delete_bearer: Some(FIXTURE_LIBRARY_DELETE_CREDENTIAL.into()),
+            session_mint_credential: Some(FIXTURE_SESSION_MINT_CREDENTIAL.into()),
             ..ServiceConfig::default()
         };
 
@@ -2579,6 +2643,7 @@ mod tests {
     const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-000001";
     const FIXTURE_LIBRARY_DELETE_CREDENTIAL: &str = "viva-fixture-library-delete-cred-0001";
     const FIXTURE_WS_CREDENTIAL: &str = "viva-fixture-websocket-cred-00000001";
+    const FIXTURE_SESSION_MINT_CREDENTIAL: &str = "viva-fixture-session-mint-cred-000001";
     const FIXTURE_SESSION_SIGNING_SECRET: &str = "viva-fixture-session-signing-secret01";
     const FIXTURE_PUBLIC_BIND: &str = "203.0.113.10:4318";
     const FIXTURE_ALLOWED_ORIGIN: &str = "https://app.example";
@@ -2616,6 +2681,10 @@ mod tests {
             (
                 "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
                 FIXTURE_LIBRARY_DELETE_CREDENTIAL,
+            ),
+            (
+                "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                FIXTURE_SESSION_MINT_CREDENTIAL,
             ),
         ]
     }
@@ -2685,6 +2754,7 @@ mod tests {
         assert!(!defaults.operator_access.is_configured());
         assert!(defaults.library_read_bearer.is_none());
         assert!(defaults.library_delete_bearer.is_none());
+        assert!(defaults.session_mint_credential.is_none());
         assert!(!defaults.max_turn_duration_overridden);
 
         let accepted: Vec<AcceptedBoundCase> = vec![
@@ -3061,6 +3131,49 @@ mod tests {
                 )],
                 ServiceConfigError::LibraryBearerRequiresSessionTokenSecret(
                     "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                ),
+            ),
+            // `A-32`: the session-mint credential is a route scope like the other
+            // three. It is required on a public bind, length-bounded, byte-distinct
+            // from every sibling, and useless without the signing secret whose
+            // credentials it authorizes the minting of.
+            (
+                "non-loopback bind without a session-mint credential",
+                public_env(&[("VIVA_AGENT_SESSION_MINT_BEARER_TOKEN", None)]),
+                ServiceConfigError::PublicBindMissingCredential(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                    public_bind_addr(),
+                ),
+            ),
+            (
+                "session-mint credential one byte below the minimum",
+                public_env(&[(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                    Some(FIXTURE_CREDENTIAL_31_BYTES),
+                )]),
+                ServiceConfigError::CredentialLengthOutOfRange(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "session-mint credential byte-equal to the library read credential",
+                public_env(&[(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                    Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+                )]),
+                ServiceConfigError::CredentialCollision(
+                    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                ),
+            ),
+            (
+                "session-mint credential on loopback without a session-token signing secret",
+                vec![(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+                    FIXTURE_SESSION_MINT_CREDENTIAL,
+                )],
+                ServiceConfigError::LibraryBearerRequiresSessionTokenSecret(
+                    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
                 ),
             ),
         ];

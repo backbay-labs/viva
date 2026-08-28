@@ -145,7 +145,12 @@ describe("Viva same-origin session API", () => {
 
     expect(response.status).toBe(200);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.input).toBe("https://agent.example/study-sets/library?user_id=synthetic-user");
+    // `A-32`: a start mint asks the agent to record the session for the one study set
+    // it is starting. Without that selector the agent's library snapshot is a pure
+    // read, so no other caller of it opens a durable session.
+    expect(calls[0]?.input).toBe(
+      "https://agent.example/study-sets/library?user_id=synthetic-user&record_start_for=biology-midterm",
+    );
     const headers = new Headers(calls[0]?.init?.headers);
     expect(headers.get("authorization")).toBe(`Bearer ${SCOPED_SESSION_MINT_BEARER}`);
     expect(headers.get("origin")).toBe(CANONICAL_WEB_ORIGIN);
@@ -175,6 +180,31 @@ describe("Viva same-origin session API", () => {
     expect(serialized).not.toContain(SCOPED_SESSION_MINT_BEARER);
     expect(serialized).not.toContain("viva-fixture-legacy-rest-bearer");
     expect(serialized).not.toContain("agent.example");
+  });
+
+  test("resume mints ask the agent for no durable write because their session already exists", async () => {
+    const calls: string[] = [];
+    const agentAccessToken = signedAgentAccessToken();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return jsonResponse(200, librarySnapshot({ resumeToken: agentAccessToken }));
+    }) as typeof fetch;
+
+    const response = await startSession(
+      sessionRequest(
+        "/api/viva-session/start",
+        sessionStartPayload({ sessionId: "server-session" }),
+      ),
+    );
+    const body = (await response.json()) as VivaSessionRouteOutcome;
+
+    expect(response.status).toBe(200);
+    expect(body.session?.session_id).toBe("server-session");
+    expect(calls).toHaveLength(1);
+    // `A-32`: only a start records. A resume names a `voice_sessions` row the start
+    // mint already committed, so it must not ask the agent to open another one.
+    expect(calls[0]).toBe("https://agent.example/study-sets/library?user_id=synthetic-user");
+    expect(calls[0]).not.toContain("record_start_for");
   });
 
   test("start requires the server-only agent URL instead of falling back to public browser config", async () => {
@@ -1597,7 +1627,8 @@ describe("Viva trusted proxy and atomic shared rate admission", () => {
     expect(admitted.status).toBe(200);
     expect(calls).toEqual([
       "https://session-store.example/v1/session-security",
-      "https://agent.example/study-sets/library?user_id=synthetic-user",
+      // A-32: the admitted call is a start, so it carries the record selector.
+      "https://agent.example/study-sets/library?user_id=synthetic-user&record_start_for=biology-midterm",
       // D-07 Branch A: the issued refresh record is committed to the same shared store.
       "https://session-store.example/v1/session-security",
     ]);
