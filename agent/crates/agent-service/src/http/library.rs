@@ -183,7 +183,45 @@ pub(super) async fn library_snapshot(
             .session_mint_access
             .as_ref()
             .is_some_and(|access| access.authorizes(&headers));
+    // `A-36.3`: the same deadlock, one credential over, and the same answer.
+    //
+    // The browser's BFF reads this route with `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN`,
+    // which `main.rs` wires into [`ProjectionReadAccess`] and nowhere else — so the
+    // check below never consulted it, compared against the WebSocket upgrade
+    // credential instead, and refused the browser's plain library read on exactly the
+    // bind that requires the read key. `A-34.2` fixed this for the mint; this is its
+    // sibling.
+    //
+    // The admission mirrors the trust `ProjectionReadAccess` already places in this
+    // credential and adds nothing to it. Three conditions, each load-bearing:
+    //
+    // * it is the READ-ONLY snapshot operation. A request that also names a start is
+    //   asking for the mint's write authority, which this credential does not hold, so
+    //   it is not this operation and falls through to the ordinary check that refuses
+    //   it. `A-34.2`'s converse pin — the mint credential cannot plain-read — is
+    //   untouched: this compares against a different credential entirely.
+    // * it names the service's own `trusted_user_id`, the narrowing `A-36.2` ratified
+    //   for the mint. The projection never reads for a subject its verified token does
+    //   not name, so its mirror cannot read for a subject the query string names.
+    // * it presents the credential from the canonical origin, which is
+    //   [`ProjectionReadAccess::authorizes_snapshot_read`]'s own decision, not a second
+    //   opinion about it.
+    //
+    // Read-only is the whole grant. Three of the four surfaces below enforce it
+    // without knowing this decision was made: the record gate reads `mint_authorized`
+    // alone, and `require_library_control_access` (export, both deletes) plus
+    // `library_mutation_access_unavailable_reason` (the delete action and its
+    // capability) consult neither scoped credential — so an admitted read is handed no
+    // mutation token and no export. The fourth is `session_token`, and it needs the
+    // explicit withholding below.
+    let library_read_authorized = mint_operation.is_none()
+        && user_id == state.trusted_user_id
+        && state
+            .projection_read_access
+            .as_ref()
+            .is_some_and(|access| access.authorizes_snapshot_read(&headers));
     if !mint_authorized
+        && !library_read_authorized
         && (!state.unauthenticated_paste_allowed || user_id != state.trusted_user_id)
     {
         if state.ws_access.required_bearer.is_none() {
@@ -237,6 +275,35 @@ pub(super) async fn library_snapshot(
     // as the mint records; every other caller — admitted by the REST bearer, by the
     // loopback trust, or by nothing at all — reads.
     let record_start_for = mint_authorized.then_some(mint_operation).flatten();
+    // `A-36.3` review fix: read-only has to mean read-only on the wire too.
+    //
+    // A start or resume action carries a `session_token`, and
+    // [`crate::config::authenticate_upgrade`] accepts that token ALONE as WebSocket
+    // authority — D-07's token-only path, no upgrade bearer required — after which
+    // the socket's own provisioning records the `voice_sessions` row. Handing this
+    // credential a session token would therefore hand it durable session creation one
+    // hop later, which is the authority `A-36.3` reserves to
+    // `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` and this route's own store assertions
+    // cannot see, because the leak is not a store call this route makes.
+    //
+    // Withheld from exactly the admission that needed it. Every caller this route
+    // already admitted keeps its tokens, because for them the token is no new
+    // authority: the upgrade bearer opens the socket by itself, and a loopback bind
+    // answers this same read with no `Authorization` header at all. Those two are why
+    // the condition is this short — a request admitted by the upgrade bearer or by
+    // the mint presents that credential in the one `Authorization` position, and
+    // `CredentialCollision` makes it byte-distinct from this one, so
+    // `library_read_authorized` is already false for both. Loopback is the only
+    // overlap left, and `unauthenticated_paste_allowed` is exactly it.
+    //
+    // The browser contract survives whole. The action stays `available` and keeps its
+    // `session_id`, which is all `apps/web`'s BFF reads before attaching its own
+    // same-origin bootstrap token, and that BFF strips every upstream `*_token` key
+    // before the browser sees the body regardless. The browser's real session token
+    // comes from `POST /api/viva-session/start`, which presents the session-mint
+    // credential — the authority that is allowed to create a session.
+    let read_credential_is_the_only_authority =
+        library_read_authorized && !state.unauthenticated_paste_allowed;
     let mut study_sets = Vec::with_capacity(snapshot.study_sets.len());
     for study_set in snapshot.study_sets {
         let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);
@@ -270,6 +337,14 @@ pub(super) async fn library_snapshot(
                 request_origin.as_deref(),
             ),
             (None, None) => unavailable_action("no_open_session"),
+        };
+        let (start, resume) = if read_credential_is_the_only_authority {
+            (
+                action_without_session_token(start),
+                action_without_session_token(resume),
+            )
+        } else {
+            (start, resume)
         };
         let mutation_auth_unavailable_reason =
             library_mutation_access_unavailable_reason(&state, &headers, &study_set.user_id);
@@ -588,6 +663,21 @@ pub(super) fn unavailable_action(reason: &'static str) -> LibraryAction {
         session_token: None,
         control_token: None,
         unavailable_reason: Some(reason),
+    }
+}
+
+/// `A-36.3` review fix: the same action, minus the one field that is a WebSocket key.
+///
+/// `session_token` is `skip_serializing_if = "Option::is_none"`, so the action goes on
+/// the wire as `{"available": true, "session_id": ...}` — the shape an action already
+/// has when no token could be signed, and the shape `apps/web`'s BFF reads to attach
+/// its own same-origin bootstrap token. Nothing else about the action changes: an
+/// available start stays available, because refusing it would re-open the deadlock
+/// `A-36.3` closed.
+pub(super) fn action_without_session_token(action: LibraryAction) -> LibraryAction {
+    LibraryAction {
+        session_token: None,
+        ..action
     }
 }
 

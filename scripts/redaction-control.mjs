@@ -385,6 +385,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /config\.ws_access\.session_token_secret\.is_none\(\)/,
       /session_token_secret: Some\("session-secret"\.to_owned\(\)\)/,
       /^\s*pub\ const\ VIVA_SESSION_TOKEN_HEADER:\ \&str\ =\ "x\-viva\-session\-token";\s*$/,
+      // A-36/LIB-READ admission: doc-comment naming the withheld token, not a value.
+      /^\s*\/\/\/\ export,\ or\ delete,\ and\ that\ it\ is\ served\ no\ `session_token`,\ since\ that\ token\s*$/,
       /^\s*session_token_secret:\ RedactedSecret,\s*$/,
       /^\s*session_token_secret,\s*$/,
       /^\s*let\ mut\ tokens\ =\ headers\.get_all\(VIVA_SESSION_TOKEN_HEADER\)\.iter\(\);\s*$/,
@@ -1699,7 +1701,13 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/http/library.rs",
     marker: "Bearer ",
-    patterns: Object.freeze([/^\s*"missing\ bearer\ token\ or\ library\ control\ token"\s*$/]),
+    patterns: Object.freeze([
+      /^\s*"missing\ bearer\ token\ or\ library\ control\ token"\s*$/,
+      // A-36/LIB-READ admission: prose naming VoiceWsAccess::required_bearer, no value.
+      /^\s*\/\/\ authority\ —\ D\-07's\ token\-only\ path,\ no\ upgrade\ bearer\ required\ —\ after\ which\s*$/,
+      /^\s*\/\/\ authority:\ the\ upgrade\ bearer\ opens\ the\ socket\ by\ itself,\ and\ a\ loopback\ bind\s*$/,
+      /^\s*\/\/\ the\ condition\ is\ this\ short\ —\ a\ request\ admitted\ by\ the\ upgrade\ bearer\ or\ by\s*$/,
+    ]),
   },
   {
     file: "agent/crates/agent-service/src/http/library.rs",
@@ -1755,6 +1763,14 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*session_token:\ Some\(session_token\),\s*$/,
       /^\s*signed_session_token_for\(\s*$/,
       /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \&\&\ state\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
+      // A-36/LIB-READ admission: the token-withholding seam — field name in
+      // prose/doc/function-name/call-site position only, never a value.
+      /^\s*\/\/\ mutation\ token\ and\ no\ export\.\ The\ fourth\ is\ `session_token`,\ and\ it\ needs\ the\s*$/,
+      /^\s*\/\/\ A\ start\ or\ resume\ action\ carries\ a\ `session_token`,\ and\s*$/,
+      /^\s*action_without_session_token\(start\),\s*$/,
+      /^\s*action_without_session_token\(resume\),\s*$/,
+      /^\s*\/\/\/\ `session_token`\ is\ `skip_serializing_if\ =\ "Option::is_none"`,\ so\ the\ action\ goes\ on\s*$/,
+      /^\s*pub\(super\)\ fn\ action_without_session_token\(action:\ LibraryAction\)\ \->\ LibraryAction\ \{\s*$/,
     ]),
   },
   {
