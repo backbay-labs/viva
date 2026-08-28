@@ -139,7 +139,35 @@ pub(super) async fn library_snapshot(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(&state.trusted_user_id);
-    if !state.unauthenticated_paste_allowed || user_id != state.trusted_user_id {
+    // `A-34`: the mint operation carries its own authority.
+    //
+    // A public bind sets `unauthenticated_paste_allowed` to false, so this route
+    // demands a credential — and the credential it demands is the deployment's REST
+    // bearer, which the session mint deliberately does not hold: the two are
+    // byte-distinct by configuration (`CredentialCollision` is startup-fatal). That
+    // left `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` required exactly where it could
+    // not be used, refusing the mint at this check before the record gate below saw
+    // it, and putting the projection back in the `A-32` deadlock.
+    //
+    // So the scoped credential authenticates the operation it exists for, and only
+    // that operation: a request that both presents it and names the study set it is
+    // starting is the mint, and is admitted as the mint. A request presenting it
+    // without naming a start is a plain library read, is not the operation this
+    // credential is for, and falls through to the ordinary check that refuses it —
+    // the mint never becomes a second way to read, export, or delete the library.
+    let mint_operation = query
+        .record_start_for
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mint_authorized = mint_operation.is_some()
+        && state
+            .session_mint_access
+            .as_ref()
+            .is_some_and(|access| access.authorizes(&headers));
+    if !mint_authorized
+        && (!state.unauthenticated_paste_allowed || user_id != state.trusted_user_id)
+    {
         if state.ws_access.required_bearer.is_none() {
             return (
                 StatusCode::FORBIDDEN,
@@ -185,13 +213,12 @@ pub(super) async fn library_snapshot(
     // bind or a loopback one, cannot open a durable session however it is written.
     // An unauthorized selector is ignored, not refused: the snapshot is still a
     // snapshot, and its start actions are still signed.
-    let record_start_for = state
-        .session_mint_access
-        .as_ref()
-        .filter(|access| access.authorizes(&headers))
-        .and(query.record_start_for.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    //
+    // `A-34`: this is the same decision the authentication above already made, which
+    // is why it is read from that decision rather than recomputed. A caller admitted
+    // as the mint records; every other caller — admitted by the REST bearer, by the
+    // loopback trust, or by nothing at all — reads.
+    let record_start_for = mint_authorized.then_some(mint_operation).flatten();
     let mut study_sets = Vec::with_capacity(snapshot.study_sets.len());
     for study_set in snapshot.study_sets {
         let mutation_control_token = signed_library_control_token(&state, &study_set.user_id);

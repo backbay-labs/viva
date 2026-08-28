@@ -549,6 +549,12 @@ const FIXTURE_LIBRARY_READ_CREDENTIAL: &str = "viva-fixture-library-read-cred-00
 /// (`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`). It is byte-distinct from the read
 /// credential the browser proxy presents, which is the entire point.
 const FIXTURE_SESSION_MINT_CREDENTIAL: &str = "viva-fixture-session-mint-cred-000001";
+/// `A-34.2`: the WebSocket upgrade credential a non-loopback deployment configures
+/// (`VIVA_VOICE_WS_BEARER_TOKEN`). It is the credential `library_snapshot`'s own
+/// bearer check compares against, and `CredentialCollision` makes it byte-distinct
+/// from the session-mint credential at startup — which is why the mint could not
+/// satisfy that check.
+const FIXTURE_WS_UPGRADE_CREDENTIAL: &str = "viva-fixture-websocket-upgrade-cred-1";
 
 /// A public deployment under `D-07 TOKEN_ONLY_REFRESH`: there is no WebSocket
 /// bearer at all, so the absent-permissive WebSocket bearer check would leave
@@ -5059,6 +5065,43 @@ fn signed_start_state_without_session_mint_authority(
     ))
 }
 
+/// `A-34.2`: the same deployment as [`signed_start_state`], bound the way a real
+/// public deployment is.
+///
+/// `main.rs` builds `with_unauthenticated_paste_allowed(config.bind_addr.ip().is_loopback())`,
+/// so on a non-loopback bind that flag is `false` and every library snapshot must
+/// present a credential. The upgrade bearer is configured, as a public bind's
+/// validation expects, and `CredentialCollision` guarantees it is byte-distinct
+/// from the session-mint credential.
+///
+/// This is the only bind shape on which `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` is
+/// required at all, so it is the shape the `A-32` deadlock fix has to work on.
+fn public_bind_signed_start_state(
+    store: Arc<dyn StudyMemoryStore>,
+    brain_store: Arc<dyn StudyMemoryStore>,
+) -> AppState {
+    AppState::with_study_store(
+        Arc::new(SyntheticBrain::with_study_store(brain_store)),
+        "synthetic",
+        VoiceWsAccess {
+            required_bearer: Some(FIXTURE_WS_UPGRADE_CREDENTIAL.into()),
+            session_token_secret: Some(STARTED_SESSION_SECRET.into()),
+            allowed_origins: vec![STARTED_SESSION_ORIGIN.to_owned()],
+        },
+        4,
+        store,
+    )
+    .with_unauthenticated_paste_allowed(false)
+    .with_projection_read_access(ProjectionReadAccess::new(
+        FIXTURE_LIBRARY_READ_CREDENTIAL.into(),
+        STARTED_SESSION_SECRET.into(),
+        vec![STARTED_SESSION_ORIGIN.to_owned()],
+    ))
+    .with_session_mint_access(SessionMintAccess::new(
+        FIXTURE_SESSION_MINT_CREDENTIAL.into(),
+    ))
+}
+
 /// Reads the library snapshot exactly as a caller does. `record_start_for` is the
 /// explicit start-mint selector: `None` is a plain listing read, `Some(id)` is the
 /// request `POST /api/viva-session/start` makes for the one set it is starting.
@@ -5081,6 +5124,23 @@ async fn library_snapshot_json_with_bearer(
     record_start_for: Option<&str>,
     bearer: Option<&str>,
 ) -> serde_json::Value {
+    let (status, payload) = library_snapshot_response(app, record_start_for, bearer).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the library snapshot is the mint path"
+    );
+    payload
+}
+
+/// The same read without the `200` assertion. On a non-loopback bind the status is
+/// the measurement: which credential the route admits, and for which operation, is
+/// the whole `A-34` question.
+async fn library_snapshot_response(
+    app: &axum::Router,
+    record_start_for: Option<&str>,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let uri = match record_start_for {
         Some(study_set_id) => {
             format!("/study-sets/library?user_id=user-1&record_start_for={study_set_id}")
@@ -5099,13 +5159,9 @@ async fn library_snapshot_json_with_bearer(
         .oneshot(request.body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the library snapshot is the mint path"
-    );
+    let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&body).unwrap()
+    (status, serde_json::from_slice(&body).unwrap())
 }
 
 fn library_study_set<'a>(
@@ -5578,6 +5634,235 @@ async fn signed_start_projection_and_socket_complete_the_entry_flow() {
     let writes = store.writes();
     assert_eq!(
         writes,
+        vec![
+            (session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted)),
+            (
+                session_id.clone(),
+                Ok(StudyStoreWriteOutcome::IdempotentReplay)
+            ),
+        ],
+        "the socket's own provisioning is an idempotent replay of the started session"
+    );
+    assert_eq!(
+        inner
+            .snapshot()
+            .sessions
+            .iter()
+            .filter(|session| session.voice_session_id == session_id)
+            .count(),
+        1,
+        "the replay must not create a second session"
+    );
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// `A-34.2`: the deadlock fix has to work on the bind that requires it.
+///
+/// Before this fix the mint's own request was refused by `library_snapshot`'s
+/// bearer check — `VoiceWsAccess::validate_bearer_headers`, which compares against
+/// the WebSocket upgrade credential — before the `A-32` record gate ever saw it.
+/// The session-mint credential is byte-distinct from that one by configuration, so
+/// on the only bind shape where `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` is required,
+/// the start answered `401` and the projection stayed in the exact deadlock `A-32`
+/// exists to break.
+///
+/// The mint is a credential for an operation. Naming the set it is starting, it
+/// mints and records; the row, its identity, and the pre-socket projection are the
+/// same ones the loopback shape already proves.
+#[tokio::test]
+async fn a_public_bind_signed_start_records_the_voice_session_its_projection_requires() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mint's own credential must reach the mint on a public bind: {payload}"
+    );
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    assert_eq!(
+        start["available"], true,
+        "the public-bind mint must offer a signed start: {start}"
+    );
+    let session_id = start["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+    let session_token = start["session_token"]
+        .as_str()
+        .expect("minted session token")
+        .to_owned();
+
+    assert_eq!(
+        store.writes(),
+        vec![(session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted))],
+        "the public-bind mint performs exactly one insert",
+    );
+    let recorded = inner
+        .snapshot()
+        .sessions
+        .into_iter()
+        .filter(|session| session.voice_session_id == session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the public-bind start records exactly one voice session"
+    );
+    assert_eq!(recorded[0].user_id, "user-1");
+    assert_eq!(recorded[0].study_set_id, "biology-midterm");
+    assert_eq!(recorded[0].status, "open");
+    assert_eq!(recorded[0].mode, StudyMode::Quiz);
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the public-bind start must be projectable before any socket opens: {projection}"
+    );
+    assert_eq!(projection["session"]["id"], session_id);
+    assert_eq!(projection["session"]["mode"], "quiz");
+}
+
+/// `A-34.2`: mint authority is not library-read authority.
+///
+/// The route admits the session-mint credential for the operation it is the
+/// credential *for*. A snapshot that names no start is a plain library read, and on
+/// a public bind that read belongs to the deployment's own REST credential — never
+/// to the mint. The identical request, minus the mint operation, is refused, and
+/// the export surface stays closed to it too, so the scope granted here is the mint
+/// and nothing wider.
+#[tokio::test]
+async fn the_session_mint_credential_is_not_library_read_authority() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, body) =
+        library_snapshot_response(&app, None, Some(FIXTURE_SESSION_MINT_CREDENTIAL)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the mint credential must not read the library: {body}"
+    );
+    assert_eq!(body["error"], "library_snapshot_auth_failed");
+    assert!(
+        !body.to_string().contains(FIXTURE_SESSION_MINT_CREDENTIAL),
+        "the refusal must not echo the credential: {body}"
+    );
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", STARTED_SESSION_ORIGIN)
+                .header(
+                    "authorization",
+                    format!("Bearer {FIXTURE_SESSION_MINT_CREDENTIAL}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        export.status(),
+        StatusCode::UNAUTHORIZED,
+        "the mint credential must not export the library either",
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "a refused read recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a refused read left a durable session behind",
+    );
+}
+
+/// `A-34.2`, the whole entry flow in the public-bind shape: the mint's credential
+/// opens a start, the projection answers before any socket exists, the socket
+/// admits the minted credential through the token-only upgrade even though a
+/// WebSocket bearer is configured, and its own provisioning is an idempotent replay
+/// of the started session rather than a second one.
+#[tokio::test]
+async fn public_bind_start_projection_and_socket_complete_the_entry_flow() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    // One store behind both the HTTP mint and the socket's provider, so the two
+    // writes and their outcomes are observed on the same port.
+    let state = public_bind_signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (status, payload) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the public-bind mint is the entry flow's first step: {payload}"
+    );
+    let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+    let session_id = start["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+    let session_token = start["session_token"]
+        .as_str()
+        .expect("minted session token")
+        .to_owned();
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &session_id, &session_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connectionEligible requires a valid projection before the socket: {projection}"
+    );
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let mut request = token_only_request(&url, &session_token);
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+    let (mut socket, _) = connect_async(request)
+        .await
+        .expect("the minted credential opens the socket on a public bind");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token("biology-midterm", &session_id, &session_token)
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let question = read_server_frame(&mut socket).await;
+    assert!(
+        matches!(question, ServerFrame::Event { .. }),
+        "the started session proceeds to its first question, got {question:?}"
+    );
+
+    assert_eq!(
+        store.writes(),
         vec![
             (session_id.clone(), Ok(StudyStoreWriteOutcome::Inserted)),
             (
