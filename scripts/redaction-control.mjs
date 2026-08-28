@@ -1,6 +1,31 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
+// 12B audit-config reconciliation (Plan 12, file owner).
+//
+// `SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES` below accumulated its rows across
+// nine coordinator-applied sanction admissions over the review-remediation
+// program -- A-12, A-15, A-16, A-21, A-23, A-24, A-25, A-27, A-29 (each
+// dated and self-described where it starts in the array; full provenance in
+// `docs/decisions/2026-08-23-plan-amendments.md`) -- plus this lane's own
+// earlier Task 3/4/7/11/13 rows and the W-07 local-signed-start-harness row.
+// Each admission scoped its own new rows without cross-checking rows already
+// present for the same `{file, marker}` pair, so sixteen pairs ended up
+// opened as separate array entries in more than one place (one of them,
+// `scripts/e2e-browser.mjs` / `session_token`, three times). At 12B this was
+// reviewed end to end and those sixteen pairs were consolidated into one
+// entry each, in place at their first occurrence: every existing anchored
+// literal pattern moved verbatim (byte-identical regex source and flags),
+// none was edited, widened, or dropped, and no new `{file, marker}` pairing
+// was introduced. Proof: parsing the array before and after the edit and
+// diffing the full sorted multiset of `{file, marker, pattern.source,
+// pattern.flags}` tuples showed zero additions and zero removals (1017
+// patterns, both before and after; 291 entries before, 274 after) --
+// `artifacts/sdd/evidence/redaction-consolidation-*.json`/`-proof.txt`. No
+// row outside those sixteen structurally-repeated pairs was touched; a
+// separately noted stale row (a reworded live-label-probe literal still
+// sanctioned under its retired form) was left in place as out of this
+// reconciliation's scope and reported instead of removed.
 export const REDACTED_VALUE = "[redacted]";
 
 // Backstop denylist for generated artifacts. Structural redaction at logging and
@@ -90,6 +115,199 @@ const SAFE_FORBIDDEN_MARKER_LITERALS = new Map([
 ]);
 
 const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
+  // RELEASE-015 / RELEASE-028 (Plan 12 Tasks 7 and 13). Every row below is
+  // dual-keyed on both the evidence marker and the structural field the same
+  // line trips (A-16: a single-keyed row is silently insufficient when both
+  // detectors fire). Each line was read in place and is parameter passing,
+  // a literal empty array, or a count -- never a value, never logging.
+  {
+    // The failure-control harness's own signing secret handed to the local
+    // scenario-target builder so it can construct the expired/replayed token
+    // the scenario is about. Pre-existing line; Task 7's main() wrap
+    // re-indented it, which is what re-presented it to the diff audit.
+    file: "scripts/e2e-browser.mjs",
+    marker: "session_secret",
+    patterns: Object.freeze([
+      /^\s*sessionSecret: failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET,?$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "source_context",
+    // The v5 client session_config's required-but-empty member. A literal
+    // empty array carries no source material by construction.
+    patterns: Object.freeze([/^\s*source_context: \[\],?$/]),
+  },
+  // W-07 (Plan 12B): the local browser story's signed-start configuration.
+  //
+  // Every line below is one of exactly four kinds, each read in place:
+  //   (a) a CONSTRUCTED loopback literal declared in this file -- not a
+  //       credential from anywhere, and deliberately not secret-shaped (A-16);
+  //       it configures the agent and web children this same process spawns on
+  //       freshly allocated loopback ports and reaps when it exits;
+  //   (b) a key of the FROZEN role environment `childEnvironmentFor` builds,
+  //       assigned one of those constants -- parameter passing, never logging,
+  //       never an evidence field;
+  //   (c) doc prose naming a field this code deliberately does NOT copy;
+  //   (d) the agent's own reason code `session_token_unavailable`, quoted in a
+  //       refusal message.
+  // Values are never logged, never written to evidence, and never reach the page.
+  {
+    // 12B reconciliation: also carries the two other `scripts/e2e-browser.mjs`
+    // `session_token` rows that pre-existed elsewhere in this file (the
+    // pre-W-07 `sessionToken: session.sessionToken` frame-construction line,
+    // and the failure-control-replay/URL-fragment/session-payload group) --
+    // same file, same marker, no pattern altered, dropped, or widened.
+    file: "scripts/e2e-browser.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*sessionToken: session\.sessionToken,?$/,
+      /^const LOCAL_STORY_SESSION_TOKEN_SECRET = "viva-local-e2e-session-token-material-0000";$/,
+      /^\s*\? LOCAL_STORY_SESSION_TOKEN_SECRET$/,
+      /^\s*: LOCAL_STORY_SESSION_TOKEN_SECRET,?$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled$/,
+      /^\s*\? failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET$/,
+      /^\s*: failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET$/,
+      /^ \* {4}start action `session_token_unavailable`, so the landing's Start control$/,
+      /^\s*"Local browser E2E requires VIVA_E2E_AGENT_DATABASE_URL: .*session_token_unavailable, and \/session opens no socket without an authenticated study projection -- so no local run without a durable store can reach an authenticated session\.",$/,
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
+      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
+      /\.replace\(\/#session_token=/,
+      /\.replace\(\/\[\?&\]session_token=/,
+      /#session_token=\$\{encodeURIComponent\(/,
+      /sessionPayload\.session_token/,
+      /^\s*session_token: session\.sessionToken,?$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "local_story_session_token_secret",
+    patterns: Object.freeze([
+      /^const LOCAL_STORY_SESSION_TOKEN_SECRET = "viva-local-e2e-session-token-material-0000";$/,
+      /^\s*\? LOCAL_STORY_SESSION_TOKEN_SECRET$/,
+      /^\s*: LOCAL_STORY_SESSION_TOKEN_SECRET,?$/,
+    ]),
+  },
+  {
+    // 12B reconciliation: also carries the second `viva_voice_session_token_secret`
+    // row that pre-existed elsewhere in this file (same file, same marker).
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled$/,
+      /^\s*\? failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET$/,
+      /^\s*: failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET$/,
+      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
+      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "local_story_bootstrap_token_secret",
+    patterns: Object.freeze([
+      /^const LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET = "viva-local-e2e-bootstrap-token-material-0";$/,
+      /^\s*VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_session_bootstrap_token_secret",
+    patterns: Object.freeze([
+      /^\s*VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET,$/,
+    ]),
+  },
+  {
+    // 12B reconciliation: also carries the second `Bearer ` row that
+    // pre-existed elsewhere in this file (same file, same marker).
+    file: "scripts/e2e-browser.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^const LOCAL_STORY_AGENT_SCOPED_BEARER = "viva-local-e2e-agent-scoped-read-material0";$/,
+      /\.replace\(\/Bearer\\s\+\[A-Za-z0-9\._~\+\/=-\]\+\/gi, "Bearer redacted"\)/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "local_story_agent_scoped_bearer",
+    patterns: Object.freeze([
+      /^const LOCAL_STORY_AGENT_SCOPED_BEARER = "viva-local-e2e-agent-scoped-read-material0";$/,
+      /^\s*\? LOCAL_STORY_AGENT_SCOPED_BEARER$/,
+      /^\s*VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+      /^\s*VIVA_AGENT_REST_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+      /^\s*VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_agent_library_read_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: localSignedSessionMode$/,
+      /^\s*VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_agent_rest_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_REST_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "viva_agent_session_mint_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "answer_text",
+    // Doc prose on `learningTruthEventFields`, enumerating the free-text
+    // members it deliberately does NOT copy out of a validated event.
+    patterns: Object.freeze([
+      /^ \* in one place: free text \(`question\.prompt`, `evaluation\.answer_text`,$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "transcript_final",
+    // A COUNT of final transcripts in the voice-transport matrix cell, and the
+    // two comparisons that read it. No transcript text is represented here.
+    patterns: Object.freeze([
+      /^\s*transcript_final_count: Array\.isArray\(turn\.transcripts\) \? turn\.transcripts\.length : 0,?$/,
+      /^\s*if \(cell\.transcript_final_count !== 1\) \{$/,
+      /transcript_final_count\} final transcripts, expected exactly 1/,
+    ]),
+  },
+  {
+    // The v5 client session_config's credential member, constructed from the
+    // smoke's own bootstrap response immediately before the frame is sent.
+    file: "scripts/live-provider-smoke.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([/^\s*session_token: session\.signedSession \?\? "",?$/]),
+  },
+  {
+    file: "scripts/live-provider-smoke.mjs",
+    marker: "source_context",
+    patterns: Object.freeze([/^\s*source_context: \[\],?$/]),
+  },
+  {
+    // T7-13 admission: the bootstrap paste posts the smoke's own operator- or
+    // default-synthetic study text to /study-sets/paste — request construction,
+    // never captured evidence or a learner payload.
+    file: "scripts/live-provider-smoke.mjs",
+    marker: "pasted_text",
+    patterns: Object.freeze([/^\s*pasted_text: config\.bootstrapText,$/]),
+  },
+  {
+    // T7-13 admission: a doc comment enumerating what the artifact must NOT
+    // contain — the redaction disclosure itself, not an emission.
+    file: "scripts/live-provider-smoke.mjs",
+    marker: "prompt",
+    patterns: Object.freeze([
+      /^\s*\* current frame, audio bytes, transcript, answer, prompt, or session token\.$/,
+    ]),
+  },
   {
     file: "agent/crates/agent-service/src/ws.rs",
     marker: "session_token",
@@ -115,6 +333,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([/text: question\.prompt,/]),
   },
   {
+    // 12B reconciliation: also carries the second `llm.rs` `api_key` row that
+    // pre-existed elsewhere in this file (same file, same marker).
     file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
     marker: "api_key",
     patterns: Object.freeze([
@@ -123,6 +343,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /assert_eq!\(capture\.api_key\.as_deref\(\), Some\("local-fixture"\)\);/,
       /assert_eq!\(capture\.api_key\.as_deref\(\), Some\("gemini-test-key"\)\);/,
       /api_key: Some\(request\.api_key\),/,
+      /^\s*let\ api_key\ =\ HeaderValue::from_str\(\&request\.api_key\)\.map_err\(\|_\|\ \{\s*$/,
+      /^\s*api_key:\ format!\("\{GEMINI_TOKEN_MARKER\}\\u\{7f\}\\u\{1\}"\),\s*$/,
     ]),
   },
   {
@@ -131,36 +353,78 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([/BrainError::MissingApiKey => \(/]),
   },
   {
+    // 12B reconciliation: also carries the second `runner.rs` `api_key` row
+    // that pre-existed elsewhere in this file (same file, same marker).
     file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
     marker: "api_key",
-    patterns: Object.freeze([/api_key: "gemini-test-key"\.to_owned\(\),/]),
+    patterns: Object.freeze([
+      /api_key: "gemini-test-key"\.to_owned\(\),/,
+      /^\s*api_key:\ "gemini\-live\-label\-probe"\.to_owned\(\),\s*$/,
+    ]),
   },
   {
+    // 12B reconciliation: also carries the second `runner.rs` `answer_text`
+    // row that pre-existed elsewhere in this file (same file, same marker).
     file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
     marker: "answer_text",
     patterns: Object.freeze([
       /answer_text: "omitted",/,
       /"answer_text": "omitted",/,
+      /^\s*answer_text:\ \&str,\s*$/,
+      /^\s*let\ evaluation\ =\ answer_evaluation_from_outcome\(\&outcome,\ answer_text,\ \&source,\ question\)\?;\s*$/,
+      /^\s*"answer_text":\ "a\ spoken\ answer",\s*$/,
+      /^\s*answer_text:\ "the\ learner\ answer"\.to_owned\(\),\s*$/,
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `config.rs` `session_token`
+    // row that pre-existed elsewhere in this file (same file, same marker).
     file: "agent/crates/agent-service/src/config.rs",
     marker: "session_token",
     patterns: Object.freeze([
       /config\.ws_access\.session_token_secret\.is_none\(\)/,
       /session_token_secret: Some\("session-secret"\.to_owned\(\)\)/,
+      /^\s*pub\ const\ VIVA_SESSION_TOKEN_HEADER:\ \&str\ =\ "x\-viva\-session\-token";\s*$/,
+      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
+      /^\s*session_token_secret,\s*$/,
+      /^\s*let\ mut\ tokens\ =\ headers\.get_all\(VIVA_SESSION_TOKEN_HEADER\)\.iter\(\);\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",\s*$/,
+      /^\s*self\.ws_access\.session_token_secret\.is_some\(\),\s*$/,
+      /^\s*if\ credential\.is_some\(\)\ \&\&\ self\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
+      /^\s*\#\[error\("`\{0\}`\ requires\ `VIVA_VOICE_SESSION_TOKEN_SECRET`"\)\]\s*$/,
+      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
+      /^\s*let\ Some\(secret\)\ =\ \&access\.session_token_secret\ else\ \{\s*$/,
+      /^\s*let\ claims\ =\ verify_session_token_at\(\&presented,\ secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*const\ SESSION_TOKEN_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
+      /^\s*const\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
+      /^\s*pub\ fn\ verify_session_token_at\(\s*$/,
+      /^\s*let\ claims\ =\ decode_session_token_claims\(\&claims_bytes\)\?;\s*$/,
+      /^\s*fn\ decode_session_token_claims\(bytes:\ \&\[u8\]\)\ \->\ Result<SessionTokenClaims,\ SessionTokenError>\ \{\s*$/,
+      /^\s*\.any\(\|name\|\ !SESSION_TOKEN_CLAIM_NAMES\.contains\(\&name\.as_str\(\)\)\)\s*$/,
+      /^\s*if\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&RedactedSecret::from\(secret\),\ now,\ None\)\s*$/,
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET"\ =>\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.to_owned\(\)\),\s*$/,
+      /^\s*public_env\(\&\[\("VIVA_VOICE_SESSION_TOKEN_SECRET",\ None\)\]\),\s*$/,
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `config.rs`
+    // `session_token_secret` row that pre-existed elsewhere in this file
+    // (same file, same marker).
     file: "agent/crates/agent-service/src/config.rs",
     marker: "session_token_secret",
-    patterns: Object.freeze([/session_token_secret: Some\("session-secret"\.to_owned\(\)\)/]),
-  },
-  {
-    file: "scripts/e2e-browser.mjs",
-    marker: "Bearer ",
     patterns: Object.freeze([
-      /\.replace\(\/Bearer\\s\+\[A-Za-z0-9\._~\+\/=-\]\+\/gi, "Bearer redacted"\)/,
+      /session_token_secret: Some\("session-secret"\.to_owned\(\)\)/,
+      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
+      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
+      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
+      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
+      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
+      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
     ]),
   },
   {
@@ -175,19 +439,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "scripts/e2e-browser.mjs",
-    marker: "session_token",
-    patterns: Object.freeze([
-      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
-      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
-      /\.replace\(\/#session_token=/,
-      /\.replace\(\/\[\?&\]session_token=/,
-      /#session_token=\$\{encodeURIComponent\(/,
-      /sessionPayload\.session_token/,
-      /^\s*session_token: session\.sessionToken,?$/,
-    ]),
-  },
-  {
-    file: "scripts/e2e-browser.mjs",
     marker: "session_bootstrap_token",
     patterns: Object.freeze([
       /action\?\.session_bootstrap_token/,
@@ -195,11 +446,52 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     ]),
   },
   {
-    file: "scripts/e2e-browser.mjs",
-    marker: "viva_voice_session_token_secret",
+    // RELEASE-029: the deny-first per-role explicit-key allowlist names its
+    // keys as bare string literals -- e.g. `"VIVA_VOICE_SESSION_TOKEN_SECRET"`
+    // in an `Object.freeze([...])` array -- never a secret value. Naming a
+    // key a role may set is exactly what this module exists to do.
+    file: "scripts/child-environment.mjs",
+    marker: "session_token",
     patterns: Object.freeze([
-      /VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan\.enabled/,
-      /failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET/,
+      /^\s*"VIVA_LIVE_SMOKE_SESSION_TOKEN",?$/,
+      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",?$/,
+    ]),
+  },
+  {
+    file: "scripts/child-environment.mjs",
+    marker: "CARTESIA_API_KEY",
+    patterns: Object.freeze([/^\s*"CARTESIA_API_KEY",?$/]),
+  },
+  {
+    file: "scripts/child-environment.mjs",
+    marker: "GEMINI_API_KEY",
+    patterns: Object.freeze([/^\s*"GEMINI_API_KEY",?$/]),
+  },
+  {
+    // RELEASE-029/RELEASE-016/021: `buildDevAgentEnv` only forwards these
+    // when the developer explicitly opts in with
+    // `VIVA_DEV_AGENT_SIGNED_SESSION=1`, and only via the "dev-agent" role's
+    // typed allowlist -- never a blind copy of the parent environment.
+    file: "scripts/dev-agent.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: signedSession$/,
+      /^\s*\? \(source\.VIVA_VOICE_SESSION_TOKEN_SECRET \?\? ""\)$/,
+    ]),
+  },
+  {
+    // The same `KEY: signedSession` line also parses as a `_secret`-suffixed
+    // structural field (its key, not a value) -- allow it under its
+    // normalized structural-field name too.
+    file: "scripts/dev-agent.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([/^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: signedSession$/]),
+  },
+  {
+    file: "scripts/dev-agent.mjs",
+    marker: "viva_voice_ws_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_VOICE_WS_BEARER_TOKEN: signedSession \? \(source\.VIVA_VOICE_WS_BEARER_TOKEN \?\? ""\) : "",?$/,
     ]),
   },
   {
@@ -217,12 +509,31 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([/authorization: `AWS4-HMAC-SHA256 Credential=/]),
   },
   {
+    // RELEASE-018/025: `hosted-monitor-state.mjs`'s `signedS3Request` builds
+    // the same SigV4 `authorization` header as the sibling S3 publisher in
+    // `hosted-monitor-runner.mjs` above -- the scheme/credential-scope
+    // literal, never a live key/signature value.
+    file: "scripts/hosted-monitor-state.mjs",
+    marker: "authorization",
+    patterns: Object.freeze([/authorization: `AWS4-HMAC-SHA256 Credential=/]),
+  },
+  {
+    // T7-13 admission: `signingKey` derives the SigV4 key chain exactly like
+    // the sanctioned sibling in `hosted-monitor-runner.mjs` — the secret is
+    // consumed by hmac(), never emitted.
+    file: "scripts/hosted-monitor-state.mjs",
+    marker: "secret",
+    patterns: Object.freeze([/hmac\(`AWS4\$\{secret\}`, dateStamp\)/]),
+  },
+  {
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "secret",
     patterns: Object.freeze([
       /hmac\(`AWS4\$\{secret\}`, dateStamp\)/,
-      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
-      /^function signedLiveMonitorSession\(\{ secret, sessionId, studySetId, userId \}\) \{$/,
+      // RELEASE-016/021: `materializeHostedLiveSmokeRun` reads the signing
+      // secret from a caller-supplied `env` only at spawn time, as a local
+      // `const`, never as a plan-time object property.
+      /^\s*const secret = requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\);$/,
       /createHmac\("sha256", secret\)\.update\(payload\)\.digest\("base64url"\)/,
     ]),
   },
@@ -231,9 +542,17 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "session_token",
     patterns: Object.freeze([
       /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
-      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
-      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
-      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+      /^\s*const secret = requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\);$/,
+      // RELEASE-016/021: `hostedLiveMonitorConfigFromEnv` checks the signing
+      // secret's presence at plan-construction time -- so a misconfigured
+      // live monitor fails fast, before any durable-state reservation or
+      // preceding leg runs -- but deliberately discards the returned value;
+      // it is never assigned or retained here.
+      /^\s*requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\);$/,
+      // RELEASE-016/021: the just-in-time materializer signs the token
+      // itself immediately before spawn; it is never a pre-minted
+      // `liveConfig` field.
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession\(claims, secret\),?$/,
     ]),
   },
   {
@@ -250,8 +569,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "scripts/hosted-monitor-runner.mjs",
     marker: "viva_live_smoke_session_token",
     patterns: Object.freeze([
-      /^\s*\? \{ VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession \}$/,
-      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig\.session\.signedSession,?$/,
+      /^\s*VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession\(claims, secret\),?$/,
     ]),
   },
   {
@@ -259,7 +577,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "viva_voice_session_token_secret",
     patterns: Object.freeze([
       /VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue/,
-      /^\s*secret: requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\),?$/,
+      /^\s*const secret = requiredValue\(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"\);$/,
     ]),
   },
   {
@@ -324,6 +642,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     patterns: Object.freeze([
       /const signingSecret = stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\);/,
       /pushUnless\(missing, "bundle_signing_secret", stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\) !== null\);/,
+      /if \(stringOrNull\(env\.VIVA_RELEASE_BUNDLE_SIGNING_SECRET\) === null\) \{/,
     ]),
   },
   // A-12 (2026-08-25): coordinator-applied sanction rows for Plan 05's v5 wire
@@ -486,6 +805,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `memory.rs` `answer_text`
+    // row that pre-existed elsewhere in this file (same file, same marker).
     file: "agent/crates/data/src/memory.rs",
     marker: "answer_text",
     patterns: Object.freeze([
@@ -493,6 +814,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*answer_text:\ "NADH\ gives\ electrons\."\.to_owned\(\),\s*$/,
       /^\s*answer_text:\ "mitosis\ chromosome\ spindle"\.to_owned\(\),\s*$/,
       /^\s*answer_text:\ "photosynthesis\ chloroplast"\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ "the\ learner\ said\ something"\.to_owned\(\),\s*$/,
     ]),
   },
   {
@@ -568,6 +890,10 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     file: "agent/crates/data/src/memory.rs",
     marker: "session_token",
     patterns: Object.freeze([
+      // 12B reconciliation: also carries the second `memory.rs`
+      // `session_token` row that pre-existed elsewhere in this file (same
+      // file, same marker).
+      /^\s*EventAuthorizationRecord,\ ReviewScheduleEventPayload,\ SESSION_TOKEN_NONCE_SKEW_SECONDS,\s*$/,
       /^\s*SESSION_TOKEN_NONCE_SKEW_SECONDS,\s*$/,
       /^\s*pub\ session_token_nonces:\ Vec<SessionTokenNonceClaim>,\s*$/,
       /^\s*async\ fn\ claim_session_token_nonce\(\s*$/,
@@ -662,18 +988,17 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/data/src/memory/ingestion.rs",
     marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*session_token:\ None,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*session_token:\ None,\s*$/]),
   },
   {
     file: "agent/crates/data/src/memory/learning.rs",
     marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*"answer_text",\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"answer_text",\s*$/]),
   },
   {
+    // 12B reconciliation: also carries the second `learning.rs`
+    // `authorization` row that pre-existed elsewhere in this file (same
+    // file, same marker).
     file: "agent/crates/data/src/memory/learning.rs",
     marker: "authorization",
     patterns: Object.freeze([
@@ -685,6 +1010,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*state\.event_authorizations\.insert\(authorization\);\s*$/,
       /^\s*EventAuthorizationKind::AnswerEvaluation,\s*$/,
       /^\s*EventAuthorizationKind::ConceptStatus,\s*$/,
+      /^\s*if\ !authorization::is_recorded_locked\(\&state,\ \&authorization\)\ \{\s*$/,
+      /^\s*authorization::record_locked\(\&mut\ state,\ authorization\);\s*$/,
     ]),
   },
   {
@@ -706,10 +1033,16 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `store_conformance.rs`
+    // `answer_text` row that pre-existed elsewhere in this file (same file,
+    // same marker).
     file: "agent/crates/data/src/memory/store_conformance.rs",
     marker: "answer_text",
     patterns: Object.freeze([
       /^\s*answer_text:\ "The\ gradient\ drives\ ATP\ synthase\."\.to_owned\(\),\s*$/,
+      /^\s*answer_text:\ \&str,\s*$/,
+      /^\s*answer_text:\ answer_text\.to_owned\(\),\s*$/,
+      /^\s*retranscribed\.answer_text\ =\ "A\ different\ transcript\ of\ the\ same\ turn\."\.to_owned\(\);\s*$/,
     ]),
   },
   {
@@ -921,14 +1254,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
-    marker: "api_key",
-    patterns: Object.freeze([
-      /^\s*let\ api_key\ =\ HeaderValue::from_str\(\&request\.api_key\)\.map_err\(\|_\|\ \{\s*$/,
-      /^\s*api_key:\ format!\("\{GEMINI_TOKEN_MARKER\}\\u\{7f\}\\u\{1\}"\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
     marker: "prompt",
     patterns: Object.freeze([
       /^\s*\/\/\ allowlisted\ diagnostic\ code\.\ No\ provider\ body,\ prompt,\ audio,\ token,\ URL,\s*$/,
@@ -1000,24 +1325,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "CARTESIA_API_KEY",
     patterns: Object.freeze([
       /^\s*cartesia_api_key:\ String::new\(\),\s*$/,
-      /^\s*cartesia_api_key:\ "sk_car_live_label_probe"\.to_owned\(\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
-    marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*answer_text:\ \&str,\s*$/,
-      /^\s*let\ evaluation\ =\ answer_evaluation_from_outcome\(\&outcome,\ answer_text,\ \&source,\ question\)\?;\s*$/,
-      /^\s*"answer_text":\ "a\ spoken\ answer",\s*$/,
-      /^\s*answer_text:\ "the\ learner\ answer"\.to_owned\(\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
-    marker: "api_key",
-    patterns: Object.freeze([
-      /^\s*api_key:\ "gemini\-live\-label\-probe"\.to_owned\(\),\s*$/,
     ]),
   },
   {
@@ -1036,7 +1343,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "cartesia_api_key",
     patterns: Object.freeze([
       /^\s*cartesia_api_key:\ String::new\(\),\s*$/,
-      /^\s*cartesia_api_key:\ "sk_car_live_label_probe"\.to_owned\(\),\s*$/,
     ]),
   },
   {
@@ -1057,16 +1363,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
     marker: "api_key",
-    patterns: Object.freeze([
-      /^\s*api_key:\ "gemini\-test\-key"\.to_owned\(\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*api_key:\ "gemini\-test\-key"\.to_owned\(\),\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
     marker: "authorization",
-    patterns: Object.freeze([
-      /^\s*authorization:\ F,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*authorization:\ F,\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/session.rs",
@@ -1100,9 +1402,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/stt.rs",
     marker: "cancellation_token",
-    patterns: Object.freeze([
-      /^\s*\&CancellationToken::new\(\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\&CancellationToken::new\(\),\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
@@ -1139,16 +1439,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-adapters/src/cartesia_gemini/tts.rs",
     marker: "pcm16_base64",
-    patterns: Object.freeze([
-      /^\s*let\ frame\ =\ AudioFrame::from_base64\(pcm16_base64\)\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ frame\ =\ AudioFrame::from_base64\(pcm16_base64\)\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/src/synthetic.rs",
     marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*answer_text:\ answer\.to_owned\(\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*answer_text:\ answer\.to_owned\(\),\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/src/synthetic.rs",
@@ -1222,9 +1518,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
     marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*!body\.contains\("session_token"\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*!body\.contains\("session_token"\),\s*$/]),
   },
   {
     file: "agent/crates/agent-adapters/tests/cartesia_gemini.rs",
@@ -1265,9 +1559,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/app.rs",
     marker: "prompt",
-    patterns: Object.freeze([
-      /^\s*let\ prompt\ =\ event\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ prompt\ =\ event\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/app.rs",
@@ -1354,67 +1646,18 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "agent/crates/agent-service/src/config.rs",
-    marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*pub\ const\ VIVA_SESSION_TOKEN_HEADER:\ \&str\ =\ "x\-viva\-session\-token";\s*$/,
-      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
-      /^\s*session_token_secret,\s*$/,
-      /^\s*let\ mut\ tokens\ =\ headers\.get_all\(VIVA_SESSION_TOKEN_HEADER\)\.iter\(\);\s*$/,
-      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
-      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
-      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",\s*$/,
-      /^\s*self\.ws_access\.session_token_secret\.is_some\(\),\s*$/,
-      /^\s*if\ credential\.is_some\(\)\ \&\&\ self\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
-      /^\s*\#\[error\("`\{0\}`\ requires\ `VIVA_VOICE_SESSION_TOKEN_SECRET`"\)\]\s*$/,
-      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
-      /^\s*let\ Some\(secret\)\ =\ \&access\.session_token_secret\ else\ \{\s*$/,
-      /^\s*let\ claims\ =\ verify_session_token_at\(\&presented,\ secret,\ now_unix_seconds,\ None\)\s*$/,
-      /^\s*const\ SESSION_TOKEN_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
-      /^\s*const\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES:\ \&\[\&str\]\ =\ \&\[\s*$/,
-      /^\s*pub\ fn\ verify_session_token_at\(\s*$/,
-      /^\s*let\ claims\ =\ decode_session_token_claims\(\&claims_bytes\)\?;\s*$/,
-      /^\s*fn\ decode_session_token_claims\(bytes:\ \&\[u8\]\)\ \->\ Result<SessionTokenClaims,\ SessionTokenError>\ \{\s*$/,
-      /^\s*\.any\(\|name\|\ !SESSION_TOKEN_CLAIM_NAMES\.contains\(\&name\.as_str\(\)\)\)\s*$/,
-      /^\s*if\ SESSION_TOKEN_REQUIRED_CLAIM_NAMES\s*$/,
-      /^\s*verify_session_token_at\(token,\ \&RedactedSecret::from\(secret\),\ now,\ None\)\s*$/,
-      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
-      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
-      /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET"\ =>\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.to_owned\(\)\),\s*$/,
-      /^\s*public_env\(\&\[\("VIVA_VOICE_SESSION_TOKEN_SECRET",\ None\)\]\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/agent-service/src/config.rs",
-    marker: "session_token_secret",
-    patterns: Object.freeze([
-      /^\s*session_token_secret:\ RedactedSecret,\s*$/,
-      /^\s*verify_session_token_at\(token,\ \&self\.session_token_secret,\ now_unix_seconds,\ None\)\s*$/,
-      /^\s*config\.ws_access\.session_token_secret\ =\ Some\(secret\.into\(\)\);\s*$/,
-      /^\s*pub\ session_token_secret:\ Option<RedactedSecret>,\s*$/,
-      /^\s*session_token_secret:\ Some\("session\-secret"\.into\(\)\),\s*$/,
-      /^\s*session_token_secret:\ Some\(FIXTURE_SESSION_SIGNING_SECRET\.into\(\)\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/agent-service/src/config.rs",
     marker: "token",
-    patterns: Object.freeze([
-      /^\s*let\ token\ =\ token\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ token\ =\ token\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
     marker: "Bearer ",
-    patterns: Object.freeze([
-      /^\s*"Bearer\ viva\-fixture\-operator\-credential\-0001\ ",\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"Bearer\ viva\-fixture\-operator\-credential\-0001\ ",\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
     marker: "bearer.",
-    patterns: Object.freeze([
-      /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \{\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \{\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
@@ -1427,9 +1670,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
     marker: "redacted_secret",
-    patterns: Object.freeze([
-      /^\s*\.map\(RedactedSecret::as_str\)\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\.map\(RedactedSecret::as_str\)\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
@@ -1445,9 +1686,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
     marker: "session_token_secret",
-    patterns: Object.freeze([
-      /^\s*\.session_token_secret\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\.session_token_secret\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/ingestion.rs",
@@ -1460,9 +1699,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/http/library.rs",
     marker: "Bearer ",
-    patterns: Object.freeze([
-      /^\s*"missing\ bearer\ token\ or\ library\ control\ token"\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"missing\ bearer\ token\ or\ library\ control\ token"\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/library.rs",
@@ -1523,16 +1760,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/http/library.rs",
     marker: "session_token_secret",
-    patterns: Object.freeze([
-      /^\s*\.session_token_secret\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\.session_token_secret\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/http/library.rs",
     marker: "token",
-    patterns: Object.freeze([
-      /^\s*let\ token\ =\ headers\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ token\ =\ headers\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/lib.rs",
@@ -1585,9 +1818,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/ws/preflight.rs",
     marker: "redacted_secret",
-    patterns: Object.freeze([
-      /^\s*\.map\(RedactedSecret::as_str\)\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\.map\(RedactedSecret::as_str\)\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/preflight.rs",
@@ -1608,23 +1839,17 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/ws/preflight.rs",
     marker: "session_token_secret",
-    patterns: Object.freeze([
-      /^\s*\.session_token_secret\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\.session_token_secret\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/preflight.rs",
     marker: "source_context",
-    patterns: Object.freeze([
-      /^\s*config\.source_context\.clear\(\);\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*config\.source_context\.clear\(\);\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/preflight.rs",
     marker: "token",
-    patterns: Object.freeze([
-      /^\s*let\ token\ =\ initial\.session_token\.as_str\(\);\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ token\ =\ initial\.session_token\.as_str\(\);\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/provider.rs",
@@ -1639,9 +1864,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/ws/tests.rs",
     marker: "Bearer ",
-    patterns: Object.freeze([
-      /^\s*Ok\(_\)\ =>\ panic!\("expected\ bearer\ rejection"\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*Ok\(_\)\ =>\ panic!\("expected\ bearer\ rejection"\),\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/tests.rs",
@@ -1686,9 +1909,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/ws/tests.rs",
     marker: "session_token_secret",
-    patterns: Object.freeze([
-      /^\s*session_token_secret:\ None,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*session_token_secret:\ None,\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/tests.rs",
@@ -1704,24 +1925,17 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/src/ws/turn.rs",
     marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*ClientAction::AnswerText\ =>\ \(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*ClientAction::AnswerText\ =>\ \(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/turn.rs",
     marker: "pcm16_base64",
-    patterns: Object.freeze([
-      /^\s*"\$\.frame\.pcm16_base64"\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"\$\.frame\.pcm16_base64"\s*$/]),
   },
   {
     file: "agent/crates/agent-service/src/ws/turn.rs",
     marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*session_token,\s*$/,
-      /^\s*\&session_token,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*session_token,\s*$/, /^\s*\&session_token,\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -1816,9 +2030,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "canonical_token",
-    patterns: Object.freeze([
-      /^\s*let\ canonical_token\ =\ \&vectors\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ canonical_token\ =\ \&vectors\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -1848,37 +2060,27 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "denied_token",
-    patterns: Object.freeze([
-      /^\s*let\ denied_token\ =\ nonce_audit_token_for\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ denied_token\ =\ nonce_audit_token_for\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "duplicate_biology_token",
-    patterns: Object.freeze([
-      /^\s*let\ duplicate_biology_token\ =\ signed_session_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ duplicate_biology_token\ =\ signed_session_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "first_frame_token",
-    patterns: Object.freeze([
-      /^\s*let\ first_frame_token\ =\ provider_limiter_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ first_frame_token\ =\ provider_limiter_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "first_socket_token",
-    patterns: Object.freeze([
-      /^\s*let\ first_socket_token\ =\ provider_limiter_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ first_socket_token\ =\ provider_limiter_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "first_token",
-    patterns: Object.freeze([
-      /^\s*let\ first_token\ =\ nonce_audit_token_for\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ first_token\ =\ nonce_audit_token_for\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -1890,16 +2092,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "normal_token",
-    patterns: Object.freeze([
-      /^\s*let\ normal_token\ =\ signed_session_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ normal_token\ =\ signed_session_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "owner_password",
-    patterns: Object.freeze([
-      /^\s*const\ OWNER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-owner";\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*const\ OWNER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-owner";\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -1936,9 +2134,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "physics_token",
-    patterns: Object.freeze([
-      /^\s*let\ physics_token\ =\ signed_session_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ physics_token\ =\ signed_session_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -1958,16 +2154,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "retry_token",
-    patterns: Object.freeze([
-      /^\s*let\ retry_token\ =\ provider_limiter_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ retry_token\ =\ provider_limiter_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "second_socket_token",
-    patterns: Object.freeze([
-      /^\s*let\ second_socket_token\ =\ provider_limiter_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ second_socket_token\ =\ provider_limiter_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -2091,9 +2283,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "socket_token",
-    patterns: Object.freeze([
-      /^\s*let\ socket_token\ =\ provider_limiter_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ socket_token\ =\ provider_limiter_token\(\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -2128,16 +2318,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "transcript_final",
-    patterns: Object.freeze([
-      /^\s*assert!\(!exported\.contains\("transcript_final"\)\);\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*assert!\(!exported\.contains\("transcript_final"\)\);\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "user_password",
-    patterns: Object.freeze([
-      /^\s*const\ USER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-user";\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*const\ USER_PASSWORD:\ \&\[u8\]\ =\ b"viva\-user";\s*$/]),
   },
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
@@ -2155,9 +2341,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "agent/crates/agent-service/tests/voice_ws.rs",
     marker: "wrong_secret_token",
-    patterns: Object.freeze([
-      /^\s*let\ wrong_secret_token\ =\ signed_session_token\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*let\ wrong_secret_token\ =\ signed_session_token\(\s*$/]),
   },
   {
     file: "agent/fixtures/voice-protocol/fake-cartesia-gemini-study-session.json",
@@ -2189,16 +2373,20 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
     marker: "token",
-    patterns: Object.freeze([
-      /^\s*const\ token\ =\ vivaAgentScopedCredential\(\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*const\ token\ =\ vivaAgentScopedCredential\(\s*$/]),
   },
   {
+    // 12B reconciliation: also carries the second `shared.ts` `Bearer ` row
+    // that pre-existed elsewhere in this file (same file, same marker).
     file: "apps/web/app/api/viva-session/shared.ts",
     marker: "Bearer ",
     patterns: Object.freeze([
       /^\s*\*\ Least\-privilege\ service\ credential\ selection\.\ A\ scoped\ bearer\ is\ required;\ the\ legacy\ broad\s*$/,
       /^\s*\*\ bearer\ is\ accepted\ only\ behind\ the\ explicit\ migration\ escape\ hatch\ AND\ a\ loopback\ agent\ URL\.\s*$/,
+      /^\s*"bearer\ ",\s*$/,
+      /^\s*authorization:\ `Bearer\ \$\{input\.scopedCredential\}`,\s*$/,
+      /^\s*const\ match\ =\ \/\^Bearer\ \(\[\\x21\-\\x7e\]\+\)\$\/\.exec\(value\);\s*$/,
+      /^\s*authorization:\ `Bearer\ \$\{credential\}`,\s*$/,
     ]),
   },
   {
@@ -2216,14 +2404,20 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `shared.ts` `session_token`
+    // row that pre-existed elsewhere in this file (same file, same marker).
     file: "apps/web/app/api/viva-session/shared.ts",
     marker: "session_token",
     patterns: Object.freeze([
       /^\s*"VIVA_VOICE_SESSION_TOKEN_SECRET",\s*$/,
       /^\s*"VIVA_VOICE_SESSION_TOKEN_PREVIOUS_SECRET",\s*$/,
+      /^\s*minted:\ \{\ session_token:\ string\ \},\s*$/,
+      /^\s*token:\ minted\.session_token,\s*$/,
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `shared.ts` `token` row
+    // that pre-existed elsewhere in this file (same file, same marker).
     file: "apps/web/app/api/viva-session/shared.ts",
     marker: "token",
     patterns: Object.freeze([
@@ -2237,13 +2431,18 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*if\ \(Buffer\.byteLength\(input\.token,\ "utf8"\)\ >\ CAPABILITY_TOKEN_MAX_BYTES\)\ return\ null;\s*$/,
       /^\s*function\ verifySessionBootstrapTokenClaims\(token:\ string\):\ SessionBootstrapTokenClaims\ \|\ null\ \{\s*$/,
       /^\s*function\ verifyLibraryControlTokenClaims\(token:\ string\):\ LibraryControlTokenClaims\ \|\ null\ \{\s*$/,
+      /^\s*token:\ minted\.session_token,\s*$/,
+      /^\s*token:\ credential,\s*$/,
     ]),
   },
   {
+    // 12B reconciliation: also carries the second `shared.ts` `viva1.` row
+    // that pre-existed elsewhere in this file (same file, same marker).
     file: "apps/web/app/api/viva-session/shared.ts",
     marker: "viva1.",
     patterns: Object.freeze([
       /^\s*\*\ Ordered\ exactly\ as\ Plan\ 05\ pins\ it:\ bounded\ size,\ `viva1\.<claims>\.<signature>`\ framing,\s*$/,
+      /^\s*"viva1\.",\s*$/,
     ]),
   },
   // A-24 (2026-08-26): coordinator-applied sanction rows for the A-22/A-24
@@ -2254,20 +2453,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "answer_evaluation_event_payload",
     patterns: Object.freeze([
       /^\s*\&AnswerEvaluationEventPayload::from_browser_event\(\&evaluation\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/data/src/memory.rs",
-    marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*answer_text:\ "the\ learner\ said\ something"\.to_owned\(\),\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/data/src/memory.rs",
-    marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*EventAuthorizationRecord,\ ReviewScheduleEventPayload,\ SESSION_TOKEN_NONCE_SKEW_SECONDS,\s*$/,
     ]),
   },
   {
@@ -2300,23 +2485,6 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
     marker: "transcript_final",
     patterns: Object.freeze([
       /^\s*\/\/\/\ reaches\ the\ same\ browser\ through\ `transcript_delta`\/`transcript_final`,\ which\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/data/src/memory/learning.rs",
-    marker: "authorization",
-    patterns: Object.freeze([
-      /^\s*if\ !authorization::is_recorded_locked\(\&state,\ \&authorization\)\ \{\s*$/,
-      /^\s*authorization::record_locked\(\&mut\ state,\ authorization\);\s*$/,
-    ]),
-  },
-  {
-    file: "agent/crates/data/src/memory/store_conformance.rs",
-    marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*answer_text:\ \&str,\s*$/,
-      /^\s*answer_text:\ answer_text\.to_owned\(\),\s*$/,
-      /^\s*retranscribed\.answer_text\ =\ "A\ different\ transcript\ of\ the\ same\ turn\."\.to_owned\(\);\s*$/,
     ]),
   },
   {
@@ -2370,19 +2538,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/app/api/viva-library/[[...path]]/route.ts",
     marker: "viva1.",
-    patterns: Object.freeze([
-      /^\s*"viva1\.",\s*$/,
-    ]),
-  },
-  {
-    file: "apps/web/app/api/viva-session/shared.ts",
-    marker: "Bearer ",
-    patterns: Object.freeze([
-      /^\s*"bearer\ ",\s*$/,
-      /^\s*authorization:\ `Bearer\ \$\{input\.scopedCredential\}`,\s*$/,
-      /^\s*const\ match\ =\ \/\^Bearer\ \(\[\\x21\-\\x7e\]\+\)\$\/\.exec\(value\);\s*$/,
-      /^\s*authorization:\ `Bearer\ \$\{credential\}`,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"viva1\.",\s*$/]),
   },
   {
     file: "apps/web/app/api/viva-session/shared.ts",
@@ -2403,40 +2559,13 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   },
   {
     file: "apps/web/app/api/viva-session/shared.ts",
-    marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*minted:\ \{\ session_token:\ string\ \},\s*$/,
-      /^\s*token:\ minted\.session_token,\s*$/,
-    ]),
-  },
-  {
-    file: "apps/web/app/api/viva-session/shared.ts",
-    marker: "token",
-    patterns: Object.freeze([
-      /^\s*token:\ minted\.session_token,\s*$/,
-      /^\s*token:\ credential,\s*$/,
-    ]),
-  },
-  {
-    file: "apps/web/app/api/viva-session/shared.ts",
-    marker: "viva1.",
-    patterns: Object.freeze([
-      /^\s*"viva1\.",\s*$/,
-    ]),
-  },
-  {
-    file: "apps/web/app/api/viva-session/shared.ts",
     marker: "x_viva_session_token",
-    patterns: Object.freeze([
-      /^\s*"x\-viva\-session\-token":\ input\.sessionCredential,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*"x\-viva\-session\-token":\ input\.sessionCredential,\s*$/]),
   },
   {
     file: "apps/web/proxy.ts",
     marker: "password",
-    patterns: Object.freeze([
-      /^\s*if\ \(url\.username\ \|\|\ url\.password\)\ return\ null;\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*if\ \(url\.username\ \|\|\ url\.password\)\ return\ null;\s*$/]),
   },
   // A-27 (2026-08-27): coordinator-applied sanction rows for Plan 10 web-session
   // client sources (node 10 admission). Dual-keyed, file-filtered, anchored
@@ -2455,9 +2584,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/components/session/LiveSessionPage.tsx",
     marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*intent:\ \{\ kind:\ "answer_text",\ text:\ payload\ \},\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*intent:\ \{\ kind:\ "answer_text",\ text:\ payload\ \},\s*$/]),
   },
   {
     file: "apps/web/components/session/LiveSessionPage.tsx",
@@ -2547,16 +2674,12 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/lib/viva-agent-client.ts",
     marker: "access_token",
-    patterns: Object.freeze([
-      /^\s*accessToken:\ string;\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*accessToken:\ string;\s*$/]),
   },
   {
     file: "apps/web/lib/viva-agent-client.ts",
     marker: "answer_text",
-    patterns: Object.freeze([
-      /^\s*intent:\ \{\ kind:\ "answer_text",\ text\ \},\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*intent:\ \{\ kind:\ "answer_text",\ text\ \},\s*$/]),
   },
   {
     file: "apps/web/lib/viva-agent-client.ts",
@@ -2568,9 +2691,7 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/lib/viva-agent-client.ts",
     marker: "current_session_token",
-    patterns: Object.freeze([
-      /^\s*const\ signedCredential\ =\ currentSessionToken;\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*const\ signedCredential\ =\ currentSessionToken;\s*$/]),
   },
   {
     file: "apps/web/lib/viva-agent-client.ts",
@@ -2596,30 +2717,22 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
   {
     file: "apps/web/components/landing/LibraryStatusPanel.tsx",
     marker: "control_token",
-    patterns: Object.freeze([
-      /^\s*controlToken:\ libraryActionControlToken\(row\.delete\),\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*controlToken:\ libraryActionControlToken\(row\.delete\),\s*$/]),
   },
   {
     file: "apps/web/lib/viva-library.ts",
     marker: "control_token",
-    patterns: Object.freeze([
-      /^\s*controlToken:\ true,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*controlToken:\ true,\s*$/]),
   },
   {
     file: "apps/web/lib/viva-library.ts",
     marker: "session_token",
-    patterns: Object.freeze([
-      /^\s*sessionToken:\ !options\.directSessionTokens,\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*sessionToken:\ !options\.directSessionTokens,\s*$/]),
   },
   {
     file: "scripts/frontend-harness.mjs",
     marker: "Bearer ",
-    patterns: Object.freeze([
-      /^\s*\*\ \ \ and\ the\ agent's\ own\ WS\ bearer\ token\.\s*$/,
-    ]),
+    patterns: Object.freeze([/^\s*\*\ \ \ and\ the\ agent's\ own\ WS\ bearer\ token\.\s*$/]),
   },
   {
     file: "scripts/frontend-harness.mjs",

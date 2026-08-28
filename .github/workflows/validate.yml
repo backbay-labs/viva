@@ -7,25 +7,49 @@ on:
     branches:
       - main
 
+# RELEASE-027: least privilege for the whole workflow. No job reads a repository
+# secret, so nothing here needs more than read access to the checkout.
+permissions:
+  contents: read
+
 jobs:
-  validate:
-    name: No-secret validation
+  quality-and-audit:
+    name: Quality and audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
 
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.3
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.94.1
+      # The pinned nightly installs first so the 1.94.1 toolchain below stays the
+      # default; `agent:deps:unused` reaches this one explicitly with `+nightly`.
+      - name: Set up the pinned cargo-udeps nightly
+        uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
         with:
+          toolchain: nightly-2026-04-21
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
+        with:
+          toolchain: 1.94.1
           components: rustfmt, clippy
+
+      - name: Install pinned Cargo proof tools
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-udeps --version 0.1.60 --locked
+          cargo install cargo-mutants --version 25.3.1 --locked
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -35,33 +59,122 @@ jobs:
           VIVA_REDACTION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: bun run redaction:check
 
+      - name: Node 24 release, monitor, and policy script tests
+        run: |
+          node --version
+          node --test scripts/*.test.mjs
+
+      - name: Dependency and advisory audit
+        run: bun run audit
+
+      - name: Module concentration ratchet
+        run: bun run module:concentration
+
+      # No ambient provider selection. `bun run validate` needs none (turbo does
+      # not declare VIVA_AGENT_PROVIDER, so it never reaches a package task), and
+      # exporting one here is an ambient leak: `scripts/live-provider-smoke.mjs`
+      # correctly refuses to run when an ambient provider disagrees with its own
+      # (RELEASE-016/021), and `agent-service`'s config reads the same variable.
       - name: Validate TypeScript, Rust, and purity gates
-        env:
-          VIVA_AGENT_PROVIDER: synthetic
         run: bun run validate
+
+      - name: Build the workspace
+        run: bun run build
+
+      # RELEASE-031 branch-neutral wiring: the ordinary build is the only build
+      # this tree has under the recorded D-06B disposition, so the cache proof
+      # sits against it and runs exactly once.
+      - name: Prove Turbo cache restoration
+        run: bun run build:cache:prove
+
+      - name: Unused Rust dependency proof
+        run: bun run agent:deps:unused
+
+      - name: Focused agent-domain mutation proof
+        run: bun run agent:domain:mutants
+
+  loopback-and-browser:
+    name: Loopback and browser proofs
+    needs: quality-and-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.3
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
 
       - name: Direct WebSocket replay gate
         env:
           VIVA_AGENT_PROVIDER: fake_cartesia_gemini
         run: bun run agent:replay:ws
 
-      - name: Install browser for E2E gate
+      - name: Install the pinned browser
         run: bunx playwright install --with-deps chromium
 
-      - name: Browser synthetic manuscript E2E gate
+      - name: Browser synthetic voice matrix
         env:
           VIVA_E2E_AGENT_PROVIDER: synthetic
           VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1"
+          VIVA_E2E_REQUIRE_VOICE_TRANSPORT_MATRIX: "1"
+          VIVA_E2E_DEPLOY_SHA: ${{ github.sha }}
+          VIVA_E2E_ARTIFACT_DIR: artifacts/ci/browser-voice-matrix/synthetic
         run: bun run e2e:browser
+
+      - name: Browser fake-provider voice matrix
+        env:
+          VIVA_E2E_AGENT_PROVIDER: fake_cartesia_gemini
+          VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO: "1"
+          VIVA_E2E_REQUIRE_VOICE_TRANSPORT_MATRIX: "1"
+          VIVA_E2E_DEPLOY_SHA: ${{ github.sha }}
+          VIVA_E2E_ARTIFACT_DIR: artifacts/ci/browser-voice-matrix/fake-provider
+        run: bun run e2e:browser
+
+      - name: Bounded audio harness negative control
+        run: bun run e2e:browser:audio:negative
+
+      - name: Frontend accessibility harness
+        run: node scripts/frontend-accessibility.mjs
+
+      # The performance harness refuses dev mode by construction, so the
+      # production build it samples has to exist before it runs.
+      - name: Build the web application for performance sampling
+        run: bun run --cwd apps/web build
+
+      - name: Frontend performance harness
+        run: node scripts/frontend-performance.mjs
 
       - name: Sanitized release evidence gate
         env:
           VIVA_AGENT_PROVIDER: fake_cartesia_gemini
         run: bun run release:check
 
+      - name: Continuous redaction control gate
+        env:
+          VIVA_REDACTION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: bun run redaction:check
+
       - name: Upload sanitized release evidence bundle
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: viva-release-evidence-${{ github.sha }}
           if-no-files-found: error
@@ -74,39 +187,55 @@ jobs:
             artifacts/e2e-browser/result.json
             artifacts/e2e-browser/*.png
             artifacts/e2e-browser/*.log
+            artifacts/frontend-performance/result.json
 
-  durable:
-    name: Opt-in durable Postgres proof
+  durable-postgres:
+    name: Durable Postgres proof
+    needs: quality-and-audit
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5
         env:
-          POSTGRES_DB: viva_test
+          POSTGRES_DB: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d viva_test"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.94.1
+        uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
         with:
+          toolchain: 1.94.1
           components: rustfmt, clippy
 
-      - name: Run durable replay and parity tests
+      # All orchestration lives in the script, where it is behaviorally tested.
+      #
+      # The script's A-32 fixture-seeding step is gated on the target resolving:
+      # lane 08 owns the binary and it has not landed, so the step records a
+      # pending obligation today and becomes fail-closed automatically the moment
+      # `--bin` resolves. Plan 15 asserts the landed end state by setting
+      # VIVA_CI_POSTGRES_SEED_REQUIRED=1 here, which refuses the pending path.
+      - name: Durable Postgres proof
+        run: scripts/ci-durable-postgres.sh
+
+  required-validation:
+    name: Required validation
+    if: always()
+    needs: [quality-and-audit, loopback-and-browser, durable-postgres]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every proof job
         env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/viva_test
-          VIVA_ALLOW_LOOPBACK_TEST_SKIP: "1"
-          VIVA_AGENT_PROVIDER: synthetic
-        run: |
-          cargo test --manifest-path agent/Cargo.toml -p data optional_postgres -- --nocapture
-          cargo test --manifest-path agent/Cargo.toml -p agent-service --test voice_ws optional_postgres -- --nocapture
+          QUALITY: ${{ needs.quality-and-audit.result }}
+          LOOPBACK_BROWSER: ${{ needs.loopback-and-browser.result }}
+          DURABLE: ${{ needs.durable-postgres.result }}
+        run: test "$QUALITY" = success && test "$LOOPBACK_BROWSER" = success && test "$DURABLE" = success

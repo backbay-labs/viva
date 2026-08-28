@@ -1,6 +1,9 @@
 #!/usr/bin/env sh
 set -eu
 
+command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
+command -v rg >/dev/null 2>&1 || { echo "rg is required" >&2; exit 1; }
+
 required_ignored_paths="
 .next
 .turbo
@@ -37,26 +40,47 @@ fi
 
 generated_path_pattern='(^|/)(node_modules|\.next|\.turbo|coverage|target|out|artifacts)(/|$)|(^|/)dist(/|$)|\.tsbuildinfo$'
 
-tracked_matches="$(
-  git ls-files | rg "$generated_path_pattern" || true
-)"
+# `rg` is run against a file, never the receiving end of a pipe, so its own
+# exit status is observable directly: status 1 ("no lines selected") is the
+# only acceptable no-match outcome; any other nonzero status (a real rg
+# error, or -- were it ever missing mid-run -- 127) propagates as a hard
+# failure instead of being coerced into an empty, passing match set. Each
+# upstream `git` command writes to its own temp file as a plain top-level
+# statement (never inside a pipeline whose exit status `set -e` cannot see),
+# so a `git` failure aborts the script immediately via `set -e` rather than
+# silently starving `rg` of input.
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
 
-if [ -n "$tracked_matches" ]; then
+git ls-files >"$workdir/tracked-files"
+
+tracked_rg_status=0
+rg "$generated_path_pattern" "$workdir/tracked-files" >"$workdir/tracked-matches" || tracked_rg_status=$?
+case "$tracked_rg_status" in
+  0 | 1) ;;
+  *) exit "$tracked_rg_status" ;;
+esac
+
+if [ -s "$workdir/tracked-matches" ]; then
   echo "Generated artifact paths are tracked:" >&2
-  echo "$tracked_matches" >&2
+  cat "$workdir/tracked-matches" >&2
   exit 1
 fi
 
-diff_matches="$(
-  {
-    git diff --name-only
-    git diff --cached --name-only
-  } | sort -u | rg "$generated_path_pattern" || true
-)"
+git diff --name-only >"$workdir/diff-unstaged"
+git diff --cached --name-only >"$workdir/diff-staged"
+sort -u "$workdir/diff-unstaged" "$workdir/diff-staged" >"$workdir/diff-files"
 
-if [ -n "$diff_matches" ]; then
+diff_rg_status=0
+rg "$generated_path_pattern" "$workdir/diff-files" >"$workdir/diff-matches" || diff_rg_status=$?
+case "$diff_rg_status" in
+  0 | 1) ;;
+  *) exit "$diff_rg_status" ;;
+esac
+
+if [ -s "$workdir/diff-matches" ]; then
   echo "Generated artifact paths are present in the release diff:" >&2
-  echo "$diff_matches" >&2
+  cat "$workdir/diff-matches" >&2
   exit 1
 fi
 

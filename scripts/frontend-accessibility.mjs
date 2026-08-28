@@ -154,7 +154,9 @@ import {
  * - adds the bare, no-flag mode (`runFullAccessibilityCheck`): `--owned-
  *   surfaces` and `--session-handoff --disclosure-scope all-live-content`
  *   together, the full item 1-5 contract this plan's acceptance criteria
- *   and `bun run validate` require.
+ *   require, enforced by the required `loopback-and-browser` CI job
+ *   (`RELEASE-027`) rather than by `bun run validate` — see the bare mode's
+ *   own doc comment below for where that gate actually lives.
  *
  * `A-31.4` (`docs/decisions/2026-08-23-plan-amendments.md`) closes four
  * remaining acceptance loose ends, all inside `--owned-surfaces` and
@@ -595,8 +597,17 @@ async function main() {
  * together and reported as one combined failure list. Task 12 separately
  * re-runs `--session-handoff` on its own for a distinctly-labelled
  * FRONTEND-005/006 RED-to-GREEN record; this bare invocation is this
- * plan's own final acceptance gate (`bun run validate` and the hosted CI
- * step both invoke it with no flag).
+ * plan's own final acceptance gate.
+ *
+ * `A-31.2`: where that gate actually runs, stated truthfully. The required
+ * `loopback-and-browser` job in `.github/workflows/validate.yml` invokes
+ * `node scripts/frontend-accessibility.mjs` with no flag, after the pinned
+ * Chromium install (`RELEASE-027`). `bun run validate` does NOT: it installs
+ * no browser and builds no production server, so wiring a Chromium-dependent
+ * harness into it would make the default local gate depend on an unstated
+ * prerequisite. The earlier claim that both invoked it was false at HEAD and
+ * is corrected here; Plan 15 verifies the hosted required job on the exact
+ * head rather than reading this comment as proof a gate exists.
  */
 async function runFullAccessibilityCheck() {
   // Sequential, not `Promise.all`: each half spawns its own dev server (and

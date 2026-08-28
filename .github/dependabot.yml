@@ -1,0 +1,25 @@
+# RELEASE-027: keep the pinned supply chain reviewable.
+#
+# Every action in .github/workflows/validate.yml is pinned to a commit SHA with
+# a trailing version comment. Dependabot rewrites both together, so review the
+# proposed SHA and the comment as one change: a SHA whose comment does not match
+# the release it claims is the whole attack this pinning exists to stop.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /agent
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

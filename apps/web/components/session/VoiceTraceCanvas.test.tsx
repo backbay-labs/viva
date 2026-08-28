@@ -298,7 +298,7 @@ type Harness = {
    * `visibilitychange` so the existing fake rAF clock (`pendingFrameCount`/
    * `drainFrames`, both pre-existing and unchanged by this addition) can
    * prove the animation loop actually stops/resumes SCHEDULING frames, not
-   * merely that a listener is attached. Revert recipe: delete this method,
+   * merely that a listener is attached. Reversal steps: delete this method,
    * its one `overrideGlobal("hidden", ...)` companion line in
    * `createHarness`, and the one test that calls it below.
    */
@@ -357,7 +357,7 @@ function createHarness(options?: {
   overrideGlobal("devicePixelRatio", 3, window);
   overrideGlobal("hardwareConcurrency", options?.hardwareConcurrency ?? 8, navigator);
   // [A-31.4(a) forced addition — see the matching `Harness.setHidden` doc
-  // comment above for the revert recipe.] Establishes `document.hidden` as
+  // comment above for the reversal steps.] Establishes `document.hidden` as
   // an own, writable, configurable property (real happy-dom `document`
   // exposes it only as a `!defaultView` getter with no setter) so
   // `setHidden` below can flip it without touching anything else this file
@@ -807,7 +807,7 @@ describe("VoiceTraceCanvas effects budget", () => {
    * [A-31.4(a) forced addition — Plan 13 lane, per
    * `docs/decisions/2026-08-23-plan-amendments.md` A-31.4(a); this file is
    * Plan-10-owned. See `Harness.setHidden`'s doc comment above for the
-   * revert recipe.] The behavioral background-pause proof rows 463/558
+   * reversal steps.] The behavioral background-pause proof rows 463/558
    * named as missing for VoiceTrace specifically: the "unmount releases
    * every listener" test above only proves a `visibilitychange` listener is
    * attached/detached, which cannot distinguish a loop that genuinely stops

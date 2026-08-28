@@ -6,9 +6,12 @@ import {
   failureMatrixEvidence,
   liveProviderFailureForSmokeReason,
 } from "./live-provider-failure-matrix.mjs";
-import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
-  type: "json",
-};
+import {
+  isReleaseVoiceTerminalReason,
+  RELEASE_LEARNER_LOOP_CONTRACT as learnerLoopContract,
+  RELEASE_VOICE_TERMINAL_REASONS,
+  validatedLearnerLoopForRelease,
+} from "./release-contract-validation.mjs";
 
 const REQUIRED_FAILURE_CLASSES = Object.freeze([
   "provider_auth_failure",
@@ -117,4 +120,49 @@ test("live smoke local terminal reasons map to matrix degradations", () => {
     liveProviderFailureForSmokeReason("recap_observed").failure_class,
     "partial_stage_success",
   );
+});
+
+// RELEASE-028: the matrix is derived from the *validated* contract singleton,
+// and the terminal reasons it publishes are checked against the shared
+// published vocabulary rather than a second local list.
+test("every wire terminal reason the matrix publishes is in the shared voice terminal vocabulary", () => {
+  // `terminal_reason` is what the *server* sends and what the matrix hands to
+  // evidence and operator copy; it must be a member of the published closed
+  // vocabulary, not a release-side invention. (`smoke_terminal_reasons` are
+  // deliberately different: they are the harness's own local stage labels,
+  // used only to route a smoke failure back to its wire class.)
+  const reasons = LIVE_PROVIDER_FAILURE_MATRIX.map((entry) => entry.terminal_reason);
+  assert.ok(reasons.length > 0);
+  for (const reason of reasons) {
+    assert.equal(
+      isReleaseVoiceTerminalReason(reason),
+      true,
+      `${reason} is not a published terminal reason`,
+    );
+  }
+  // And the whole matrix is derived from the closed set, never wider than it.
+  assert.ok(reasons.length <= RELEASE_VOICE_TERMINAL_REASONS.length);
+});
+
+test("the matrix consumes a validated contract: an unknown nested field is refused with the stable code", () => {
+  const hostile = structuredClone(
+    JSON.parse(JSON.stringify(learnerLoopContract)),
+  );
+  hostile.states[0].viva_hostile_unknown_key = "viva-hostile-sentinel-value-9f2a";
+
+  assert.throws(
+    () => validatedLearnerLoopForRelease(hostile),
+    (error) => {
+      assert.equal(error.code, "learner_loop_contract_invalid");
+      assert.equal(`${error.message}${error.stack}`.includes("viva-hostile-sentinel-value-9f2a"), false);
+      return true;
+    },
+  );
+});
+
+test("the matrix's contract-derived rows are frozen against a consumer rewriting them", () => {
+  assert.equal(Object.isFrozen(learnerLoopContract.states), true);
+  assert.throws(() => {
+    learnerLoopContract.states[0].stage = "rewritten";
+  }, TypeError);
 });

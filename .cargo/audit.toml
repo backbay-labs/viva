@@ -1,0 +1,33 @@
+# A-33 (docs/decisions/2026-08-23-plan-amendments.md): the only cargo-audit
+# advisory this workspace scopes out, and only with both proofs below
+# load-bearing.
+#
+# RUSTSEC-2023-0071 — rsa 0.9.10, "Marvin Attack" timing side-channel key
+# recovery, no fixed upgrade exists (https://rustsec.org/advisories/RUSTSEC-2023-0071).
+# The only path to `rsa` in this workspace is the MySQL driver pulled in by
+# sqlx's feature-agnostic dependency graph; this workspace declares sqlx
+# Postgres-only and never enables, builds, or ships MySQL support.
+#
+# (1) Build-graph absence proof: `cargo tree --manifest-path agent/Cargo.toml
+#     -i <rsa|sqlx-mysql|sqlx-sqlite|flume> --target all` prints nothing for
+#     any target — recorded at
+#     artifacts/sdd/evidence/task-14-cargo-lock-superset-proof.txt. Cargo.lock
+#     still names these crates regardless: the lockfile is feature-agnostic
+#     and records every optional dependency of every resolved package whether
+#     or not a feature activates it, so no manifest edit can prune them from
+#     the lock (this is Plan 12 Task 14's blocker B-1). The build graph —
+#     what is actually compiled and shipped — is the surface that matters,
+#     and it is empty.
+# (2) Keeping (1) honest: scripts/dependency-policy.test.mjs's "the unused
+#     SQLx driver path never enters the compiled dependency graph" test
+#     re-runs that exact `cargo tree -i` proof on every run and fails BEFORE
+#     this ignore could hide anything, the moment the RSA path becomes
+#     compilable. Its "the cargo-audit ignore list scopes exactly the
+#     unfixable RSA advisory" test pins this list to exactly one entry, so a
+#     second advisory cannot be added here silently.
+#
+# A future workspace `sqlx` upgrade to 0.9 (probe-confirmed to drop `rsa`
+# entirely) removes the need for this file; see A-33's recorded post-program
+# closure note.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

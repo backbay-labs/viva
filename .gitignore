@@ -7,11 +7,16 @@ artifacts
 .turbo
 apps/web/out
 *.tsbuildinfo
-.env
-.env.local
-.env.*.local
+
+# RELEASE-027: fail-closed dotenv policy. One general rule covers every depth --
+# the reviewed root-only list left apps/web/.env.production, .envrc, and
+# .env.secrets committable -- and exactly the two template shapes are re-included.
+# scripts/ignore-policy.test.mjs proves this behaviorally with git check-ignore.
+**/.env*
+!**/.env.example
+!**/.env.*.example
+
 .DS_Store
-agent/.env
 agent/certs
 agent/target
 .playwright-cli

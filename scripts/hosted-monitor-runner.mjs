@@ -1,10 +1,7 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
   buildHostedE2eMatrixContract,
@@ -14,6 +11,9 @@ import {
   HOSTED_MONITOR_POLICY,
   summarizeHostedE2eResult,
 } from "./hosted-e2e-matrix.mjs";
+import { childEnvironmentFor } from "./child-environment.mjs";
+import { finalizeLiveMonitorRun, reserveLiveMonitorRun } from "./hosted-monitor-state.mjs";
+import { spawnManaged } from "./process-supervisor.mjs";
 import { auditTextArtifacts } from "./redaction-control.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -60,28 +60,28 @@ export function buildHostedMonitorPlan(env = process.env) {
       : [];
   const explicitFailureControlSubset =
     mode === "pr" && hasExplicitFailureControlScenarioSubset(env);
-  const matrixScenarioIds = mode === "pr"
-    ? [...PR_BROWSER_SCENARIO_IDS, ...failureControlScenarioIds]
-    : null;
+  const matrixScenarioIds =
+    mode === "pr" ? [...PR_BROWSER_SCENARIO_IDS, ...failureControlScenarioIds] : null;
   const matrix = buildHostedE2eMatrixContract({
     mode,
     profile: matrixProfile,
     runId,
     scenarioIds: matrixScenarioIds,
-    scenarioSubset: mode === "pr"
-      ? {
-          selected: true,
-          explicitly_configured: explicitFailureControlSubset,
-          configured_env: "VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS",
-          scenario_ids: matrixScenarioIds,
-          excluded_requires_browser_action: failureControlScenarioIdsForProfile({
-            includeBrowserActionScenarios: true,
-            profile: matrixProfile,
-          })
-            .filter(failureControlScenarioRequiresExplicitBrowserAction)
-            .filter((scenarioId) => !failureControlScenarioIds.includes(scenarioId)),
-        }
-      : null,
+    scenarioSubset:
+      mode === "pr"
+        ? {
+            selected: true,
+            explicitly_configured: explicitFailureControlSubset,
+            configured_env: "VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS",
+            scenario_ids: matrixScenarioIds,
+            excluded_requires_browser_action: failureControlScenarioIdsForProfile({
+              includeBrowserActionScenarios: true,
+              profile: matrixProfile,
+            })
+              .filter(failureControlScenarioRequiresExplicitBrowserAction)
+              .filter((scenarioId) => !failureControlScenarioIds.includes(scenarioId)),
+          }
+        : null,
   });
   const artifactPrefix = `viva-hosted-monitor/${mode}/${runId}`;
   const baseTarget = hostedTargetFromEnv(env, {
@@ -97,7 +97,6 @@ export function buildHostedMonitorPlan(env = process.env) {
     VIVA_E2E_SYNTHETIC_STUDY_SET_ID: syntheticStudySetId,
     VIVA_E2E_SYNTHETIC_USER_ID: syntheticUserId,
     VIVA_HOSTED_RUN_ID: runId,
-    VIVA_VOICE_SESSION_TOKEN_SECRET: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),
     ...(deploySha ? { VIVA_E2E_DEPLOY_SHA: deploySha } : {}),
   };
   const syntheticTarget = {
@@ -124,21 +123,23 @@ export function buildHostedMonitorPlan(env = process.env) {
           ]),
         )
       : new Map();
-  const liveMonitorDecision =
-    mode === "scheduled"
-      ? liveMonitorScheduleDecision(
-          env,
-          matrix.monitor_policy.live_monitor,
-          matrix.monitor_policy.self_quarantine,
-        )
-      : {
-          enabled: false,
-          should_run: false,
-          skip_reason: "pr_mode",
-        };
-  const liveMonitorConfig = liveMonitorDecision.should_run
+  // BAC-527: the live-monitor cadence/budget/quarantine decision is durable
+  // state resolved by `applyHostedLiveMonitorState` against the S3-backed
+  // hosted-monitor-state store, never operator-set environment counters.
+  // Target/session configuration is still validated synchronously here so a
+  // misconfigured live-monitor target fails fast regardless of today's
+  // budget.
+  const liveMonitorRequested = mode === "scheduled" && env.VIVA_HOSTED_LIVE_MONITOR_ENABLED === "1";
+  const liveMonitorConfig = liveMonitorRequested
     ? hostedLiveMonitorConfigFromEnv(env, matrix.monitor_policy.live_monitor, runId)
     : null;
+  const liveMonitor = liveMonitorRequested
+    ? { enabled: true, should_run: false, skip_reason: "pending_state_resolution" }
+    : {
+        enabled: false,
+        should_run: false,
+        skip_reason: mode === "scheduled" ? "disabled" : "pr_mode",
+      };
   const scheduledRuns = [
     {
       name: "scheduled_hosted_synthetic_monitor",
@@ -149,18 +150,6 @@ export function buildHostedMonitorPlan(env = process.env) {
       }),
       timeoutMs: runTimeoutMs,
     },
-    ...(liveMonitorDecision.should_run
-      ? [
-          scheduledLiveMonitorRun(
-            liveMonitorConfig.target,
-            matrix.monitor_policy.live_monitor,
-            runTimeoutMs,
-            runId,
-            liveMonitorConfig,
-            liveMonitorDecision,
-          ),
-        ]
-      : []),
   ];
   const runs =
     mode === "scheduled"
@@ -207,6 +196,13 @@ export function buildHostedMonitorPlan(env = process.env) {
               VIVA_FAILURE_CONTROL_SECRET: requiredValue(env, "VIVA_FAILURE_CONTROL_SECRET"),
               VIVA_FAILURE_CONTROL_STUDY_SET_IDS: syntheticStudySetId,
               VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS: syntheticUserId,
+              // RELEASE-016/021: the session-signing failure-control
+              // scenarios (expired_token and its session-auth siblings) all
+              // require explicit browser action and are therefore never
+              // selectable through this hosted PR matrix (see
+              // FAILURE_CONTROL_SCENARIOS_REQUIRING_BROWSER_ACTION in
+              // hosted-e2e-matrix.mjs) -- no run built here ever needs the
+              // session-token signing secret.
             }),
             timeoutMs: runTimeoutMs,
           })),
@@ -221,10 +217,13 @@ export function buildHostedMonitorPlan(env = process.env) {
       region: env.VIVA_HOSTED_ARTIFACT_REGION || "auto",
       secretAccessKey: requiredValue(env, "VIVA_HOSTED_ARTIFACT_SECRET_KEY"),
     },
+    deploySha: deploySha || "unknown",
     hostedAgentHttpUrl: baseTarget.agentHttpUrl,
     hostedAgentWsUrl: baseTarget.agentWsUrl,
     hostedWebUrl: baseTarget.webUrl,
-    liveMonitor: liveMonitorDecision,
+    liveMonitor,
+    liveMonitorConfig,
+    liveMonitorRequested,
     matrix,
     matrixProfile,
     mode,
@@ -234,6 +233,48 @@ export function buildHostedMonitorPlan(env = process.env) {
     runs,
     syntheticStudySetId,
     syntheticUserId,
+  };
+}
+
+/**
+ * BAC-527: resolve the durable live-monitor state and, if the reservation
+ * says the live leg should run, append the bounded live-smoke run to the
+ * plan. A no-op when the live monitor was not requested (PR mode, or
+ * scheduled mode with the opt-in unset) so no state I/O happens on the
+ * common path.
+ */
+export async function applyHostedLiveMonitorState(
+  plan,
+  { fetchImpl = fetch, deadlineMs, env = process.env } = {},
+) {
+  if (!plan.liveMonitorRequested) return plan;
+  const nowIso = dateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_NOW", new Date()).toISOString();
+  const reserved = await reserveLiveMonitorRun({
+    store: plan.artifactStore,
+    fetchImpl,
+    runId: plan.runId,
+    nowIso,
+    livePolicy: plan.matrix.monitor_policy.live_monitor,
+    quarantinePolicy: plan.matrix.monitor_policy.self_quarantine,
+    deadlineMs,
+  });
+  const decision = reserved.decision;
+  if (!decision.should_run) {
+    return { ...plan, liveMonitor: decision };
+  }
+  const liveRun = scheduledLiveMonitorRun(
+    plan.liveMonitorConfig.target,
+    plan.matrix.monitor_policy.live_monitor,
+    plan.runTimeoutMs,
+    plan.runId,
+    plan.liveMonitorConfig,
+    decision,
+    plan.deploySha,
+  );
+  return {
+    ...plan,
+    liveMonitor: decision,
+    runs: [...plan.runs, liveRun],
   };
 }
 
@@ -312,144 +353,6 @@ function hasExplicitFailureControlScenarioSubset(env) {
   return (env.VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS ?? "").trim().length > 0;
 }
 
-function liveMonitorScheduleDecision(env, livePolicy, quarantinePolicy) {
-  if (env.VIVA_HOSTED_LIVE_MONITOR_ENABLED !== "1") {
-    return {
-      enabled: false,
-      should_run: false,
-      skip_reason: "disabled",
-    };
-  }
-  const now = dateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_NOW", new Date());
-  const stateDate = (env.VIVA_HOSTED_LIVE_MONITOR_STATE_DATE ?? "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(stateDate)) {
-    return {
-      enabled: true,
-      now: now.toISOString(),
-      should_run: false,
-      skip_reason: "state_date_missing",
-    };
-  }
-  const today = now.toISOString().slice(0, 10);
-  const runsToday =
-    stateDate === today
-      ? nonNegativeInteger(
-          env.VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY,
-          "VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY",
-        )
-      : 0;
-  const tokensToday =
-    stateDate === today
-      ? nonNegativeInteger(
-          env.VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY,
-          "VIVA_HOSTED_LIVE_MONITOR_TOKENS_TODAY",
-        )
-      : 0;
-  const consecutiveFailures = optionalNonNegativeInteger(
-    env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES,
-    "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
-    0,
-  );
-  const priorFailureState = liveMonitorPriorFailureState(
-    env,
-    now,
-    quarantinePolicy,
-    consecutiveFailures,
-  );
-  const quarantinedUntil = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL");
-  if (quarantinedUntil && quarantinedUntil.getTime() > now.getTime()) {
-    return {
-      ...priorFailureStateEvidence(priorFailureState),
-      enabled: true,
-      now: now.toISOString(),
-      quarantined_until: quarantinedUntil.toISOString(),
-      should_run: false,
-      skip_reason: "self_quarantined",
-    };
-  }
-  const failureCountQuarantinedUntil =
-    priorFailureState.consecutiveFailures >= quarantinePolicy.consecutive_failures &&
-    priorFailureState.lastFailureAt
-      ? new Date(
-          priorFailureState.lastFailureAt.getTime() +
-            quarantinePolicy.cooldown_seconds * 1000,
-        )
-      : null;
-  if (failureCountQuarantinedUntil && failureCountQuarantinedUntil.getTime() > now.getTime()) {
-    return {
-      ...priorFailureStateEvidence(priorFailureState),
-      enabled: true,
-      now: now.toISOString(),
-      quarantine_cooldown_seconds: quarantinePolicy.cooldown_seconds,
-      quarantine_source: "failure_count",
-      quarantined_until: failureCountQuarantinedUntil.toISOString(),
-      should_run: false,
-      skip_reason: "self_quarantined",
-    };
-  }
-  if (runsToday >= livePolicy.max_runs_per_day) {
-    return {
-      ...priorFailureStateEvidence(priorFailureState),
-      enabled: true,
-      now: now.toISOString(),
-      runs_today: runsToday,
-      should_run: false,
-      skip_reason: "daily_budget_exhausted",
-    };
-  }
-  if (tokensToday >= livePolicy.max_tokens_per_day) {
-    return {
-      ...priorFailureStateEvidence(priorFailureState),
-      enabled: true,
-      max_tokens_per_day: livePolicy.max_tokens_per_day,
-      now: now.toISOString(),
-      should_run: false,
-      skip_reason: "daily_token_budget_exhausted",
-      tokens_today: tokensToday,
-    };
-  }
-  if (tokensToday + livePolicy.max_tokens_per_run > livePolicy.max_tokens_per_day) {
-    return {
-      ...priorFailureStateEvidence(priorFailureState),
-      enabled: true,
-      max_tokens_per_day: livePolicy.max_tokens_per_day,
-      max_tokens_per_run: livePolicy.max_tokens_per_run,
-      now: now.toISOString(),
-      should_run: false,
-      skip_reason: "daily_token_budget_remaining_too_low",
-      token_budget_remaining: Math.max(0, livePolicy.max_tokens_per_day - tokensToday),
-      tokens_today: tokensToday,
-    };
-  }
-  const lastRunAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT");
-  if (lastRunAt) {
-    const elapsedSeconds = Math.floor((now.getTime() - lastRunAt.getTime()) / 1000);
-    if (elapsedSeconds < livePolicy.min_cadence_seconds) {
-      return {
-        ...priorFailureStateEvidence(priorFailureState),
-        enabled: true,
-        last_run_at: lastRunAt.toISOString(),
-        min_cadence_seconds: livePolicy.min_cadence_seconds,
-        now: now.toISOString(),
-        seconds_since_last_run: Math.max(0, elapsedSeconds),
-        should_run: false,
-        skip_reason: "cadence_wait",
-      };
-    }
-  }
-  return {
-    ...priorFailureStateEvidence(priorFailureState),
-    enabled: true,
-    max_runs_per_day: livePolicy.max_runs_per_day,
-    min_cadence_seconds: livePolicy.min_cadence_seconds,
-    now: now.toISOString(),
-    quarantine_cooldown_seconds: quarantinePolicy.cooldown_seconds,
-    runs_today: runsToday,
-    should_run: true,
-    tokens_today: tokensToday,
-  };
-}
-
 function hostedLiveMonitorConfigFromEnv(env, livePolicy, runId) {
   const target = hostedTargetFromEnv(env, {
     agentHttpName: "VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL",
@@ -476,33 +379,43 @@ function hostedLiveMonitorConfigFromEnv(env, livePolicy, runId) {
       "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD must be less than or equal to the hosted live monitor policy cap",
     );
   }
-  const session = hostedLiveMonitorSessionFromEnv(env, runId);
+  // RELEASE-016/021: the plan carries live identity only, never a minted
+  // token -- `materializeHostedLiveSmokeRun` mints the session capability
+  // immediately before the live-smoke child is spawned, not here. Validate
+  // the signing secret's presence now, synchronously, so a misconfigured
+  // live monitor fails fast before `applyHostedLiveMonitorState` commits any
+  // durable-state reservation or a preceding leg is spawned -- but discard
+  // the value immediately: materialization re-reads it fresh from `env` at
+  // spawn time, so it is never retained on this config, the plan, or the
+  // hosted summary.
+  requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET");
+  const identity = hostedLiveMonitorIdentityFromEnv(env, runId);
+  const agentDeployId = (
+    env.VIVA_HOSTED_LIVE_MONITOR_AGENT_DEPLOY_ID ??
+    env.VIVA_HOSTED_AGENT_DEPLOY_ID ??
+    "unknown"
+  ).trim() || "unknown";
   return {
+    agentDeployId,
     bearerToken,
     audioFile:
       env.VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE?.trim() || "/app/evidence/live-smoke-answer.pcm",
+    identity,
     remoteMaxSessionCostUsd,
-    session,
     target,
   };
 }
 
-function hostedLiveMonitorSessionFromEnv(env, runId) {
+function hostedLiveMonitorIdentityFromEnv(env, runId) {
   const userId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_USER_ID");
   const studySetId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID");
   const baseSessionId = requiredValue(env, "VIVA_HOSTED_LIVE_MONITOR_SESSION_ID");
   const sessionId = liveMonitorRunSessionId(baseSessionId, runId);
   assertSyntheticIdentity(userId);
   return {
-    sessionId,
-    signedSession: signedLiveMonitorSession({
-      secret: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),
-      sessionId,
-      studySetId,
-      userId,
-    }),
-    studySetId,
-    userId,
+    session_id: sessionId,
+    study_set_id: studySetId,
+    user_id: userId,
   };
 }
 
@@ -510,19 +423,61 @@ function liveMonitorRunSessionId(baseSessionId, runId) {
   return uuidFromStableInput(`viva-live-monitor:${baseSessionId}:${runId}:${randomUUID()}`);
 }
 
-function signedLiveMonitorSession({ secret, sessionId, studySetId, userId }) {
-  const expiresAt = Math.floor(Date.now() / 1000) + 15 * 60;
-  const claims = {
-    user_id: userId,
-    study_set_id: studySetId,
-    session_id: sessionId,
-    expires_at: expiresAt,
-    nonce: randomUUID(),
-  };
+function signHostedLiveSmokeSession(claims, secret) {
   const claimsPart = Buffer.from(JSON.stringify(claims)).toString("base64url");
   const payload = `viva1.${claimsPart}`;
   const signature = createHmac("sha256", secret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
+}
+
+/**
+ * RELEASE-016/021: mint the live-smoke session capability at the last
+ * possible moment -- immediately before this specific run is spawned, never
+ * at plan construction. `env` (defaulting to this process's own environment)
+ * is read only here, so the raw signing secret never has to be threaded
+ * through the plan/run object, the hosted summary, or any earlier stage of
+ * the pipeline. The returned token's expiry is computed from `nowSeconds`
+ * (the moment of this call) plus the run's own timeout -- which already
+ * folds in the runner's 30s flush grace -- plus an additional 60s safety
+ * margin, so it always retains its full validity window regardless of how
+ * long any earlier plan run took to execute.
+ *
+ * The signed claims carry exactly the fields the deployed agent's
+ * `SessionTokenClaims` (agent/crates/agent-service/src/config.rs) accepts:
+ * `user_id`, `study_set_id`, `session_id`, `expires_at`, `nonce`. That struct
+ * derives `#[serde(deny_unknown_fields)]`, so any additional claim -- a run
+ * id, deploy SHA, agent deploy id, or provider mode -- makes the deployed
+ * server reject the whole token as malformed before any provider work, not
+ * merely ignore the extra field. `run.runId`, `run.deploySha`,
+ * `run.agentDeployId`, and `run.provider` stay on the returned run object,
+ * outside the signed envelope, alongside the rest of the run's already
+ * non-secret configuration, so they still correlate this specific
+ * materialization in the sanitized hosted summary. Binding them
+ * cryptographically into the verified token itself would require extending
+ * that struct (the way `failure_control` is already nested there), which is
+ * capability source this lane does not own -- a deferred voice-lane
+ * handoff, not silently dropped scope.
+ */
+export function materializeHostedLiveSmokeRun(
+  run,
+  env = process.env,
+  nowSeconds = Math.floor(Date.now() / 1000),
+) {
+  const secret = requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET");
+  const claims = {
+    user_id: run.identity.user_id,
+    study_set_id: run.identity.study_set_id,
+    session_id: run.identity.session_id,
+    expires_at: nowSeconds + Math.ceil(run.timeoutMs / 1000) + 60,
+    nonce: randomUUID(),
+  };
+  return {
+    ...run,
+    env: {
+      ...run.env,
+      VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession(claims, secret),
+    },
+  };
 }
 
 function uuidFromStableInput(value) {
@@ -546,22 +501,39 @@ function scheduledLiveMonitorRun(
   runId,
   liveConfig,
   liveMonitorDecision,
+  deploySha,
 ) {
-  const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run);
+  // BAC-527: the smoke enforces its own max_duration_ms_per_run deadline
+  // internally and writes classified partial evidence when interrupted;
+  // this outer supervisory kill grants a fixed 30s evidence-flush grace on
+  // top of that before it hard-kills a process that failed to self-abort.
+  const timeoutMs = Math.min(runTimeoutMs, livePolicy.max_duration_ms_per_run + 30_000);
   return {
     name: "scheduled_hosted_live_smoke",
     scenario_id: "live_provider_smoke",
     runner: "live-provider-smoke",
     resultFileName: "evidence.json",
+    // RELEASE-016/021: normalized identity/binding the just-in-time
+    // materializer reads at spawn time -- never a pre-minted token. The
+    // agent deployment remains the only component that holds the raw
+    // Cartesia/Gemini provider keys.
+    agentDeployId: liveConfig.agentDeployId,
+    deploySha,
+    identity: liveConfig.identity,
+    provider: "cartesia_gemini",
+    runId,
     env: {
       VIVA_AGENT_PROVIDER: "cartesia_gemini",
-      VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES: String(
-        liveMonitorDecision.consecutive_failures ?? 0,
-      ),
-      ...(liveMonitorDecision.last_failure_at
-        ? { VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT: liveMonitorDecision.last_failure_at }
-        : {}),
+      // BAC-527: translate the authoritative durable decision once into the
+      // smoke's public contract. This is the exact variable name
+      // `live-provider-smoke.mjs` reads; no `VIVA_HOSTED_*` state leaks into
+      // the child.
+      VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES: String(liveMonitorDecision.consecutive_failures ?? 0),
       VIVA_HOSTED_RUN_ID: runId,
+      // RELEASE-016/021: the child attests it will use the deployed agent's
+      // already-configured, zero-retention-approved provider secrets; it
+      // never receives the raw Cartesia/Gemini keys itself.
+      VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED: "1",
       VIVA_LIVE_PROVIDER_SMOKE: "1",
       VIVA_LIVE_SMOKE: "1",
       VIVA_LIVE_SMOKE_AGENT_HTTP_URL: target.agentHttpUrl,
@@ -575,12 +547,14 @@ function scheduledLiveMonitorRun(
       VIVA_LIVE_SMOKE_MAX_TOKENS: String(livePolicy.max_tokens_per_run),
       VIVA_LIVE_SMOKE_MAX_TURNS: String(livePolicy.max_turns_per_run),
       VIVA_LIVE_SMOKE_ORIGIN: target.webUrl,
-      VIVA_LIVE_SMOKE_SESSION_ID: liveConfig.session.sessionId,
-      ...(liveConfig.session.signedSession
-        ? { VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession }
-        : {}),
-      VIVA_LIVE_SMOKE_STUDY_SET_ID: liveConfig.session.studySetId,
-      VIVA_LIVE_SMOKE_USER_ID: liveConfig.session.userId,
+      VIVA_LIVE_SMOKE_RUN_ID: runId,
+      VIVA_LIVE_SMOKE_SESSION_ID: liveConfig.identity.session_id,
+      // RELEASE-016/021: the session capability env key is deliberately
+      // absent here -- it is minted just-in-time by
+      // `materializeHostedLiveSmokeRun`, immediately before this run is
+      // spawned.
+      VIVA_LIVE_SMOKE_STUDY_SET_ID: liveConfig.identity.study_set_id,
+      VIVA_LIVE_SMOKE_USER_ID: liveConfig.identity.user_id,
       VIVA_VOICE_WS_BEARER_TOKEN: liveConfig.bearerToken,
       VIVA_VOICE_WS_MAX_SESSION_COST_USD: String(liveConfig.remoteMaxSessionCostUsd),
     },
@@ -613,7 +587,11 @@ export function buildObjectKey(prefix, relativePath) {
 }
 
 async function main() {
-  const plan = buildHostedMonitorPlan();
+  const basePlan = buildHostedMonitorPlan();
+  const plan = await applyHostedLiveMonitorState(basePlan, {
+    fetchImpl: fetch,
+    deadlineMs: Date.now() + basePlan.publishTimeoutMs,
+  });
   const outputDir = path.join(hostedArtifactRoot, plan.mode, plan.runId);
   await mkdir(outputDir, { recursive: true });
   const summary = {
@@ -638,7 +616,13 @@ async function main() {
     const runDir = path.join(outputDir, run.name);
     const evidenceArtifactDir = path.join(runDir, artifactSubdirForRun(run));
     await mkdir(runDir, { recursive: true });
-    let outcome = await runHostedMonitorCommand(run, runDir, evidenceArtifactDir);
+    // RELEASE-016/021: mint the live-smoke session capability immediately
+    // before this specific run is spawned -- never earlier in the loop, and
+    // never at plan construction -- so its TTL is always measured from this
+    // moment, not from however long any preceding run took.
+    const spawnRun =
+      run.runner === "live-provider-smoke" ? materializeHostedLiveSmokeRun(run) : run;
+    let outcome = await runHostedMonitorCommand(spawnRun, runDir, evidenceArtifactDir);
     const resultRead = await readRunResult(evidenceArtifactDir, run);
     if (outcome.status === "passed" && !resultRead.result) {
       outcome = await writeRunOutcomeArtifact(
@@ -649,8 +633,39 @@ async function main() {
     }
     await auditHostedArtifacts(runDir);
     summary.runs.push(
-      summarizeHostedRun(run, runDir, evidenceArtifactDir, outcome, resultRead.result),
+      summarizeHostedRun(
+        run,
+        runDir,
+        evidenceArtifactDir,
+        outcome,
+        resultRead.result,
+        root,
+        plan.liveMonitor,
+      ),
     );
+  }
+
+  const liveRun = plan.runs.find((run) => run.runner === "live-provider-smoke");
+  if (liveRun) {
+    const liveRunSummary = summary.runs.find((run) => run.name === liveRun.name);
+    const finalized = await finalizeLiveMonitorRun({
+      store: plan.artifactStore,
+      fetchImpl: fetch,
+      runId: plan.runId,
+      failed: liveRunSummary?.status !== "passed",
+      nowIso: new Date().toISOString(),
+      quarantinePolicy: plan.matrix.monitor_policy.self_quarantine,
+      deadlineMs: Date.now() + plan.publishTimeoutMs,
+    });
+    if (!finalized.finalized) {
+      summary.runs.push({
+        name: "live_monitor_state_finalize",
+        runner: "hosted-monitor-state",
+        status: "failed",
+        failure_class: finalized.failure_class ?? "publish_failed",
+        sanitized: true,
+      });
+    }
   }
 
   const failedRuns = summary.runs.filter((run) => run.status !== "passed").map((run) => run.name);
@@ -663,24 +678,63 @@ async function main() {
   }
 }
 
-async function publishHostedEvidence(outputDir, summary, plan) {
+/**
+ * RELEASE-018/025: the manifest is uploaded last, and only after every
+ * earlier object in this run's directory has succeeded -- `publishOptions`
+ * is the single deadline-bounded, retry-aware options object shared by both
+ * the bulk upload and the final manifest PUT, so a failure anywhere in the
+ * former throws before the latter is ever attempted. A publication failure
+ * is recorded as a local sanitized `publish-failure.json` (never itself
+ * re-attempted for upload) before the failure is re-thrown, so the run still
+ * fails closed while leaving a diagnosable local artifact behind.
+ */
+export async function publishHostedEvidence(outputDir, summary, plan, options = {}) {
   const published = await writePublishedManifest(outputDir, summary, plan);
   await auditHostedArtifacts(outputDir);
-  const publishDeadlineMs = Date.now() + plan.publishTimeoutMs;
-  const uploaded = await publishDirectoryToS3(outputDir, plan.artifactPrefix, plan.artifactStore, {
-    deadlineMs: publishDeadlineMs,
-  });
-  if (uploaded.length + 1 !== published.durable_artifact_store.uploaded_files) {
-    throw new Error("hosted monitor upload count drifted before manifest publication");
+  const publishDeadlineMs = options.deadlineMs ?? Date.now() + plan.publishTimeoutMs;
+  const publishOptions = { ...options, deadlineMs: publishDeadlineMs };
+  try {
+    const uploaded = await publishDirectoryToS3(
+      outputDir,
+      plan.artifactPrefix,
+      plan.artifactStore,
+      publishOptions,
+    );
+    if (uploaded.length + 1 !== published.durable_artifact_store.uploaded_files) {
+      throw new Error("hosted monitor upload count drifted before manifest publication");
+    }
+    await putS3Object(
+      plan.artifactStore,
+      buildObjectKey(plan.artifactPrefix, "manifest.json"),
+      Buffer.from(`${JSON.stringify(published, null, 2)}\n`),
+      "application/json",
+      publishOptions,
+    );
+  } catch (error) {
+    await writePublishFailureArtifact(outputDir, error);
+    throw error;
   }
-  await putS3Object(
-    plan.artifactStore,
-    buildObjectKey(plan.artifactPrefix, "manifest.json"),
-    Buffer.from(`${JSON.stringify(published, null, 2)}\n`),
-    "application/json",
-    { deadlineMs: publishDeadlineMs },
-  );
   return published;
+}
+
+async function writePublishFailureArtifact(outputDir, error) {
+  const message = typeof error?.message === "string" ? error.message : "publish failed";
+  const failure = {
+    schema: "viva.hosted_monitor_publish_failure.v1",
+    failure_class: "publish_failed",
+    object_key: typeof error?.objectKey === "string" ? error.objectKey : null,
+    attempt_count: Number.isSafeInteger(error?.attempts) ? error.attempts : null,
+    // `message` is always one of putS3Object's own constructed strings
+    // ("artifact upload failed/timed out for <key> ...") -- never a raw
+    // fetch/response object -- so it can never carry a header or credential
+    // value; the length cap is a defensive backstop only.
+    message: message.slice(0, 500),
+    sanitized: true,
+  };
+  await writeFile(
+    path.join(outputDir, "publish-failure.json"),
+    `${JSON.stringify(failure, null, 2)}\n`,
+  );
 }
 
 export async function writePublishedManifest(outputDir, summary, plan) {
@@ -723,7 +777,15 @@ async function readRunResult(runDir, run = {}) {
   }
 }
 
-export function summarizeHostedRun(run, runDir, resultDir, outcome, result, rootDir = root) {
+export function summarizeHostedRun(
+  run,
+  runDir,
+  resultDir,
+  outcome,
+  result,
+  rootDir = root,
+  liveMonitorDecision = null,
+) {
   const resultRelativeDir = path.relative(runDir, resultDir).replaceAll("\\", "/");
   const browserStoryArtifact =
     result?.browser_story_artifact && resultRelativeDir
@@ -751,14 +813,14 @@ export function summarizeHostedRun(run, runDir, resultDir, outcome, result, root
         }
       : null,
     hosted_e2e: summarizeHostedE2eResult(result),
-    live_smoke: summarizeLiveSmokeResult(result, run.env ?? {}),
+    live_smoke: summarizeLiveSmokeResult(result, liveMonitorDecision, run),
     manuscript_ready: result?.manuscript_ready === true,
     page_error_count: Array.isArray(result?.page_errors) ? result.page_errors.length : 0,
     sanitized: true,
   };
 }
 
-function summarizeLiveSmokeResult(result, env = {}) {
+function summarizeLiveSmokeResult(result, liveMonitorDecision, run) {
   if (result?.schema !== "viva.live_provider_smoke.v1") return null;
   const terminalReason = liveSmokeTerminalReason(result);
   return {
@@ -769,8 +831,36 @@ function summarizeLiveSmokeResult(result, env = {}) {
     failure_class: result.failure?.failure_class ?? result.failure_class ?? null,
     caps: result.caps ?? null,
     privacy: result.privacy ?? null,
-    self_quarantine: liveMonitorSelfQuarantine(result, env),
+    // RELEASE-003/007/008: bind to the run the monitor itself constructed
+    // and dispatched (scheduledLiveMonitorRun's own runId/agentDeployId/
+    // deploySha) -- the authoritative identity for which release run and
+    // deploy this specific leg targeted -- rather than trusting whatever
+    // the child self-reported, which a hosted-spawned child cannot always
+    // independently verify. Falls back to the child's own report only when
+    // the dispatched run carries none (e.g. a manually-run smoke result
+    // read back outside this runner's own dispatch loop).
+    run_id: run?.runId ?? result.run_id ?? null,
+    agent_deploy_id: run?.agentDeployId ?? result.agent_deploy_id ?? null,
+    deploy_sha: run?.deploySha ?? result.deploy_sha ?? null,
+    self_quarantine: liveMonitorSelfQuarantine(result, liveMonitorDecision),
+    // BAC-527: transport_error, protocol_error, and structured_error must
+    // stay distinct all the way into the hosted summary, not just the raw
+    // smoke evidence.
+    event_counts: summarizeLiveSmokeEventCounts(result.websocket?.event_counts),
     sanitized: true,
+  };
+}
+
+function summarizeLiveSmokeEventCounts(eventCounts) {
+  if (!eventCounts || typeof eventCounts !== "object") return null;
+  return {
+    transport_error: Number.isInteger(eventCounts.transport_error)
+      ? eventCounts.transport_error
+      : 0,
+    protocol_error: Number.isInteger(eventCounts.protocol_error) ? eventCounts.protocol_error : 0,
+    structured_error: Number.isInteger(eventCounts.structured_error)
+      ? eventCounts.structured_error
+      : 0,
   };
 }
 
@@ -778,38 +868,33 @@ function liveSmokeTerminalReason(result) {
   return result?.terminal_reason ?? result?.websocket?.terminal_reason ?? null;
 }
 
-function liveMonitorSelfQuarantine(result, env = {}) {
+// BAC-527: the prior consecutive-failure count and staleness are already
+// resolved once by the durable state module at plan-resolution time
+// (`applyHostedLiveMonitorState`); this only applies the "+1 on failure"
+// arithmetic so the hosted summary agrees with the durable state and the
+// smoke's own observability evidence.
+function liveMonitorSelfQuarantine(result, liveMonitorDecision) {
   const policy = HOSTED_MONITOR_POLICY.self_quarantine;
   const terminalReason = liveSmokeTerminalReason(result);
   const failureClass = result?.failure?.failure_class ?? result?.failure_class ?? null;
   const currentFailure =
     terminalReason === policy.terminal_reason || failureClass === policy.failure_class;
-  const observedAt =
-    optionalDateValue(result?.generated_at) ??
-    optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_NOW") ??
-    new Date();
-  const configuredConsecutiveFailures = optionalNonNegativeInteger(
-    env.VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES,
-    "VIVA_HOSTED_LIVE_MONITOR_CONSECUTIVE_FAILURES",
-    0,
-  );
-  const priorFailureState = liveMonitorPriorFailureState(
-    env,
-    observedAt,
-    policy,
-    configuredConsecutiveFailures,
-  );
-  const consecutiveFailures = currentFailure ? priorFailureState.consecutiveFailures + 1 : 0;
+  const observedAt = optionalDateValue(result?.generated_at) ?? new Date();
+  const priorConsecutiveFailures = Number.isSafeInteger(liveMonitorDecision?.consecutive_failures)
+    ? liveMonitorDecision.consecutive_failures
+    : 0;
+  const priorFailureStale = liveMonitorDecision?.prior_failure_stale === true;
+  const priorLastFailureAt = liveMonitorDecision?.last_failure_at ?? null;
+  const priorSecondsSinceLastFailure = liveMonitorDecision?.seconds_since_last_failure ?? null;
+  const consecutiveFailures = currentFailure ? priorConsecutiveFailures + 1 : 0;
   const triggered = currentFailure && consecutiveFailures >= policy.consecutive_failures;
   return {
     triggered,
     consecutive_failures: consecutiveFailures,
     current_failure: currentFailure,
-    prior_failure_stale: priorFailureState.stale,
-    last_failure_at: currentFailure
-      ? observedAt.toISOString()
-      : (priorFailureState.lastFailureAt?.toISOString() ?? null),
-    seconds_since_last_failure: priorFailureState.secondsSinceLastFailure,
+    prior_failure_stale: priorFailureStale,
+    last_failure_at: currentFailure ? observedAt.toISOString() : priorLastFailureAt,
+    seconds_since_last_failure: priorSecondsSinceLastFailure,
     required_consecutive_failures: policy.consecutive_failures,
     terminal_reason: currentFailure ? terminalReason : null,
     failure_class: currentFailure ? failureClass : null,
@@ -818,53 +903,65 @@ function liveMonitorSelfQuarantine(result, env = {}) {
   };
 }
 
-async function runHostedMonitorCommand(run, runDir, evidenceArtifactDir) {
+/**
+ * RELEASE-015: every hosted monitor child is a wrapper. `bun run e2e:browser`
+ * execs Node, which launches Chromium and (in loopback mode) cargo; `bun run
+ * live:smoke` execs Node holding a websocket. Signalling only the wrapper's pid
+ * at the timeout left those grandchildren alive, holding the evidence directory
+ * and the port that the next run in the same matrix then raced. Ending the log
+ * streams at signal time additionally discarded whatever the child wrote while
+ * dying -- exactly the output that explains a timeout.
+ *
+ * The child is therefore a supervised process-group child: SIGTERM to the whole
+ * group, a bounded grace, SIGKILL only if needed, and the log streams closed
+ * strictly after the child itself is gone.
+ */
+export async function runHostedMonitorCommand(
+  run,
+  runDir,
+  evidenceArtifactDir,
+  { commandFactory = hostedMonitorCommand, graceMs = 5_000, spawnImpl = spawnManaged } = {},
+) {
   const runner = run.runner ?? "e2e-browser";
   const logPrefix = runner === "live-provider-smoke" ? "live-smoke" : "e2e";
-  const stdout = createWriteStream(path.join(runDir, `${logPrefix}.stdout.log`));
-  const stderr = createWriteStream(path.join(runDir, `${logPrefix}.stderr.log`));
-  const stdoutFinished = finished(stdout);
-  const stderrFinished = finished(stderr);
-  const command = hostedMonitorCommand(run, evidenceArtifactDir);
-  const child = spawn(command.bin, command.args, {
+  const command = commandFactory(run, evidenceArtifactDir);
+  const child = spawnImpl({
+    command: command.bin,
+    args: command.args,
     cwd: root,
-    env: {
-      ...process.env,
-      ...run.env,
-      ...command.env,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
+    env: hostedMonitorChildEnv(run, command),
+    stdoutPath: path.join(runDir, `${logPrefix}.stdout.log`),
+    stderrPath: path.join(runDir, `${logPrefix}.stderr.log`),
+    label: `hosted ${run.name}`,
   });
-  child.stdout.pipe(stdout);
-  child.stderr.pipe(stderr);
-  let timedOut = false;
-  let killTimer;
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    killTimer.unref?.();
-  }, run.timeoutMs);
-  timeout.unref?.();
-  let code;
+
   try {
-    code = await new Promise((resolve, reject) => {
-      child.once("error", reject);
-      child.once("exit", (exitCode, signal) => resolve(exitCode ?? signal));
-    });
+    await child.ready;
   } catch {
-    clearTimeout(timeout);
-    if (killTimer) clearTimeout(killTimer);
-    await flushHostedRunLogs(stdoutFinished, stderrFinished);
+    // A spawn error never escapes into this runner's own cleanup path: the
+    // managed promise carries it and the run is recorded as a sanitized
+    // spawn failure.
+    await child.stop({ graceMs });
     return writeRunOutcomeArtifact(
       runDir,
       "runner-failure.json",
       failedRunOutcome(run, "spawn_error"),
     );
   }
+
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.stop({ graceMs });
+  }, run.timeoutMs);
+  timeout.unref?.();
+  const { code, signal } = await child.exit.catch(() => ({ code: null, signal: null }));
   clearTimeout(timeout);
-  if (killTimer) clearTimeout(killTimer);
-  const logFlushFailure = await flushHostedRunLogs(stdoutFinished, stderrFinished);
+  // stop() is idempotent: whether the timeout already started the teardown or
+  // the child exited on its own, this is the one call that awaits the group's
+  // exit and only then finishes both log streams.
+  const stopped = await child.stop({ graceMs });
+
   if (timedOut) {
     return writeRunOutcomeArtifact(
       runDir,
@@ -875,18 +972,21 @@ async function runHostedMonitorCommand(run, runDir, evidenceArtifactDir) {
       }),
     );
   }
-  if (logFlushFailure) {
+  if (stopped.logFlushFailed) {
+    // The run's own logs are release evidence: a truncated stream is a failed
+    // run, never a quietly-passed one.
     return writeRunOutcomeArtifact(
       runDir,
       "runner-failure.json",
       failedRunOutcome(run, "log_flush_failed"),
     );
   }
-  if (code !== 0) {
+  const exitStatus = code ?? signal;
+  if (exitStatus !== 0) {
     return writeRunOutcomeArtifact(
       runDir,
       "runner-failure.json",
-      failedRunOutcome(run, "process_exit", exitDetails(code)),
+      failedRunOutcome(run, "process_exit", exitDetails(exitStatus)),
     );
   }
   return {
@@ -895,6 +995,20 @@ async function runHostedMonitorCommand(run, runDir, evidenceArtifactDir) {
     sanitized: true,
     exit_code: 0,
   };
+}
+
+// RELEASE-029: every hosted monitor child (the hosted browser E2E harness
+// and the live-provider smoke) receives an explicitly constructed
+// environment keyed off its role, never this process's own ambient
+// environment. `run.env`/`command.env` are already this runner's own
+// normalized plan/target configuration — never a blind copy of
+// `parentEnv` by name.
+export function hostedMonitorChildEnv(run, command, parentEnv = process.env) {
+  const role = (run.runner ?? "e2e-browser") === "live-provider-smoke" ? "hosted-live" : "hosted-browser";
+  return childEnvironmentFor(role, {
+    parentEnv,
+    explicit: { ...run.env, ...command.env },
+  });
 }
 
 function hostedMonitorCommand(run, evidenceArtifactDir) {
@@ -920,11 +1034,6 @@ function hostedMonitorCommand(run, evidenceArtifactDir) {
     };
   }
   throw new Error(`unsupported hosted monitor runner ${runner}`);
-}
-
-async function flushHostedRunLogs(stdoutFinished, stderrFinished) {
-  const results = await Promise.allSettled([stdoutFinished, stderrFinished]);
-  return results.some((result) => result.status === "rejected");
 }
 
 function failedRunOutcome(run, failureClass, extra = {}) {
@@ -958,72 +1067,154 @@ async function publishDirectoryToS3(directory, prefix, store, options = {}) {
   return uploaded;
 }
 
+const DEFAULT_PUBLISH_MAX_ATTEMPTS = 3;
+const PUBLISH_BACKOFF_BASE_MS = 100;
+
+/**
+ * RELEASE-018/025: retries only a classified-retryable failure -- a thrown
+ * fetch error, or HTTP 408/429/5xx -- for at most `maxAttempts` (default 3),
+ * with every attempt's timeout and every backoff bounded by the same
+ * `options.deadlineMs`. Any other 4xx fails immediately with a single
+ * attempt. SigV4 (the date header and signature) is recomputed fresh on
+ * every attempt so a retried request never carries a stale signature.
+ * `fetchImpl`/`sleep`/`nowMs`/`jitter` are injectable so tests never sleep
+ * in real time; each defaults to the real implementation.
+ */
 export async function putS3Object(store, key, body, contentType, options = {}) {
-  const endpoint = new URL(store.endpoint);
-  endpoint.hostname = `${store.bucket}.${endpoint.hostname}`;
-  endpoint.pathname = `/${key.split("/").map(encodeURIComponent).join("/")}`;
+  const {
+    deadlineMs,
+    fetchImpl = fetch,
+    jitter = defaultPublishJitter,
+    maxAttempts = DEFAULT_PUBLISH_MAX_ATTEMPTS,
+    nowMs = Date.now,
+    sleep = defaultPublishSleep,
+  } = options;
   const payloadHash = sha256Hex(body);
-  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
-  const dateStamp = amzDate.slice(0, 8);
-  const headers = {
-    "content-type": contentType,
-    host: endpoint.host,
-    "x-amz-content-sha256": payloadHash,
-    "x-amz-date": amzDate,
-  };
-  const signedHeaders = Object.keys(headers).sort().join(";");
-  const canonicalHeaders = Object.keys(headers)
-    .sort()
-    .map((name) => `${name}:${headers[name]}`)
-    .join("\n");
-  const canonicalRequest = [
-    "PUT",
-    endpoint.pathname,
-    "",
-    `${canonicalHeaders}\n`,
-    signedHeaders,
-    payloadHash,
-  ].join("\n");
-  const scope = `${dateStamp}/${store.region}/s3/aws4_request`;
-  const stringToSign = [
-    "AWS4-HMAC-SHA256",
-    amzDate,
-    scope,
-    sha256Hex(Buffer.from(canonicalRequest)),
-  ].join("\n");
-  const signature = hmacHex(
-    signingKey(store.secretAccessKey, dateStamp, store.region),
-    stringToSign,
-  );
-  const timeoutMs =
-    options.deadlineMs === undefined
-      ? defaultPublishTimeoutMs
-      : remainingPublishMs(options.deadlineMs);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  timeout.unref?.();
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      body,
-      headers: {
-        ...headers,
-        authorization: `AWS4-HMAC-SHA256 Credential=${store.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
-      },
-      method: "PUT",
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error(`artifact upload timed out for ${key}`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const attemptNowMs = nowMs();
+    const timeoutMs =
+      deadlineMs === undefined
+        ? defaultPublishTimeoutMs
+        : remainingPublishMsForAttempt(deadlineMs, attemptNowMs, key, attempt);
+    const endpoint = new URL(store.endpoint);
+    endpoint.hostname = `${store.bucket}.${endpoint.hostname}`;
+    endpoint.pathname = `/${key.split("/").map(encodeURIComponent).join("/")}`;
+    // Derived from the injectable clock (not a bare `new Date()`) so a
+    // retried attempt's signature is both genuinely fresh in production and
+    // deterministically provable in tests.
+    const amzDate = new Date(attemptNowMs).toISOString().replace(/[:-]|\.\d{3}/g, "");
+    const dateStamp = amzDate.slice(0, 8);
+    const headers = {
+      "content-type": contentType,
+      host: endpoint.host,
+      "x-amz-content-sha256": payloadHash,
+      "x-amz-date": amzDate,
+    };
+    const signedHeaders = Object.keys(headers).sort().join(";");
+    const canonicalHeaders = Object.keys(headers)
+      .sort()
+      .map((name) => `${name}:${headers[name]}`)
+      .join("\n");
+    const canonicalRequest = [
+      "PUT",
+      endpoint.pathname,
+      "",
+      `${canonicalHeaders}\n`,
+      signedHeaders,
+      payloadHash,
+    ].join("\n");
+    const scope = `${dateStamp}/${store.region}/s3/aws4_request`;
+    const stringToSign = [
+      "AWS4-HMAC-SHA256",
+      amzDate,
+      scope,
+      sha256Hex(Buffer.from(canonicalRequest)),
+    ].join("\n");
+    const signature = hmacHex(
+      signingKey(store.secretAccessKey, dateStamp, store.region),
+      stringToSign,
+    );
+    const controller = new AbortController();
+    // Deliberately referenced, never unref'd: under Node 24 an unref'd abort
+    // timer can let the event loop consider itself idle and move on before
+    // this correctness-critical abort fires.
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    let transportError = null;
+    try {
+      response = await fetchImpl(endpoint, {
+        body,
+        headers: {
+          ...headers,
+          authorization: `AWS4-HMAC-SHA256 Credential=${store.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+        },
+        method: "PUT",
+        signal: controller.signal,
+      });
+    } catch (error) {
+      transportError = controller.signal.aborted
+        ? s3PublishError(`artifact upload timed out for ${key}`, { attempts: attempt, key })
+        : error;
+    } finally {
+      clearTimeout(timeout);
     }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+    const isLastAttempt = attempt === maxAttempts;
+    if (!transportError) {
+      // Checked as a status range, not `response.ok` -- an injected test
+      // `fetchImpl` may return a minimal duck-typed response that never
+      // implements the real `Response` object's `ok` getter.
+      if (isSuccessStatus(response.status)) return;
+      if (!isRetryablePublishStatus(response.status) || isLastAttempt) {
+        throw s3PublishError(`artifact upload failed for ${key} with HTTP ${response.status}`, {
+          attempts: attempt,
+          key,
+        });
+      }
+    } else if (isLastAttempt) {
+      throw transportError;
+    }
+    // Bounded backoff before the next attempt; never sleep past the
+    // deadline, and never start a backoff the remaining budget cannot cover.
+    const remaining =
+      deadlineMs === undefined
+        ? undefined
+        : remainingPublishMsForAttempt(deadlineMs, nowMs(), key, attempt);
+    const rawBackoff = PUBLISH_BACKOFF_BASE_MS * 2 ** (attempt - 1) + jitter();
+    const backoffMs = remaining === undefined ? rawBackoff : Math.min(rawBackoff, remaining - 1);
+    if (backoffMs <= 0) {
+      if (transportError) throw transportError;
+      throw s3PublishError(`artifact upload failed for ${key} with HTTP ${response.status}`, {
+        attempts: attempt,
+        key,
+      });
+    }
+    await sleep(backoffMs);
   }
-  if (!response.ok) {
-    throw new Error(`artifact upload failed for ${key} with HTTP ${response.status}`);
-  }
+}
+
+function s3PublishError(message, { key, attempts }) {
+  const error = new Error(message);
+  error.objectKey = key;
+  error.attempts = attempts;
+  return error;
+}
+
+function isSuccessStatus(status) {
+  return status >= 200 && status <= 299;
+}
+
+function isRetryablePublishStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function defaultPublishSleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function defaultPublishJitter() {
+  return Math.floor(Math.random() * 50);
 }
 
 export function remainingPublishMs(deadlineMs, nowMs = Date.now()) {
@@ -1032,6 +1223,22 @@ export function remainingPublishMs(deadlineMs, nowMs = Date.now()) {
     throw new Error("hosted monitor publication timed out");
   }
   return remaining;
+}
+
+// `putS3Object`'s two internal `remainingPublishMs` call sites (the
+// pre-fetch timeout budget, and the post-response backoff budget) both run
+// with `key`/`attempt` already in scope: reclassifying a deadline-exhaustion
+// throw through `s3PublishError` here, instead of letting `remainingPublishMs`'s
+// own bare `Error` propagate directly, keeps the in-flight object key and
+// attempt count on the error object -- and therefore in the sanitized local
+// `publish-failure.json` written from it -- exactly like every other
+// terminal failure this loop can throw.
+function remainingPublishMsForAttempt(deadlineMs, nowMsValue, key, attempt) {
+  try {
+    return remainingPublishMs(deadlineMs, nowMsValue);
+  } catch (error) {
+    throw s3PublishError(error.message, { attempts: attempt, key });
+  }
 }
 
 async function auditHostedArtifacts(directory) {
@@ -1111,22 +1318,6 @@ function positiveInteger(value, fallback, name) {
   return parsed;
 }
 
-function nonNegativeInteger(value, name) {
-  if (value === undefined || value === null || String(value).trim() === "") {
-    throw new Error(`${name} is required`);
-  }
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`${name} must be a non-negative integer`);
-  }
-  return parsed;
-}
-
-function optionalNonNegativeInteger(value, name, fallback = null) {
-  if (value === undefined || value === null || String(value).trim() === "") return fallback;
-  return nonNegativeInteger(value, name);
-}
-
 function positiveNumber(value, name) {
   const parsed = Number.parseFloat(String(value));
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -1145,56 +1336,10 @@ function dateFromEnv(env, name, fallback) {
   return parsed;
 }
 
-function optionalDateFromEnv(env, name) {
-  const value = env[name];
-  if (value === undefined || value === null || String(value).trim() === "") return null;
-  return dateFromEnv(env, name, null);
-}
-
 function optionalDateValue(value) {
   if (value === undefined || value === null || String(value).trim() === "") return null;
   const parsed = new Date(String(value));
   return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-function liveMonitorPriorFailureState(env, now, policy, configuredConsecutiveFailures) {
-  if (configuredConsecutiveFailures <= 0) {
-    return {
-      consecutiveFailures: 0,
-      lastFailureAt: null,
-      secondsSinceLastFailure: null,
-      stale: false,
-    };
-  }
-  const lastFailureAt = optionalDateFromEnv(env, "VIVA_HOSTED_LIVE_MONITOR_LAST_FAILURE_AT");
-  if (!lastFailureAt) {
-    return {
-      consecutiveFailures: 0,
-      lastFailureAt: null,
-      secondsSinceLastFailure: null,
-      stale: true,
-    };
-  }
-  const secondsSinceLastFailure = Math.max(
-    0,
-    Math.floor((now.getTime() - lastFailureAt.getTime()) / 1000),
-  );
-  const stale = secondsSinceLastFailure > policy.observation_window_seconds;
-  return {
-    consecutiveFailures: stale ? 0 : configuredConsecutiveFailures,
-    lastFailureAt,
-    secondsSinceLastFailure,
-    stale,
-  };
-}
-
-function priorFailureStateEvidence(state) {
-  return {
-    consecutive_failures: state.consecutiveFailures,
-    last_failure_at: state.lastFailureAt?.toISOString() ?? null,
-    prior_failure_stale: state.stale,
-    seconds_since_last_failure: state.secondsSinceLastFailure,
-  };
 }
 
 function sanitizeRunId(value) {
@@ -1205,10 +1350,15 @@ function sanitizeRunId(value) {
   return sanitized;
 }
 
+// RELEASE-018/025: no `image/png` branch here -- `publishableHostedFiles`
+// (via `isPublishableHostedArtifact`/`isTextArtifact`) never selects a PNG
+// for upload, so this function never receives one. A future decision to
+// publish screenshots durably must add PNG upload, checksum, redaction,
+// content type, retry, and fetch-after-publish proof together, not resurrect
+// a dormant content-type branch alone.
 function contentTypeFor(file) {
   if (file.endsWith(".json")) return "application/json";
   if (file.endsWith(".log") || file.endsWith(".txt")) return "text/plain; charset=utf-8";
-  if (file.endsWith(".png")) return "image/png";
   return "application/octet-stream";
 }
 

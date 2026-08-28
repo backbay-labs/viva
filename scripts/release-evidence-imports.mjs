@@ -12,7 +12,7 @@ export async function readHostedMonitorEvidence({
   productionRequested = false,
   root = process.cwd(),
 } = {}) {
-  const manifestPath = await resolveHostedMonitorEvidencePath({ env, mode, root });
+  const manifestPath = await resolveHostedMonitorEvidencePath({ env, mode, productionRequested, root });
   if (manifestPath === null) {
     if (productionRequested) {
       throw new Error("hosted monitor manifest is required for production release evidence");
@@ -56,8 +56,20 @@ export function matrixResultsFromHostedMonitorEvidence(
       run.scenario_id.length > 0,
   );
 
-  if (productionRequested && expectedDeployIds.complete) {
-    for (const run of passedRuns.filter((entry) => requiredScenarioIdSet.has(entry.scenario_id))) {
+  if (productionRequested) {
+    // RELEASE-003/007/008: an incomplete expected identity must fail
+    // closed, never silently skip the comparison -- otherwise a run's own
+    // (unverified) reported deploy ids stand in unexamined. And every
+    // passed run is checked, not only the ones a required recovery
+    // scenario names, so a non-required run's deploy ids can never be
+    // "inherited" from elsewhere without being mapped to the actual
+    // selected target.
+    if (!expectedDeployIds.complete) {
+      throw new Error(
+        "hosted monitor deploy identity requires VIVA_RELEASE_WEB_DEPLOY_ID and VIVA_RELEASE_AGENT_DEPLOY_ID",
+      );
+    }
+    for (const run of passedRuns) {
       if (
         run.hosted_e2e?.deploy_ids?.web !== expectedDeployIds.web ||
         run.hosted_e2e?.deploy_ids?.agent !== expectedDeployIds.agent
@@ -146,7 +158,18 @@ export async function readProviderFailureObservations({
   return observations;
 }
 
-async function resolveHostedMonitorEvidencePath({ env, mode, root }) {
+async function resolveHostedMonitorEvidencePath({ env, mode, productionRequested, root }) {
+  // RELEASE-003/007/008: a production import must name the exact run it
+  // wants before anything else is resolved -- even when an explicit
+  // manifest path is also supplied, so a mistakenly-pointed path can never
+  // substitute for a genuine run-id binding, and so the lexicographic
+  // "latest" fallback below is structurally unreachable in production.
+  if (productionRequested && !stringOrNull(env.VIVA_RELEASE_RUN_ID)) {
+    throw new Error(
+      "hosted monitor manifest resolution requires VIVA_RELEASE_RUN_ID for production release evidence",
+    );
+  }
+
   const explicit =
     env.VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH ?? env.VIVA_HOSTED_MONITOR_MANIFEST_PATH;
   if (explicit) return path.resolve(root, explicit);
@@ -193,7 +216,9 @@ function validateHostedMonitorManifest(manifest, { env, now, productionRequested
     subject: "hosted monitor manifest",
   });
   validateRunId(manifest, env, "hosted monitor manifest");
-  if (manifest.sanitized === false) {
+  // RELEASE-003/007/008: missing/null must fail exactly like an explicit
+  // false -- only a literal `true` proves the manifest was sanitized.
+  if (manifest.sanitized !== true) {
     throw new Error("hosted monitor manifest must be sanitized");
   }
 }

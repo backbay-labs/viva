@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
-  type: "json",
-};
+import {
+  RELEASE_LEARNER_LOOP_CONTRACT,
+  RELEASE_LEARNER_LOOP_CONTRACT as learnerLoopContract,
+  validatedLearnerLoopForRelease,
+} from "./release-contract-validation.mjs";
 import fixture from "./fixtures/rollback-drain-threshold-samples.json" with { type: "json" };
 import {
   assertRollbackReleaseGate,
@@ -324,4 +326,38 @@ test("default non-production release evidence carries thresholds without allowin
   assert.equal(evidence.production_snapshot.provider_mode, "fake_cartesia_gemini");
   assert.doesNotThrow(() => assertRollbackReleaseGate(evidence));
   assert.equal(rollbackCriteriaEvidence().schema, "viva.rollback_drain_criteria.v1");
+});
+
+// RELEASE-028: the rollback gate's contract-state check reads the validated
+// singleton, so an unknown or misspelled learner-loop state can never reach it.
+test("rollback drain coverage names only states the validated learner-loop contract defines", () => {
+  const contractStateIds = new Set(learnerLoopContract.states.map((state) => state.id));
+  const named = BAC_510_ROLLBACK_COVERAGE.map((entry) => entry.contract_state_id);
+
+  assert.ok(named.length > 0);
+  for (const stateId of named) {
+    assert.equal(contractStateIds.has(stateId), true, `${stateId} is not a contract state`);
+  }
+  assert.equal(Object.isFrozen(learnerLoopContract), true);
+});
+
+
+// RELEASE-028 bypass control: this consumer's own hostile variant. If the
+// published validator ever stopped rejecting unknown keys, this test fails
+// here rather than letting an unchecked state reach the gate.
+test("the rollback gate refuses a learner-loop variant carrying an unknown nested field", () => {
+  const hostile = JSON.parse(JSON.stringify(RELEASE_LEARNER_LOOP_CONTRACT));
+  hostile.states[0].viva_hostile_unknown_key = "viva-hostile-sentinel-value-9f2a";
+
+  assert.throws(
+    () => validatedLearnerLoopForRelease(hostile),
+    (error) => {
+      assert.equal(error.code, "learner_loop_contract_invalid");
+      assert.equal(
+        `${error.message}${error.stack}`.includes("viva-hostile-sentinel-value-9f2a"),
+        false,
+      );
+      return true;
+    },
+  );
 });

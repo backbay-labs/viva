@@ -81,7 +81,6 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
       command_summary_present: true,
       fixture_hash_count: 1,
       frame_ids: [
-        "pending_local_preview",
         "server_ready_study_set",
         "active_synthetic_manuscript",
         "second_tab_session_cap",
@@ -89,16 +88,22 @@ test("normalizes connected recap browser evidence from the current e2e schema", 
         "recap",
       ],
       frame_screenshot_ids: [
-        "pending_local_preview",
         "server_ready_study_set",
         "active_synthetic_manuscript",
         "second_tab_session_cap",
         "correction_marginalia",
         "recap",
       ],
+      non_product_evidence: [
+        {
+          id: "pending_local_preview",
+          kind: "structured_preview",
+          screenshot: "pending-local-preview.png",
+        },
+      ],
+      product_screenshot_count: 5,
       sanitized: true,
       schema: "viva.browser_story.v1",
-      screenshot_count: 6,
       trace_retained: false,
       validation_run_id: "browser-story-synthetic",
     },
@@ -171,6 +176,48 @@ test("rejects browser evidence without next-session review recommendations", () 
 test("requires sanitized browser-story frames for the manuscript release artifact", () => {
   assert.doesNotThrow(() =>
     assertReleaseBrowserEvidence(normalizeBrowserEvidence(completeBrowserResult())),
+  );
+});
+
+test("D-09 Branch B: a complete release story passes with the harness-authored preview frame entirely absent", () => {
+  const storyWithoutPreview = completeBrowserStory({
+    frames: completeBrowserStory().frames.filter((frame) => frame.id !== "pending_local_preview"),
+  });
+
+  assert.equal(
+    storyWithoutPreview.frames.some((frame) => frame.id === "pending_local_preview"),
+    false,
+  );
+  assert.doesNotThrow(() =>
+    assertReleaseBrowserEvidence(
+      normalizeBrowserEvidence(completeBrowserResult({ browser_story: storyWithoutPreview })),
+    ),
+  );
+});
+
+test("D-09 Branch B: a structured_preview frame cannot satisfy a missing required product frame or inflate product_screenshot_count", () => {
+  const storyWithRelabeledRecap = completeBrowserStory({
+    frames: [
+      ...completeBrowserStory({ omitFrameId: "recap" }).frames,
+      { id: "recap", kind: "structured_preview", screenshot: "fake-recap.png" },
+    ],
+  });
+
+  const evidence = normalizeBrowserEvidence(
+    completeBrowserResult({ browser_story: storyWithRelabeledRecap }),
+  );
+
+  // The relabeled frame carries the required id and a screenshot, but its kind
+  // marks it as non-product evidence: it must not be counted as a product frame.
+  assert.equal(evidence.browser_story.frame_ids.includes("recap"), false);
+  assert.equal(evidence.browser_story.product_screenshot_count, 4);
+  assert.deepEqual(
+    evidence.browser_story.non_product_evidence.map((frame) => frame.id),
+    ["pending_local_preview", "recap"],
+  );
+  assert.throws(
+    () => assertReleaseBrowserEvidence(evidence),
+    /browser_story\.frames must include recap/,
   );
 });
 

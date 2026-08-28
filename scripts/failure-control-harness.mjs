@@ -257,7 +257,13 @@ export function failureControlHarnessEvidence(plan) {
   const scenarioIds = FAILURE_CONTROL_SCENARIOS.map((entry) => entry.id);
   return {
     schema: HARNESS_SCHEMA,
-    enabled_for_release: false,
+    // BAC-528: this must reflect the plan's real enabled state. The
+    // production release gate's `bac_528_harness_disabled` proof
+    // (scripts/production-release-gate.mjs) trusts this field literally as
+    // its only signal; a hardcoded value here would make that gate attest
+    // nothing. scripts/release-check.mjs's independent throw when the
+    // in-process plan is enabled remains a second, separate layer.
+    enabled_for_release: enabled,
     selected_scenario: enabled ? plan.scenario.id : null,
     scenario_count: FAILURE_CONTROL_SCENARIOS.length,
     scenario_ids: scenarioIds,

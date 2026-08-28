@@ -51,7 +51,26 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_VOICE_WS_MAX_IP_SESSIONS",
     "VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE",
     "VIVA_VOICE_WS_MAX_SESSION_COST_USD",
+    // SERVICE-003 (Plan 08 handoff, applied by Plan 12 Task 15 Step 5A): the
+    // per-IP cap's client-address derivation is peer-first, trusted-proxy-aware.
+    "VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS",
+    "socket peer address",
+    "needs no forwarding proxy header",
+    "X-Forwarded-For",
+    "right to left",
+    "X-Real-IP",
+    "trusted proxy",
+    "rejected before a session slot",
   ]);
+
+  // SERVICE-003: a direct (non-proxied) deployment must never be documented as
+  // requiring a forwarding header -- that claim is exactly the spoofable
+  // left-most-XFF defect (Important I2) this section closes.
+  assert.doesNotMatch(
+    runtime,
+    /direct[a-z /-]*\brequires?\b[^.\n]{0,60}forward/i,
+    "runtime section must not claim a direct deployment requires a forwarding proxy header",
+  );
 
   assertIncludesAll(postgres, [
     "DATABASE_URL",
@@ -86,6 +105,10 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_SESSION_ALLOWED_USER_IDS",
     "VIVA_SESSION_ALLOWED_STUDY_SET_IDS",
     "VIVA_SESSION_MINT_MAX_PER_MINUTE",
+    // A-34.4: the agent-side session-mint credential rides the combined 12B
+    // admission; the mint/record scoping sentence is the A-36 authority record.
+    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+    "mint/record operation only",
     "token_refresh_outcome",
     "invalid_rejected",
     "Authorization: Bearer",
@@ -140,6 +163,9 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "selectable: true",
     "live_runtime: true",
     "recap_ready",
+    "VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED",
+    "never reads",
+    "the only component that holds them",
   ]);
 
   assertIncludesAll(hostedMonitor, [
@@ -162,8 +188,6 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "BAC-532",
     "BAC-535",
     "VIVA_HOSTED_LIVE_MONITOR_ENABLED",
-    "VIVA_HOSTED_LIVE_MONITOR_STATE_DATE",
-    "VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY",
     "VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL",
     "VIVA_HOSTED_LIVE_MONITOR_AGENT_MAX_SESSION_COST_USD",
     "VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE",
@@ -201,6 +225,34 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "publishes only text, JSON, and log artifacts",
     "object prefix",
     "not GitHub Actions",
+    "Durable live-monitor state",
+    "viva-hosted-monitor/state/live-monitor-state.v1.json",
+    "no longer operator-set environment state",
+    "runs_today",
+    "tokens_today",
+    "cost_usd_today",
+    "consecutive_failures",
+    "last_applied_run_id",
+    "active_reservation",
+    "never carries a learner/provider payload or a secret value",
+    "cas-probe.v1.json",
+    "If-Match",
+    "If-None-Match: *",
+    "state_unavailable",
+    "Plan 15 handoff item 4",
+    "compare-and-swap",
+    "conservatively charged",
+    "never refunded from unverifiable partial evidence",
+    "publish_failed",
+    "manifest last",
+    "VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES",
+    "VIVA_LIVE_SMOKE_RUN_ID",
+    "VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED",
+    "immediately before spawning",
+    "never persisted in the plan",
+    "run's own timeout plus",
+    "flush grace",
+    "agent deploy id",
   ]);
 
   assertIncludesAll(rollback, [
@@ -232,8 +284,10 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "websocket_drain_emits_terminal_phase_before_close",
     "websocket_drain_interrupts_active_provider_response",
     "VIVA_PRODUCTION_RELEASE",
+    "VIVA_RELEASE_RUN_ID",
     "VIVA_RELEASE_WEB_DEPLOY_ID",
     "VIVA_RELEASE_AGENT_DEPLOY_ID",
+    "VIVA_RELEASE_DEPLOY_SHA",
     "VIVA_LIVE_WEB_DEPLOY_ID",
     "VIVA_LIVE_AGENT_DEPLOY_ID",
     "VIVA_RELEASE_WEB_ORIGIN",
@@ -254,6 +308,59 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "VIVA_RELEASE_OWNER",
     "VIVA_RELEASE_OWNER_DECISION=proceed",
     "VIVA_RELEASE_OWNER_DECIDED_AT_UTC",
+    "Exact run and deploy binding",
+    "resolving any production path",
+    "lexicographically latest run directory",
+    "one-character difference is rejected",
+    "sanitized",
+    "must be strictly `true`",
+    "not only the runs a",
+    "required recovery scenario names",
+    "live_smoke_run_id_match",
+    "live_smoke_agent_deploy_match",
+    "live_smoke_deploy_sha_match",
+    "VIVA_LIVE_SMOKE_AGENT_DEPLOY_ID",
+    "Downstream bundle verification",
+    "release:verify",
+    "verify-release-bundle.mjs",
+    "accepts exactly one evidence path",
+    "hmac-sha256",
+    "signature_key_present",
+    "rejected outright",
+    "never silently downgraded",
+    "sha256-self",
+    "wrong secret, or any tamper",
+    "rejected exactly like a tampered one",
+    "verification failure, never a silently skipped check",
+    "assertProductionReleaseGate",
+    "validly signed but incomplete bundle is still rejected",
+    "sanitized JSON line",
+    "payload_sha256",
+    "never a secret or raw evidence field",
+    "Plan 15 supplies the real secret",
+    "authorized deployment/release environment",
+    "Container supply chain",
+    "sha256:",
+    "rust:1.94.1-slim-bookworm",
+    "debian:bookworm-slim",
+    "mcr.microsoft.com/playwright:v1.61.0-noble",
+    "Bun 1.3.3 from verified release bytes",
+    "bun-linux-x64.zip",
+    "bun-linux-aarch64.zip",
+    "sha256sum -c",
+    "`RUN` layer",
+    "uid/gid `10001:10001`",
+    "pwuser",
+    "/app/evidence",
+    "before the `USER`",
+    "re-enters root",
+    "build_inputs",
+    "deployment_outputs",
+    "VIVA_RELEASE_AGENT_IMAGE_DIGEST",
+    "VIVA_RELEASE_MONITOR_IMAGE_DIGEST",
+    "swapped between agent and monitor",
+    "never inferred from a",
+    "can never masquerade as",
   ]);
 
   assertIncludesAll(redaction, [
@@ -294,11 +401,22 @@ test("hosted monitor substrate config is deployable off GitHub Actions", async (
   ]);
 
   const dockerfile = await readFile("Dockerfile.monitor", "utf8");
-  assert.match(dockerfile, /mcr\.microsoft\.com\/playwright:v1\.61\.0/);
+  assert.match(dockerfile, /mcr\.microsoft\.com\/playwright:v1\.61\.0-noble@sha256:[0-9a-f]{64}/);
   assert.match(dockerfile, /bun-v1\.3\.3/);
   assert.match(dockerfile, /bun install --frozen-lockfile/);
   assert.match(dockerfile, /\/app\/evidence\/live-smoke-answer\.pcm/);
   assert.match(dockerfile, /bun", "run", "hosted:monitor"/);
+  // RELEASE-026: verified Bun bytes (not a curl-piped installer script),
+  // and a non-root pwuser owning the evidence directory before CMD.
+  assert.doesNotMatch(dockerfile, /curl[^\n]*\|\s*(ba)?sh\b/);
+  assert.match(dockerfile, /sha256sum -c/);
+  assert.match(dockerfile, /\nUSER pwuser\s*\n/);
+  assert.match(dockerfile, /chown(?:\s+-R)?\s+pwuser:pwuser\s+\/app\/evidence/);
+});
+
+test("RELEASE-004: downstream bundle verification is wired as a package script", async () => {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+  assert.equal(packageJson.scripts["release:verify"], "node scripts/verify-release-bundle.mjs");
 });
 
 test("hosted monitor agent targets can deploy from the agent directory", async () => {
@@ -309,6 +427,10 @@ test("hosted monitor agent targets can deploy from the agent directory", async (
     /VIVA_AGENT_BIND_ADDR=\$\{VIVA_AGENT_BIND_ADDR:-0\.0\.0\.0:\$\{PORT:-4318\}\}/,
   );
   assert.doesNotMatch(dockerfile, /Dockerfile\.monitor|hosted:monitor/);
+  // RELEASE-026: pinned digests and a non-root runtime user.
+  assert.match(dockerfile, /^FROM rust:1\.94\.1-slim-bookworm@sha256:[0-9a-f]{64} AS builder$/m);
+  assert.match(dockerfile, /^FROM debian:bookworm-slim@sha256:[0-9a-f]{64} AS runtime$/m);
+  assert.match(dockerfile, /\nUSER 10001:10001\s*\n/);
 });
 
 function requiredSection(markdown, heading) {

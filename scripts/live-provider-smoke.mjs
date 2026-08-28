@@ -5,12 +5,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   failureMatrixEvidence,
+  LIVE_PROVIDER_FAILURE_MATRIX,
   liveProviderFailureForSmokeReason,
 } from "./live-provider-failure-matrix.mjs";
 import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
+import {
+  isReleaseVoiceTerminalReason,
+  validatedVoiceFrameForRelease,
+} from "./release-contract-validation.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PROTOCOL_VERSION = 5;
 const LIVE_PROVIDER = "cartesia_gemini";
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash";
 const DEFAULT_AGENT_HTTP_URL = "http://127.0.0.1:4318";
@@ -38,6 +42,60 @@ const SAFE_EVENT_CODES = Object.freeze({
   cancellation: "cancellation",
   structured_error: "structured_error",
 });
+// BAC-527: a genuine server structured_error event may name its own reason
+// via `source`; only retain it verbatim when it is one of the server's
+// allow-listed failure reasons, never an arbitrary provider-controlled
+// string.
+const RECOGNIZED_STRUCTURED_ERROR_SOURCES = new Set(
+  LIVE_PROVIDER_FAILURE_MATRIX.flatMap((entry) => entry.smoke_terminal_reasons ?? []),
+);
+
+/**
+ * BAC-527: one monotonic deadline shared by every live-smoke stage —
+ * readiness, bootstrap, socket open, ready, question, and recap — so a slow
+ * earlier stage correspondingly shrinks the time budget left for the ones
+ * after it, instead of each stage getting a fresh full cap.
+ */
+export function createDeadline({ nowMs, durationMs }) {
+  const deadlineAt = nowMs + durationMs;
+  return {
+    deadlineAt,
+    remainingMs(currentNowMs) {
+      const remaining = deadlineAt - currentNowMs;
+      if (remaining <= 0) {
+        throw new Error("live smoke deadline exceeded");
+      }
+      return remaining;
+    },
+  };
+}
+
+/**
+ * BAC-527: the sanitized evidence written when the runner's supervisory
+ * SIGTERM interrupts an in-flight run. Deliberately minimal — counters,
+ * stage, run/deploy binding, signal name, and timestamps only; never the
+ * current frame, audio bytes, transcript, answer, prompt, or session token.
+ */
+export function interruptedEvidence(state, signal) {
+  return {
+    schema: "viva.live_provider_smoke.v1",
+    generated_at: new Date().toISOString(),
+    deploy_sha: state?.deploySha ?? "unknown",
+    model: state?.model ?? DEFAULT_GEMINI_MODEL,
+    provider: LIVE_PROVIDER,
+    run_id: state?.runId ?? null,
+    agent_deploy_id: state?.agentDeployId ?? null,
+    status: "failed",
+    partial: true,
+    failure_stage: state?.stage ?? "unknown",
+    failure_class: "timeout",
+    terminal_reason: "killed_by_runner",
+    signal,
+    event_counts: state?.eventCounts ?? null,
+    privacy: privacyEvidence(),
+  };
+}
+
 export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {}) {
   const artifactDir = liveSmokeArtifactDir(env, rootDir);
   const deploySha = deploymentSha(env);
@@ -45,30 +103,34 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
   const enabled = liveSmokeEnabled(env);
   const model = liveSmokeModel(env);
   const provider = LIVE_PROVIDER;
+  const runId = env.VIVA_LIVE_SMOKE_RUN_ID?.trim() || null;
+  // RELEASE-003/007/008: the release's own agent deploy identity, distinct
+  // from deploy_sha (a git commit) and run_id (this smoke's own run). Set
+  // explicitly rather than inferred, so it can be bound and verified
+  // against VIVA_RELEASE_AGENT_DEPLOY_ID by the production gate.
+  const agentDeployId = env.VIVA_LIVE_SMOKE_AGENT_DEPLOY_ID?.trim() || null;
   if (!enabled) {
     return {
+      agentDeployId,
       artifactDir,
       deploySha,
       enabled,
       model,
       outputPath,
       provider,
+      runId,
     };
   }
 
   if (env.VIVA_AGENT_PROVIDER && env.VIVA_AGENT_PROVIDER !== provider) {
     throw new Error("live smoke provider mismatch");
   }
-  if (!hasValue(env.CARTESIA_API_KEY) || !hasValue(env.GEMINI_API_KEY)) {
-    throw new Error("live provider secrets are required when smoke is enabled");
-  }
-  if (
-    env.CARTESIA_ZERO_DATA_RETENTION_ENABLED !== "1" ||
-    env.GEMINI_ZERO_DATA_RETENTION_APPROVED !== "1"
-  ) {
-    throw new Error(
-      "live provider zero-data-retention confirmation is required when smoke is enabled",
-    );
+  // RELEASE-016/021: the smoke never holds or consumes raw Cartesia/Gemini
+  // keys -- the agent deployment is the only component that does. The
+  // caller instead attests, with one explicit flag, that those keys and
+  // their zero-data-retention approvals are already configured there.
+  if (env.VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED !== "1") {
+    throw new Error("live provider secrets confirmation is required when smoke is enabled");
   }
 
   const caps = {
@@ -95,6 +157,7 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     wsUrlFromHttp(httpBaseUrl);
 
   return {
+    agentDeployId,
     artifactDir,
     audioFile,
     bearerToken: env.VIVA_VOICE_WS_BEARER_TOKEN?.trim() || null,
@@ -114,6 +177,7 @@ export function buildLiveSmokeConfig({ env = process.env, rootDir = root } = {})
     origin: env.VIVA_LIVE_SMOKE_ORIGIN?.trim() || null,
     outputPath,
     provider,
+    runId,
     suppliedSession: suppliedSessionFromEnv(env),
     wsUrl,
   };
@@ -125,6 +189,7 @@ export async function runLiveProviderSmoke({
   fetchImpl = fetch,
   now = () => new Date(),
   readFileImpl = readFile,
+  interruptState = null,
 } = {}) {
   const config = buildLiveSmokeConfig({ env });
   if (!config.enabled) {
@@ -141,53 +206,39 @@ export async function runLiveProviderSmoke({
     ),
   };
   const base = baseEvidence(config, now);
-  let readiness;
-  try {
-    readiness = await collectReadiness(config, fetchImpl);
-  } catch {
-    const terminalReason = "readiness_unavailable";
-    const failure = liveProviderFailureForSmokeReason(terminalReason);
-    const evidence = {
-      ...base,
-      status: "failed",
-      failure_stage: "readiness",
-      failure,
-      failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
-      readiness: readinessUnavailable(),
-      terminal_reason: terminalReason,
-    };
+  const finish = (terminalReason, stage, extra = {}) => {
+    const evidence = failedEvidence(base, monitorConfig, terminalReason, stage, extra);
     auditLiveSmokeEvidence(evidence, env);
     return evidence;
+  };
+
+  // BAC-527: readiness, bootstrap, socket open, ready, question, and recap
+  // all share this one deadline — each stage receives only whatever time is
+  // left, never a fresh full cap of its own.
+  const deadline = createDeadline({
+    nowMs: now().getTime(),
+    durationMs: config.caps.max_duration_ms,
+  });
+  if (interruptState) {
+    interruptState.deploySha = config.deploySha;
+    interruptState.model = config.model;
+    interruptState.runId = config.runId;
+    interruptState.agentDeployId = config.agentDeployId;
+    interruptState.stage = "readiness";
+  }
+
+  let readiness;
+  try {
+    readiness = await collectReadiness(config, fetchImpl, deadline.remainingMs(now().getTime()));
+  } catch {
+    return finish("readiness_unavailable", "readiness", { readiness: readinessUnavailable() });
   }
 
   if (!readinessPasses(readiness)) {
-    const terminalReason = readinessFailureSmokeReason(readiness);
-    const failure = liveProviderFailureForSmokeReason(terminalReason);
-    const evidence = {
-      ...base,
-      status: "failed",
-      failure_stage: "readiness",
-      failure,
-      failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
-      readiness,
-      terminal_reason: terminalReason,
-    };
-    auditLiveSmokeEvidence(evidence, env);
-    return evidence;
+    return finish(readinessFailureSmokeReason(readiness), "readiness", { readiness });
   }
   if (!remoteCostCapPasses(readiness, config)) {
-    const evidence = {
-      ...base,
-      status: "failed",
-      failure_stage: "readiness",
-      failure: liveProviderFailureForSmokeReason("cost_budget"),
-      readiness,
-      terminal_reason: "cost_budget",
-    };
-    auditLiveSmokeEvidence(evidence, env);
-    return evidence;
+    return finish("cost_budget", "readiness", { readiness });
   }
 
   let audioBytes;
@@ -197,40 +248,15 @@ export async function runLiveProviderSmoke({
       throw new Error("audio size outside configured cap");
     }
   } catch {
-    const terminalReason = "audio_input_unavailable";
-    const failure = liveProviderFailureForSmokeReason(terminalReason);
-    const evidence = {
-      ...base,
-      status: "failed",
-      failure_stage: "audio_input",
-      failure,
-      failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
-      readiness,
-      terminal_reason: terminalReason,
-    };
-    auditLiveSmokeEvidence(evidence, env);
-    return evidence;
+    return finish("audio_input_unavailable", "audio_input", { readiness });
   }
 
+  if (interruptState) interruptState.stage = "bootstrap";
   let bootstrap;
   try {
-    bootstrap = await bootstrapSession(config, fetchImpl);
+    bootstrap = await bootstrapSession(config, fetchImpl, deadline.remainingMs(now().getTime()));
   } catch {
-    const terminalReason = "bootstrap_failed";
-    const failure = liveProviderFailureForSmokeReason(terminalReason);
-    const evidence = {
-      ...base,
-      status: "failed",
-      failure_stage: "bootstrap",
-      failure,
-      failure_class: failure.failure_class,
-      monitor: failedMonitorEvidence(monitorConfig, terminalReason),
-      readiness,
-      terminal_reason: terminalReason,
-    };
-    auditLiveSmokeEvidence(evidence, env);
-    return evidence;
+    return finish("bootstrap_failed", "bootstrap", { readiness });
   }
 
   const websocket = await collectWebSocketProof({
@@ -238,6 +264,9 @@ export async function runLiveProviderSmoke({
     bootstrap,
     config,
     createWebSocket,
+    deadline,
+    interruptState,
+    now,
   });
   const usageAfter = await collectUsageSnapshot(config, fetchImpl).catch(() => null);
   const requiredEvents = requiredEventSummary(websocket.event_counts);
@@ -246,6 +275,8 @@ export async function runLiveProviderSmoke({
     websocket.ready_frame_observed &&
     Object.values(requiredEvents).every(Boolean) &&
     websocket.event_counts.structured_error === 0 &&
+    websocket.event_counts.transport_error === 0 &&
+    websocket.event_counts.protocol_error === 0 &&
     websocket.terminal_reason === "recap_observed"
       ? "passed"
       : "failed";
@@ -256,18 +287,7 @@ export async function runLiveProviderSmoke({
   const terminalReason = tokenBudgetExceeded
     ? "cost_budget"
     : (websocket.terminal_reason ?? "websocket_failed");
-  const failure = status === "failed" ? liveProviderFailureForSmokeReason(terminalReason) : null;
-  const evidence = {
-    ...base,
-    status,
-    ...(failure
-      ? {
-          failure,
-          failure_class: failure.failure_class,
-          failure_stage: tokenBudgetExceeded ? "usage" : "websocket",
-          terminal_reason: terminalReason,
-        }
-      : {}),
+  const websocketEvidence = {
     readiness,
     bootstrap: {
       server_study_created: bootstrap.serverStudyCreated,
@@ -277,74 +297,179 @@ export async function runLiveProviderSmoke({
       ...websocket,
       required_events: requiredEvents,
     },
+    usage,
+  };
+  if (status === "failed") {
+    return finish(terminalReason, tokenBudgetExceeded ? "usage" : "websocket", websocketEvidence);
+  }
+  const evidence = {
+    ...base,
+    status,
+    ...websocketEvidence,
     monitor: liveMonitorEvidence({
+      agentDeployId: config.agentDeployId,
       consecutiveFailures: monitorConfig.liveMonitorConsecutiveFailures,
       deploySha: config.deploySha,
       model: config.model,
+      runId: config.runId,
       status,
       terminalReason,
     }),
-    usage,
   };
   auditLiveSmokeEvidence(evidence, env);
   return evidence;
 }
 
+/**
+ * BAC-527: every failure branch returns the same complete top-level shape —
+ * `failure`, `failure_class`, `monitor`, `terminal_reason`, and
+ * `failure_stage` — so a remote-cost-cap rejection is exactly as
+ * classifiable as any other live-smoke failure.
+ */
+function failedEvidence(base, monitorConfig, terminalReason, stage, extra = {}) {
+  const failure = liveProviderFailureForSmokeReason(terminalReason);
+  return {
+    ...base,
+    ...extra,
+    status: "failed",
+    failure_stage: stage,
+    failure,
+    failure_class: failure.failure_class,
+    monitor: failedMonitorEvidence(monitorConfig, terminalReason),
+    terminal_reason: terminalReason,
+  };
+}
+
+/**
+ * RELEASE-028: validate before believing anything.
+ *
+ * This function used to branch on `frame.type`, `frame.event.type`,
+ * `frame.event.phase`, `frame.event.terminal_reason`, `partial_reason` and
+ * `source` on a bare `JSON.parse` result — so a payload that merely *looked*
+ * like a frame could set a terminal reason and reach the evidence file. Every
+ * frame now goes through the published strict validator first; only its
+ * reconstructed, frozen value is read, and an invalid frame yields the single
+ * stable sanitized code with none of the offending content.
+ */
 export function summarizeServerFrame(frame) {
-  if (!frame || typeof frame !== "object") {
+  let validated;
+  try {
+    validated = validatedVoiceFrameForRelease(frame);
+  } catch (error) {
     return {
       kind: "invalid",
+      event_code: error?.code ?? "voice_server_frame_invalid",
     };
   }
-  if (frame.type === "ready") {
+  if (validated.type === "ready") {
     return {
       kind: "ready",
-      brain: summarizeBrain(frame.brain),
-      input_encoding: typeof frame.input_encoding === "string" ? frame.input_encoding : null,
-      sample_rate_hz: Number.isInteger(frame.sample_rate_hz) ? frame.sample_rate_hz : null,
-      store: summarizeStore(frame.store),
+      brain: summarizeBrain(validated.brain),
+      input_encoding: validated.input_encoding,
+      protocol_version: validated.version,
+      sample_rate_hz: validated.sample_rate_hz,
+      store: summarizeStore(validated.store),
     };
   }
-  if (frame.type === "error") {
+  if (validated.type === "error") {
     return {
       event_code: "structured_error",
       kind: "event",
     };
   }
-  if (frame.type !== "event" || !frame.event || typeof frame.event !== "object") {
+  if (validated.type === "audio_turn_accepted") {
+    // A well-formed acceptance is a real event, not an unrecognized shape:
+    // classifying it as "unknown" would have made a correct server frame a
+    // protocol failure.
     return {
-      kind: "unknown",
+      event_code: "audio_turn_accepted",
+      kind: "event",
     };
   }
-  const rawType = typeof frame.event.type === "string" ? frame.event.type : "unknown";
-  const eventCode = SAFE_EVENT_CODES[rawType] ?? "unknown_event";
+  const eventCode = SAFE_EVENT_CODES[validated.event.type] ?? "unknown_event";
   const summary = {
     event_code: eventCode,
     kind: "event",
   };
-  if (eventCode === "session_phase" && typeof frame.event.phase === "string") {
-    summary.phase = frame.event.phase;
-    if (typeof frame.event.terminal_reason === "string") {
-      summary.terminal_reason = safeEnum(frame.event.terminal_reason);
+  if (eventCode === "session_phase") {
+    summary.phase = validated.event.phase;
+    // The terminal reason is already a member of the published closed
+    // vocabulary (the validator enforces it); the membership check is kept as
+    // the explicit statement of that dependency.
+    if (isReleaseVoiceTerminalReason(validated.event.terminal_reason)) {
+      summary.terminal_reason = validated.event.terminal_reason;
     }
   }
-  if (eventCode === "recap" && typeof frame.event.partial_reason === "string") {
-    summary.partial_reason = safeEnum(frame.event.partial_reason);
+  if (eventCode === "recap" && isReleaseVoiceTerminalReason(validated.event.partial_reason)) {
+    summary.partial_reason = validated.event.partial_reason;
+  }
+  if (eventCode === "structured_error") {
+    summary.source = safeEnum(validated.event.source);
   }
   return summary;
+}
+
+/**
+ * RELEASE-028 / A-03: the smoke's own client frames carry the version the
+ * *server* just advertised in its validated `ready` frame — never a literal in
+ * this file, which is exactly what drifted to `4` while the contract moved to
+ * `5` and was only caught by a source-text comparison.
+ */
+export function smokeSessionConfigFrame({ session, clientGenerationId, protocolVersion }) {
+  assertNegotiatedProtocol(protocolVersion, clientGenerationId);
+  return {
+    type: "session_config",
+    version: protocolVersion,
+    client_generation_id: clientGenerationId,
+    session_token: session.signedSession ?? "",
+    session: {
+      session_id: session.sessionId,
+      user_id: session.userId,
+      study_set_id: session.studySetId,
+      mode: "quiz",
+      source_context: [],
+      active_concepts: [],
+    },
+  };
+}
+
+export function smokeStopFrame({ clientGenerationId, protocolVersion }) {
+  assertNegotiatedProtocol(protocolVersion, clientGenerationId);
+  return {
+    type: "stop",
+    version: protocolVersion,
+    client_generation_id: clientGenerationId,
+  };
+}
+
+function assertNegotiatedProtocol(protocolVersion, clientGenerationId) {
+  if (!Number.isInteger(protocolVersion)) {
+    throw new Error(
+      "live smoke client frames require the protocol version negotiated from the server's validated ready frame",
+    );
+  }
+  if (typeof clientGenerationId !== "string" || clientGenerationId.length === 0) {
+    throw new Error("live smoke client frames require a client generation id");
+  }
 }
 
 export function auditLiveSmokeEvidence(evidence, env = process.env) {
   assertNoForbiddenEvidenceMarkers(evidence, { context: "live smoke evidence", env });
 }
 
-async function collectReadiness(config, fetchImpl) {
-  const health = await fetchJson(fetchImpl, `${config.httpBaseUrl}/health/brain`, {
-    headers: restHeaders(config, false),
-  });
-  const ready = await fetchJson(fetchImpl, `${config.httpBaseUrl}/ready`, {
-    headers: restHeaders(config, false),
-  });
+async function collectReadiness(config, fetchImpl, timeoutMs) {
+  const health = await fetchJson(
+    fetchImpl,
+    `${config.httpBaseUrl}/health/brain`,
+    { headers: restHeaders(config, false) },
+    timeoutMs,
+  );
+  const ready = await fetchJson(
+    fetchImpl,
+    `${config.httpBaseUrl}/ready`,
+    { headers: restHeaders(config, false) },
+    timeoutMs,
+  );
   const healthBrain = health.body?.brain ?? {};
   const readyBrain = ready.body?.brain ?? {};
   const healthStore = objectOrNull(health.body?.store);
@@ -447,7 +572,7 @@ function remoteCostCapPasses(readiness, config) {
   );
 }
 
-async function bootstrapSession(config, fetchImpl) {
+async function bootstrapSession(config, fetchImpl, timeoutMs) {
   if (config.suppliedSession) {
     return {
       serverStudyCreated: false,
@@ -455,15 +580,20 @@ async function bootstrapSession(config, fetchImpl) {
       signedSessionAttached: Boolean(config.suppliedSession.signedSession),
     };
   }
-  const response = await fetchJson(fetchImpl, `${config.httpBaseUrl}/study-sets/paste`, {
-    body: JSON.stringify({
-      course: "Live Smoke",
-      pasted_text: config.bootstrapText,
-      title: "Viva Live Smoke",
-    }),
-    headers: restHeaders(config, true),
-    method: "POST",
-  });
+  const response = await fetchJson(
+    fetchImpl,
+    `${config.httpBaseUrl}/study-sets/paste`,
+    {
+      body: JSON.stringify({
+        course: "Live Smoke",
+        pasted_text: config.bootstrapText,
+        title: "Viva Live Smoke",
+      }),
+      headers: restHeaders(config, true),
+      method: "POST",
+    },
+    timeoutMs,
+  );
   if (response.http_status !== 201) {
     throw new Error("bootstrap request failed");
   }
@@ -485,8 +615,17 @@ async function bootstrapSession(config, fetchImpl) {
   };
 }
 
-async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebSocket }) {
+async function collectWebSocketProof({
+  audioBytes,
+  bootstrap,
+  config,
+  createWebSocket,
+  deadline,
+  interruptState,
+  now,
+}) {
   const eventCounts = zeroEventCounts();
+  if (interruptState) interruptState.eventCounts = eventCounts;
   const phaseCounts = {};
   const createdSocket = createWebSocket(
     config.wsUrl,
@@ -502,11 +641,13 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
     event_counts: eventCounts,
     opened: false,
     phase_counts: phaseCounts,
+    protocol_version: null,
     ready: null,
     ready_frame_observed: false,
     terminal_reason: null,
     turns_seen: 0,
   };
+  const clientGenerationId = `live-smoke-${config.runId ?? "unknown"}-1`;
   const openDeferred = deferred();
   const readyDeferred = deferred();
   const questionDeferred = deferred();
@@ -536,13 +677,16 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
       try {
         frame = parseSocketMessage(event);
       } catch {
-        eventCounts.structured_error += 1;
+        // Not even parseable JSON: a protocol-shaped failure, distinct from
+        // a genuine server-sent structured_error.
+        eventCounts.protocol_error += 1;
         completeWithTerminalFailure("invalid_server_frame");
         return;
       }
       const summary = summarizeServerFrame(frame);
       if (summary.kind === "ready") {
         proof.ready_frame_observed = true;
+        proof.protocol_version = summary.protocol_version;
         proof.ready = {
           brain: summary.brain,
           input_encoding: summary.input_encoding,
@@ -550,6 +694,13 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
           store: summary.store,
         };
         readyDeferred.resolve();
+        return;
+      }
+      if (summary.kind === "invalid" || summary.kind === "unknown") {
+        // Valid JSON, but not a frame shape the shared protocol recognizes:
+        // also protocol-shaped, not a transport or structured-error signal.
+        eventCounts.protocol_error += 1;
+        completeWithTerminalFailure("invalid_server_frame");
         return;
       }
       if (summary.kind !== "event") return;
@@ -576,7 +727,12 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
         }
       }
       if (code === "structured_error") {
-        proof.terminal_reason = "server_error_frame";
+        // Only a valid, protocol-conformant server error frame reaches
+        // here; retain the server's own allowed failure class when it
+        // names one, instead of collapsing every structured_error to the
+        // same generic label.
+        proof.terminal_reason =
+          recognizedStructuredErrorReason(summary.source) ?? "server_error_frame";
       }
       if (code === "recap" && summary.partial_reason) {
         if (!proof.terminal_reason || proof.terminal_reason === "recap_observed") {
@@ -584,10 +740,13 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
         }
       } else if (code === "recap" && !proof.terminal_reason) {
         proof.terminal_reason = "recap_observed";
-        sendJson(socket, {
-          type: "stop",
-          version: PROTOCOL_VERSION,
-        });
+        sendJson(
+          socket,
+          smokeStopFrame({
+            clientGenerationId,
+            protocolVersion: proof.protocol_version,
+          }),
+        );
         recapDeferred.resolve();
       }
     }),
@@ -598,33 +757,63 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
       proof.close_clean =
         event?.wasClean === true ? true : event?.wasClean === false ? false : null;
       if (!settled && proof.terminal_reason !== "recap_observed") {
-        proof.terminal_reason = proof.terminal_reason ?? "socket_closed_before_recap";
+        if (!proof.terminal_reason) {
+          // Only an otherwise-unexplained close is a transport failure; a
+          // close that follows an already-known reason (a structured_error
+          // event, a terminal session_phase, turn-cap exceeded, ...) must
+          // not also count as a separate transport failure.
+          eventCounts.transport_error += 1;
+          proof.terminal_reason = "socket_closed_before_recap";
+        }
         recapDeferred.resolve();
       }
     }),
   );
   cleanup.push(
     onSocket(socket, "error", () => {
-      eventCounts.structured_error += 1;
+      eventCounts.transport_error += 1;
       proof.terminal_reason = "socket_error";
       recapDeferred.resolve();
     }),
   );
 
   try {
-    await withTimeout(openDeferred.promise, config.caps.max_duration_ms, "socket_open_timeout");
+    if (interruptState) interruptState.stage = "websocket_open";
+    await withTimeout(
+      openDeferred.promise,
+      deadline.remainingMs(now().getTime()),
+      "socket_open_timeout",
+    );
     throwIfTerminalFailure();
-    await withTimeout(readyDeferred.promise, config.caps.max_duration_ms, "ready_frame_timeout");
+    if (interruptState) interruptState.stage = "websocket_ready";
+    await withTimeout(
+      readyDeferred.promise,
+      deadline.remainingMs(now().getTime()),
+      "ready_frame_timeout",
+    );
     throwIfTerminalFailure();
-    sendJson(socket, sessionConfigFrame(bootstrap.session));
+    sendJson(
+      socket,
+      smokeSessionConfigFrame({
+        session: bootstrap.session,
+        clientGenerationId,
+        protocolVersion: proof.protocol_version,
+      }),
+    );
+    if (interruptState) interruptState.stage = "websocket_question";
     await withTimeout(
       questionDeferred.promise,
-      config.caps.max_duration_ms,
+      deadline.remainingMs(now().getTime()),
       "question_event_timeout",
     );
     throwIfTerminalFailure();
     socket.send(Buffer.from(audioBytes));
-    await withTimeout(recapDeferred.promise, config.caps.max_duration_ms, "recap_timeout");
+    if (interruptState) interruptState.stage = "websocket_recap";
+    await withTimeout(
+      recapDeferred.promise,
+      deadline.remainingMs(now().getTime()),
+      "recap_timeout",
+    );
     throwIfTerminalFailure();
     settled = true;
   } catch (error) {
@@ -640,23 +829,6 @@ async function collectWebSocketProof({ audioBytes, bootstrap, config, createWebS
   return proof;
 }
 
-function sessionConfigFrame(session) {
-  return {
-    type: "session_config",
-    version: PROTOCOL_VERSION,
-    session: {
-      active_concepts: [],
-      initial_goal: "Complete the live provider smoke check in one concise turn.",
-      mode: "quiz",
-      session_id: session.sessionId,
-      source_context: [],
-      study_set_id: session.studySetId,
-      user_id: session.userId,
-    },
-    ...(session.signedSession ? { session_token: session.signedSession } : {}),
-  };
-}
-
 function sendJson(socket, payload) {
   socket.send(JSON.stringify(payload));
 }
@@ -669,14 +841,26 @@ function zeroEventCounts() {
     concept_status: 0,
     final_transcript: 0,
     manuscript_intent: 0,
+    // BAC-527: transport_error (raw socket open/close/error failures),
+    // protocol_error (malformed JSON or an unrecognized frame shape), and
+    // structured_error (a valid, server-sent error frame) are distinct
+    // counters — a failure must never be attributed to more than one.
+    protocol_error: 0,
     question: 0,
     recap: 0,
     session_phase: 0,
     source_ref: 0,
     structured_error: 0,
     transcript_delta: 0,
+    transport_error: 0,
     unknown_event: 0,
   };
+}
+
+function recognizedStructuredErrorReason(source) {
+  return typeof source === "string" && RECOGNIZED_STRUCTURED_ERROR_SOURCES.has(source)
+    ? source
+    : null;
 }
 
 function requiredEventSummary(eventCounts) {
@@ -694,8 +878,21 @@ function parseSocketMessage(event) {
   throw new Error("unsupported socket message");
 }
 
-async function fetchJson(fetchImpl, url, init) {
-  const response = await fetchImpl(url, init);
+async function fetchJson(fetchImpl, url, init, timeoutMs) {
+  if (timeoutMs === undefined) {
+    return responseToJson(await fetchImpl(url, init));
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return responseToJson(await fetchImpl(url, { ...init, signal: controller.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function responseToJson(response) {
   let body;
   try {
     body = await response.json();
@@ -773,6 +970,8 @@ function baseEvidence(config, now) {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
     deploy_sha: config.deploySha,
+    run_id: config.runId ?? null,
+    agent_deploy_id: config.agentDeployId ?? null,
     enabled: true,
     failure_matrix: failureMatrixEvidence(),
     model: config.model,
@@ -787,6 +986,8 @@ function skippedEvidence(config, now) {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
     deploy_sha: config.deploySha,
+    run_id: config.runId ?? null,
+    agent_deploy_id: config.agentDeployId ?? null,
     enabled: false,
     model: config.model,
     status: "skipped",
@@ -809,9 +1010,11 @@ function privacyEvidence() {
 }
 
 export function liveMonitorEvidence({
+  agentDeployId = null,
   consecutiveFailures,
   deploySha = "unknown",
   model = DEFAULT_GEMINI_MODEL,
+  runId = null,
   status,
   terminalReason,
 }) {
@@ -822,6 +1025,8 @@ export function liveMonitorEvidence({
     : 0;
   return {
     deploy_sha: deploySha,
+    run_id: runId,
+    agent_deploy_id: agentDeployId,
     failure_class: failed ? "live_monitor_failure" : null,
     live_monitor_attempt_count: 1,
     live_monitor_consecutive_failures: failed ? priorConsecutiveFailures + 1 : 0,
@@ -841,14 +1046,18 @@ export function configurationFailureEvidence({
 } = {}) {
   const failure = liveProviderFailureForSmokeReason("configuration_error");
   const config = {
+    agentDeployId: env.VIVA_LIVE_SMOKE_AGENT_DEPLOY_ID?.trim() || null,
     deploySha: deploymentSha(env),
     liveMonitorConsecutiveFailures,
     model: liveSmokeModel(env),
+    runId: env.VIVA_LIVE_SMOKE_RUN_ID?.trim() || null,
   };
   return {
     schema: "viva.live_provider_smoke.v1",
     generated_at: now().toISOString(),
     deploy_sha: config.deploySha,
+    run_id: config.runId,
+    agent_deploy_id: config.agentDeployId,
     enabled: liveSmokeEnabled(env),
     failure_matrix: failureMatrixEvidence(),
     failure_stage: "configuration",
@@ -888,9 +1097,11 @@ export async function configurationFailureEvidenceWithMonitorState({
 
 function failedMonitorEvidence(config, terminalReason) {
   return liveMonitorEvidence({
+    agentDeployId: config.agentDeployId ?? null,
     consecutiveFailures: config.liveMonitorConsecutiveFailures,
     deploySha: config.deploySha,
     model: config.model,
+    runId: config.runId ?? null,
     status: "failed",
     terminalReason,
   });
@@ -1228,18 +1439,42 @@ async function writeEvidence(outputPath, evidence) {
 
 async function main() {
   const outputPath = liveSmokeOutputPath(process.env);
+  const interruptState = {
+    stage: "startup",
+    eventCounts: null,
+    deploySha: deploymentSha(process.env),
+    model: liveSmokeModel(process.env),
+    runId: process.env.VIVA_LIVE_SMOKE_RUN_ID?.trim() || null,
+  };
+  let finalized = false;
+
+  // BAC-527: single-shot finalization so the runner's supervisory SIGTERM
+  // and normal completion can never race each other into a double or
+  // partial write.
+  const finalizeEvidence = async (evidence) => {
+    if (finalized) return;
+    finalized = true;
+    auditLiveSmokeEvidence(evidence, process.env);
+    await writeEvidence(outputPath, evidence);
+    console.log(`Sanitized live smoke evidence written to ${path.relative(root, outputPath)}`);
+    if (evidence.status === "failed") {
+      process.exitCode = 1;
+    }
+  };
+
+  const onSigterm = () => {
+    void finalizeEvidence(interruptedEvidence(interruptState, "SIGTERM"));
+  };
+  process.once("SIGTERM", onSigterm);
+
   let evidence;
   try {
-    evidence = await runLiveProviderSmoke();
+    evidence = await runLiveProviderSmoke({ interruptState });
   } catch {
     evidence = await configurationFailureEvidenceWithMonitorState({ outputPath });
   }
-  auditLiveSmokeEvidence(evidence, process.env);
-  await writeEvidence(outputPath, evidence);
-  console.log(`Sanitized live smoke evidence written to ${path.relative(root, outputPath)}`);
-  if (evidence.status === "failed") {
-    process.exitCode = 1;
-  }
+  process.removeListener("SIGTERM", onSigterm);
+  await finalizeEvidence(evidence);
 }
 
 function liveSmokeEnabled(env) {

@@ -7,7 +7,8 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**", "!docs/design-reference", "!coverage", "!apps/web/out"]
+    "includes": ["**", "!docs/design-reference", "!coverage", "!apps/web/out"],
+    "maxSize": 8388608
   },
   "formatter": {
     "enabled": true,

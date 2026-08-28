@@ -11,12 +11,20 @@ import {
   HOSTED_E2E_MONITOR_POLICY_SCHEMA,
   HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS,
   HOSTED_E2E_RESULT_SCHEMA,
+  HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY,
+  HOSTED_LIVE_MONITOR_STATE_PROBE_KEY,
+  HOSTED_LIVE_MONITOR_STATE_SCHEMA,
+  HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
   HOSTED_MONITOR_POLICY,
   hostedEvidenceStageForScenario,
   scenariosForProfile,
   summarizeHostedE2eResult,
   withHostedEvidenceAudit,
 } from "./hosted-e2e-matrix.mjs";
+import {
+  RELEASE_LEARNER_LOOP_CONTRACT,
+  validatedLearnerLoopForRelease,
+} from "./release-contract-validation.mjs";
 
 const FORBIDDEN_MARKERS = Object.freeze([
   "pcm16_base64",
@@ -138,7 +146,9 @@ test("hosted E2E matrix keeps future product slices contracted but not in defaul
 });
 
 test("hosted PR profile expands to browser-runnable deterministic failure-control scenarios", () => {
-  const expected = prRunnableFailureControlScenarios().map((scenario) => scenario.id).sort();
+  const expected = prRunnableFailureControlScenarios()
+    .map((scenario) => scenario.id)
+    .sort();
   assert.deepEqual(failureControlScenarioIdsForProfile({ profile: "full" }).sort(), expected);
   for (const scenarioId of sessionAuthFailureControlScenarioIds()) {
     assert.equal(failureControlScenarioRequiresExplicitBrowserAction(scenarioId), true);
@@ -273,6 +283,17 @@ test("hosted monitor policy caps live cadence and self-quarantines sustained pro
   assert.equal(HOSTED_MONITOR_POLICY.self_quarantine.consecutive_failures, 2);
 });
 
+test("hosted live monitor durable state object is named one run-independent schema-versioned key", () => {
+  assert.equal(HOSTED_LIVE_MONITOR_STATE_SCHEMA, "viva.hosted_live_monitor_state.v1");
+  assert.equal(
+    HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY,
+    "viva-hosted-monitor/state/live-monitor-state.v1.json",
+  );
+  assert.doesNotMatch(HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY, /\$\{|<run_id>|run-2026/);
+  assert.notEqual(HOSTED_LIVE_MONITOR_STATE_PROBE_KEY, HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY);
+  assert.match(HOSTED_LIVE_MONITOR_STATE_PROBE_KEY, /^viva-hosted-monitor\/state\//);
+});
+
 test("hosted browser evidence records required production fields without forbidden payloads", () => {
   const evidence = buildHostedBrowserEvidence({
     agentUrl: "https://agent.example.com/ws?debug=secret#fragment",
@@ -348,7 +369,7 @@ test("hosted browser evidence audit is reflected in runner summaries", () => {
   assert.equal(summary.budget_state, null);
   assert.equal(summary.usage.redacted, true);
   assert.equal(summary.cost_usd, null);
-  assert.deepEqual(summary.screenshots, []);
+  assert.deepEqual(summary.local_screenshots, []);
   assert.equal(summary.traces, "none");
   assert.equal(summary.redaction_audit.forbidden_hits, 0);
   assert.equal(summary.redaction_audit.scanned_files, 4);
@@ -359,6 +380,98 @@ test("hosted browser evidence audit is reflected in runner summaries", () => {
   }
 });
 
+test("hosted browser evidence exposes local_screenshots as safe relative local paths, never a durable object reference", () => {
+  const evidence = buildHostedBrowserEvidence({
+    agentUrl: "https://agent.example.com",
+    deploySha: "abc123localshots",
+    hostedMode: true,
+    provider: "synthetic",
+    recapSuccess: true,
+    runId: "run-1",
+    scenarioId: "happy_path",
+    screenshots: ["connected-terminal-fold.png", "source-folio.png"],
+    stage: "feedback",
+    terminalReason: "completed",
+    webUrl: "https://web.example.com",
+  });
+
+  assert.equal(Object.hasOwn(evidence, "screenshots"), false, "the old field name must not survive");
+  assert.deepEqual(evidence.local_screenshots, [
+    "connected-terminal-fold.png",
+    "source-folio.png",
+  ]);
+  for (const name of evidence.local_screenshots) {
+    assert.match(name, /^[A-Za-z0-9._-]+\.png$/, `${name} must be a safe relative local filename`);
+    assert.doesNotMatch(name, /^https?:\/\//, `${name} must not look like a durable object URL`);
+    assert.doesNotMatch(name, /\.\./, `${name} must not traverse directories`);
+  }
+
+  const summary = summarizeHostedE2eResult(
+    withHostedEvidenceAudit(
+      { browser_story: {}, hosted_e2e: evidence },
+      { forbidden_hits: 0, scanned_files: 1 },
+    ),
+  );
+  assert.deepEqual(summary.local_screenshots, evidence.local_screenshots);
+  assert.equal(Object.hasOwn(summary, "screenshots"), false);
+  assert.ok(
+    HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS.includes("local_screenshots"),
+    "the required-evidence-field list must name the renamed field",
+  );
+  assert.ok(
+    !HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS.includes("screenshots"),
+    "the required-evidence-field list must not keep the retired field name",
+  );
+});
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+// RELEASE-028: the hosted matrix's turn bound and evidence-field allowlist are
+// read from the validated learner-loop singleton, never from the raw JSON.
+test("hosted matrix bounds and evidence fields come from the validated learner-loop contract", () => {
+  assert.equal(
+    HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS,
+    RELEASE_LEARNER_LOOP_CONTRACT.max_submitted_answer_resolution_ms,
+  );
+  assert.equal(Object.isFrozen(RELEASE_LEARNER_LOOP_CONTRACT), true);
+
+  const contract = buildHostedE2eMatrixContract({
+    generatedAt: "2026-08-27T00:00:00.000Z",
+    mode: "pr",
+    runId: "run-1",
+  });
+  assert.equal(contract.bac_510_contract.schema, RELEASE_LEARNER_LOOP_CONTRACT.schema);
+  assert.equal(
+    contract.bac_510_contract.max_submitted_answer_resolution_ms,
+    RELEASE_LEARNER_LOOP_CONTRACT.max_submitted_answer_resolution_ms,
+  );
+  for (const field of RELEASE_LEARNER_LOOP_CONTRACT.evidence_fields) {
+    assert.ok(
+      HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS.includes(field),
+      `${field} must be an accepted hosted evidence field`,
+    );
+  }
+});
+
+
+// RELEASE-028 bypass control: this consumer's own hostile variant. If the
+// published validator ever stopped rejecting unknown keys, this test fails
+// here rather than letting an unchecked state reach the gate.
+test("the hosted matrix refuses a learner-loop variant carrying an unknown nested field", () => {
+  const hostile = JSON.parse(JSON.stringify(RELEASE_LEARNER_LOOP_CONTRACT));
+  hostile.states[0].viva_hostile_unknown_key = "viva-hostile-sentinel-value-9f2a";
+
+  assert.throws(
+    () => validatedLearnerLoopForRelease(hostile),
+    (error) => {
+      assert.equal(error.code, "learner_loop_contract_invalid");
+      assert.equal(
+        `${error.message}${error.stack}`.includes("viva-hostile-sentinel-value-9f2a"),
+        false,
+      );
+      return true;
+    },
+  );
+});
