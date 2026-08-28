@@ -20,7 +20,9 @@
       "@viva/core/runtime-validation": ["packages/core/src/runtime-validation.ts"],
       "@viva/core/testing/fake-evaluator": ["packages/core/src/testing/fake-evaluator.ts"],
       "@viva/tokens": ["packages/tokens/src/index.ts"],
-      "@viva/ui-web": ["packages/ui-web/src/index.tsx"]
+      "@viva/tokens/theme.css": ["packages/tokens/src/theme.css"],
+      "@viva/ui-web": ["packages/ui-web/src/index.tsx"],
+      "@viva/ui-web/styles.css": ["packages/ui-web/src/styles.css"]
     }
   }
 }
