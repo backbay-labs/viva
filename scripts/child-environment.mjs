@@ -113,6 +113,11 @@ const ROLE_EXPLICIT_KEYS = Object.freeze({
     "VIVA_AGENT_DATABASE_URL",
     "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
     "VIVA_AGENT_PROVIDER",
+    // W-07 / A-32: the agent's own record-at-mint authority. Without it here
+    // (even though the web tier presents it) nothing on the agent side may
+    // record the started voice session, and the projection the socket needs
+    // can never validate -- the A-32 deadlock, reproduced locally.
+    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
     "VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS",
     "VIVA_FAILURE_CONTROL_ENABLED",
     "VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY",
