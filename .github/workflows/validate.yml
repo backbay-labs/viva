@@ -220,11 +220,13 @@ jobs:
       # All orchestration lives in the script, where it is behaviorally tested.
       #
       # The script's A-32 fixture-seeding step is gated on the target resolving:
-      # lane 08 owns the binary and it has not landed, so the step records a
-      # pending obligation today and becomes fail-closed automatically the moment
-      # `--bin` resolves. Plan 15 asserts the landed end state by setting
-      # VIVA_CI_POSTGRES_SEED_REQUIRED=1 here, which refuses the pending path.
+      # lane 08's viva-dev-seed-fixture binary has now landed, so
+      # VIVA_CI_POSTGRES_SEED_REQUIRED=1 asserts the landed end state and
+      # refuses the PENDING path outright (A-43(b)/R-12-B) rather than leaving
+      # it silently available in CI now that there is no reason to accept it.
       - name: Durable Postgres proof
+        env:
+          VIVA_CI_POSTGRES_SEED_REQUIRED: "1"
         run: scripts/ci-durable-postgres.sh
 
   required-validation:
@@ -233,7 +235,63 @@ jobs:
     needs: [quality-and-audit, loopback-and-browser, durable-postgres]
     runs-on: ubuntu-latest
     steps:
+      # A-43(a)/R-12-A: the hosted consumption boundary. `loopback-and-browser`
+      # already generates and durably uploads this exact commit's sanitized
+      # release evidence bundle (`viva-release-evidence-${{ github.sha }}` --
+      # a deterministic selection by commit SHA, never a mutable "latest"
+      # object); these steps prove a completely fresh job can download that
+      # STORED bundle and independently verify it, closing the downstream
+      # half of RELEASE-004's separate-verifier design continuously rather
+      # than only as a one-off manual acceptance action. They run only when
+      # loopback-and-browser actually produced a bundle to consume, and they
+      # never regenerate the bundle they verify (that stays
+      # loopback-and-browser's `bun run release:check`, a different job).
+      - name: Checkout
+        if: needs.loopback-and-browser.result == 'success'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node
+        if: needs.loopback-and-browser.result == 'success'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Set up Bun
+        if: needs.loopback-and-browser.result == 'success'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.3
+
+      - name: Install dependencies
+        if: needs.loopback-and-browser.result == 'success'
+        run: bun install --frozen-lockfile
+
+      - name: Download the selected stored release evidence bundle
+        if: needs.loopback-and-browser.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: viva-release-evidence-${{ github.sha }}
+          path: artifacts/downloaded-release
+
+      - name: Place the downloaded bundle at the hosted consumption boundary path
+        if: needs.loopback-and-browser.result == 'success'
+        run: |
+          set -euo pipefail
+          found="$(find artifacts/downloaded-release -type f -name evidence.json -print -quit)"
+          if [ -z "$found" ]; then
+            echo "no evidence.json found in the downloaded release evidence bundle" >&2
+            exit 1
+          fi
+          if [ "$found" != "artifacts/downloaded-release/evidence.json" ]; then
+            mv "$found" artifacts/downloaded-release/evidence.json
+          fi
+
+      - name: Verify the downloaded release bundle from a fresh environment
+        if: needs.loopback-and-browser.result == 'success'
+        run: bun run release:verify -- artifacts/downloaded-release/evidence.json
+
       - name: Require every proof job
+        if: always()
         env:
           QUALITY: ${{ needs.quality-and-audit.result }}
           LOOPBACK_BROWSER: ${{ needs.loopback-and-browser.result }}

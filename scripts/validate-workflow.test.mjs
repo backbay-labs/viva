@@ -605,6 +605,20 @@ test("the durable job delegates all orchestration to scripts/ci-durable-postgres
   }
 });
 
+test("A-43(b)/R-12-B: durable-postgres refuses the PENDING A-32 seed path, asserting the landed end state", async () => {
+  const { workflow } = await loadWorkflow();
+  const [step] = jobSteps(workflow, "durable-postgres").filter(
+    (candidate) => typeof candidate.run === "string" && candidate.run.trim() === "scripts/ci-durable-postgres.sh",
+  );
+  assert.ok(step, "the durable-postgres proof step must exist");
+  assert.equal(
+    String(step.env?.VIVA_CI_POSTGRES_SEED_REQUIRED),
+    "1",
+    "VIVA_CI_POSTGRES_SEED_REQUIRED=1 must be set so the A-32 fixture-seeding command is mandatory, " +
+      "never a silently accepted pending state, now that lane 08's viva-dev-seed-fixture binary exists",
+  );
+});
+
 test("the browser job runs both frontend harnesses after the pinned Chromium install", async () => {
   const { workflow } = await loadWorkflow();
   const job = "loopback-and-browser";
@@ -674,9 +688,21 @@ test("required-validation is a stable aggregate that fails on any non-success up
   assert.equal(job.if, "always()");
   assert.deepEqual([...job.needs].sort(), [...PROOF_JOBS].sort());
 
+  // The gate is the LAST run-based step, not the only one: A-43(a)'s hosted
+  // consumption boundary adds prior steps to this same job (never a sibling
+  // job -- `needs` above is asserted exactly, so nothing else could gate the
+  // aggregate), and the pass/fail check must still run last, unconditionally.
+  // Exact count, not a lower bound (review-fix F2): install + place + verify
+  // + the gate itself -- an arbitrary extra run step landing in this
+  // branch-protection-context job must fail here, not slip in unnoticed.
   const steps = job.steps.filter((step) => typeof step.run === "string");
-  assert.equal(steps.length, 1);
-  const [assertion] = steps;
+  assert.equal(
+    steps.length,
+    4,
+    "required-validation must carry exactly its known run steps (install, place, verify, gate)",
+  );
+  const assertion = steps.at(-1);
+  assert.equal(String(assertion.if).trim(), "always()", "the gate must run even if earlier steps in this job were skipped");
   const values = Object.values(assertion.env);
   for (const proofJob of PROOF_JOBS) {
     assert.ok(
@@ -688,6 +714,66 @@ test("required-validation is a stable aggregate that fails on any non-success up
   // `success`, so equality (not `!= failure`) is what keeps it red.
   for (const name of Object.keys(assertion.env)) {
     assert.match(assertion.run, new RegExp(`test "\\$${name}" = success`));
+  }
+});
+
+test("A-43(a)/R-12-A: required-validation downloads the selected stored release bundle and verifies it in a fresh environment", async () => {
+  const { workflow } = await loadWorkflow();
+  const steps = jobSteps(workflow, AGGREGATE_JOB);
+  const text = (step) =>
+    [
+      typeof step.run === "string" ? step.run : "",
+      typeof step.uses === "string" ? step.uses : "",
+      JSON.stringify(step.with ?? {}),
+    ].join("\n");
+
+  const verifyIndex = steps.findIndex(
+    (step) => typeof step.run === "string" && step.run.includes("bun run release:verify"),
+  );
+  assert.ok(verifyIndex >= 0, "required-validation must verify the downloaded release bundle");
+  const verify = steps[verifyIndex];
+  assert.ok(
+    verify.run.includes("bun run release:verify -- artifacts/downloaded-release/evidence.json"),
+    "the boundary must run exactly the documented command",
+  );
+  assert.equal(
+    steps.filter((step) => typeof step.run === "string" && step.run.includes("bun run release:verify")).length,
+    1,
+    "exactly one step may verify the stored release bundle",
+  );
+
+  // Never regenerated in the same job as it is verified (the boundary
+  // consumes a STORED bundle; loopback-and-browser already owns generating
+  // one via `bun run release:check`).
+  assert.equal(
+    steps.some((step) => typeof step.run === "string" && step.run.includes("bun run release:check")),
+    false,
+    "required-validation must verify the stored bundle, never regenerate the one it verifies",
+  );
+
+  // Downloaded to the exact documented path, before verification, never from
+  // a mutable "latest" object.
+  const downloadIndex = steps.findIndex(
+    (step, index) => index < verifyIndex && text(step).includes("artifacts/downloaded-release/evidence.json"),
+  );
+  assert.ok(downloadIndex >= 0, "the stored bundle must be downloaded to artifacts/downloaded-release/evidence.json first");
+  assert.doesNotMatch(text(steps[downloadIndex]), /latest/i, "a mutable latest object may not be selected");
+
+  // The artifact name is keyed by this exact commit's own upload
+  // (loopback-and-browser's `viva-release-evidence-${{ github.sha }}`), a
+  // deterministic selection by SHA, never a separately-named "latest" pointer.
+  const downloadArtifact = steps.find((step) => String(step.uses ?? "").startsWith("actions/download-artifact@"));
+  assert.ok(downloadArtifact, "the boundary must use actions/download-artifact");
+  assert.equal(downloadArtifact.with?.name, "viva-release-evidence-${{ github.sha }}");
+
+  // Runs only once loopback-and-browser (which produced the bundle) has
+  // actually succeeded -- never against a job that failed or was skipped.
+  for (const index of [downloadIndex, verifyIndex]) {
+    assert.equal(
+      String(steps[index].if).trim(),
+      "needs.loopback-and-browser.result == 'success'",
+      "the boundary steps must not run against a bundle that was never produced",
+    );
   }
 });
 
