@@ -156,19 +156,19 @@ describe("LandingEntry", () => {
     expect(markup).not.toContain("viva1.server-token");
   });
 
-  test("keeps a direct signed-token session target available for static-export actions", () => {
+  test("keeps a direct signed-token session target available for the direct-session-token fast path (post-D-06B)", () => {
     const target = libraryActionSessionTarget(
       { id: "biology-midterm", userId: "user-1" },
       {
         available: true,
         sessionId: "server-session",
-        sessionToken: "viva1.static-export-token",
+        sessionToken: "viva1.direct-session-token",
       },
       { includeSessionToken: true },
     );
 
     expect(target).toBe(
-      "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.static-export-token",
+      "/session?user_id=user-1&study_set_id=biology-midterm&session_id=server-session#session_token=viva1.direct-session-token",
     );
   });
 
@@ -312,7 +312,7 @@ describe("LandingEntry", () => {
     }
   });
 
-  test("the landing page keeps static export compatible", () => {
+  test("the landing page route keeps its rendering mode automatic (post-D-06B)", () => {
     expect(dynamic).toBe("auto");
   });
 
