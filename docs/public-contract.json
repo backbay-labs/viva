@@ -1,6 +1,6 @@
 {
   "schema": "viva.public_contract.v1",
-  "source_manifest_sha256": "8be29f8b25dd23002f3d12e7d608f29862137b9ea066684ddce7b192ff584ca3",
+  "source_manifest_sha256": "52c5333da2c71807dbb4a315e3e359826139a1755aa37881e6d8afd5e2688221",
   "protocol": {
     "version": 5,
     "supported_versions": [
@@ -181,7 +181,69 @@
     "container_runtime_users": [
       "10001:10001",
       "pwuser"
-    ]
+    ],
+    "library_control_authority": {
+      "matrix_heading": "## Configuration Matrix",
+      "control_gate_operations": [
+        "library_export",
+        "session_delete",
+        "study_set_delete"
+      ],
+      "control_gate_refusal_codes": [
+        "library_export_auth_failed",
+        "library_export_auth_required",
+        "library_snapshot_auth_failed",
+        "library_snapshot_auth_required",
+        "session_delete_auth_failed",
+        "session_delete_auth_required",
+        "study_set_delete_auth_failed",
+        "study_set_delete_auth_required"
+      ],
+      "control_gate_credential_keys": [
+        "VIVA_VOICE_SESSION_TOKEN_SECRET",
+        "VIVA_VOICE_WS_BEARER_TOKEN"
+      ],
+      "control_gate_unconsulted_fields": [
+        "library_delete_bearer",
+        "library_read_bearer",
+        "operator_access",
+        "session_mint_credential"
+      ],
+      "control_gate_unconsulted_keys": [
+        "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+        "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+        "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+        "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN"
+      ],
+      "control_capability_header": "x-viva-library-control-token",
+      "control_capability_subject": "__library_control__",
+      "mutation_unavailable_reason": "mutation_auth_required",
+      "no_credential_refusal_message": "library export and deletion controls require authenticated REST access",
+      "public_bind_required_keys": [
+        "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+        "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+        "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+        "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+        "VIVA_VOICE_SESSION_TOKEN_SECRET"
+      ],
+      "public_bind_auth_alternatives": [
+        "VIVA_VOICE_SESSION_TOKEN_SECRET",
+        "VIVA_VOICE_WS_BEARER_TOKEN"
+      ],
+      "session_mint_selectors": [
+        "mint_resume_for",
+        "record_start_for"
+      ],
+      "startup_refusals": [
+        "CredentialCollision",
+        "CredentialLengthOutOfRange",
+        "FailureControlMisconfigured",
+        "LibraryBearerRequiresSessionTokenSecret",
+        "PublicBindMissingAllowedOrigins",
+        "PublicBindMissingAuth",
+        "PublicBindMissingCredential"
+      ]
+    }
   },
   "provider_modes": [
     {
