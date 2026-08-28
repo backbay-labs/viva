@@ -127,32 +127,69 @@ function contentSecurityPolicy(nonce: string): string {
 }
 
 /**
- * The validated direct-agent origins, deduplicated, in the order the two envs are read.
+ * The validated direct-agent `connect-src` sources, deduplicated, in the order the two envs are
+ * read.
+ *
+ * The two envs hold different KINDS of value, so they contribute different shapes.
+ * `NEXT_PUBLIC_VIVA_AGENT_HTTP_URL` is a BASE: `vivaAgentHttpBaseUrl` trims its trailing slash and
+ * every caller concatenates a request path onto it, and the deployment runbook documents it as
+ * "the public agent origin". It contributes its ORIGIN, because a CSP `path-part` there would
+ * refuse every request the app actually makes under that base.
+ * `NEXT_PUBLIC_VIVA_AGENT_WS_URL` is one ENDPOINT, opened verbatim — `connectVivaAgent` hands
+ * `vivaAgentWsUrl()` straight to `new WebSocket(...)`, unchanged and with the token in the
+ * subprotocol rather than the URL. It contributes that endpoint's ORIGIN AND PATH.
  *
  * An unusable value is dropped rather than emitted, and it is never echoed into a log or an error:
  * a misconfigured origin should narrow the policy, not widen it and not disclose itself.
  */
 function directAgentConnectSources(): string[] {
   if (!DIRECT_AGENT_TRANSPORT_RECORDED) return [];
+  const httpBase = validatedAgentUrl(process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL, [
+    "https:",
+    "http:",
+  ]);
+  const wsEndpoint = validatedAgentUrl(process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL, ["wss:", "ws:"]);
   const sources: string[] = [];
-  for (const candidate of [
-    validatedAgentOrigin(process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL, ["https:", "http:"]),
-    validatedAgentOrigin(process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL, ["wss:", "ws:"]),
-  ]) {
+  for (const candidate of [httpBase?.origin, wsEndpoint && endpointHostSource(wsEndpoint)]) {
     if (candidate && !sources.includes(candidate)) sources.push(candidate);
   }
   return sources;
 }
 
 /**
- * An exact, credential-free origin using the secure scheme publicly or the insecure one on
- * loopback. A path, query, fragment, userinfo, unsupported scheme, or insecure public value is
- * refused, and the refusal returns nothing at all rather than a reason carrying the input.
+ * A host-source naming one exact endpoint: its origin, plus the CSP `path-part` for the path the
+ * operator configured. `A-42` item 2 orders this shape for the socket value — "exactly the
+ * configured socket URL's origin+path shape, never a broadened wildcard" — and a `path-part`
+ * without a trailing solidus matches that one path and no sibling of it.
+ *
+ * A bare origin contributes no `path-part` at all. That states the same policy a `/` path-part
+ * would, in the spelling the operator wrote and every consumer already reads.
  */
-function validatedAgentOrigin(
+function endpointHostSource(url: URL): string {
+  return url.pathname === "/" ? url.origin : `${url.origin}${url.pathname}`;
+}
+
+/**
+ * An exact, credential-free agent URL using the secure scheme publicly or the insecure one on
+ * loopback. A query, fragment, userinfo, unsupported scheme, insecure public value, or any value
+ * the URL parser had to normalize is refused, and the refusal returns nothing at all rather than
+ * a reason carrying the input. The caller decides which part of the accepted URL to state.
+ *
+ * `A-42`/`W-07`: an endpoint PATH is admitted. It has to be, because the socket endpoint every
+ * consumer configures carries one — `.env.example`, the deployment runbook, and `vivaAgentWsUrl`'s
+ * own fallback are all `…/ws`, and `vivaApiBaseUrl` derives the REST base by stripping that exact
+ * suffix. Refusing it dropped the socket source silently: the emitted policy was still
+ * well-formed, so nothing failed until a real browser refused the session's only transport.
+ *
+ * Admitting a path never widens what a value can name. The scheme, host, and port still come from
+ * the parsed URL, so a path segment that spells a hostname stays a path segment; userinfo that
+ * spells one is refused outright; and no accepted value can produce a wildcard, a bare scheme
+ * source, or any host the operator did not already write.
+ */
+function validatedAgentUrl(
   value: string | undefined,
   [secureScheme, insecureScheme]: readonly [string, string],
-): string | null {
+): URL | null {
   const raw = value?.trim();
   if (!raw) return null;
   let url: URL;
@@ -161,20 +198,36 @@ function validatedAgentOrigin(
   } catch {
     return null;
   }
+  // Both guards are subsumed by the exactness check below — userinfo, query, and fragment all
+  // make `raw` differ from origin+pathname — and are kept as defense in depth so that loosening
+  // the exactness check can never silently start admitting credentials or a query string.
   if (url.username || url.password) return null;
-  if (url.pathname !== "/" || url.search || url.hash) return null;
-  if (raw !== url.origin && raw !== `${url.origin}/`) return null;
-  if (url.protocol === secureScheme) return url.origin;
-  if (url.protocol === insecureScheme && isLoopbackHostname(url.hostname)) return url.origin;
+  if (url.search || url.hash) return null;
+  // The configured value must be exactly what it parses back to, so a normalized-away default
+  // port or an altered host can never reach the policy under a shape the operator never wrote.
+  // `url.pathname` is `/` for a bare origin, which is why both spellings of that case are named.
+  const withPath = `${url.origin}${url.pathname}`;
+  const bareOrigin = url.pathname === "/" ? url.origin : null;
+  if (raw !== withPath && raw !== bareOrigin) return null;
+  if (url.protocol === secureScheme) return url;
+  if (url.protocol === insecureScheme && isLoopbackHostname(url.hostname)) return url;
   return null;
 }
 
+/**
+ * The hosts a dev machine actually serves loopback on: `localhost`, IPv6 `::1`, and the whole of
+ * `127.0.0.0/8`. Nothing else. The insecure-scheme allowance above exists only because loopback
+ * traffic never leaves the machine, so it must be spent on hosts that ARE loopback and never on
+ * one that merely reads like one: `127.0.0.1.evil.example` is an ordinary registrable name whose
+ * first label happens to be `127`, and a prefix test would hand its owner the allowance. Numeric
+ * spellings the URL parser rewrites (`127.1`, `0177.0.0.1`, `2130706433`) never reach here — they
+ * normalize to `127.0.0.1`, which no longer matches what the operator wrote, so the exactness
+ * check in `validatedAgentUrl` has already refused them.
+ */
 function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return (
-    normalized === "localhost" ||
-    normalized === "::1" ||
-    normalized === "127.0.0.1" ||
-    normalized.startsWith("127.")
-  );
+  if (normalized === "localhost" || normalized === "::1") return true;
+  const octets = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(normalized);
+  if (!octets) return false;
+  return octets.slice(1).every((octet) => Number(octet) <= 255);
 }
