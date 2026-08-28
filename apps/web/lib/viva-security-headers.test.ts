@@ -107,9 +107,92 @@ describe("Viva server-mode security headers", () => {
     );
   });
 
+  /**
+   * `A-42`/`W-07` — the live blocker the harness's two full-matrix reproductions isolated.
+   *
+   * Every consumer configures the socket endpoint with its path: `.env.example` and the
+   * deployment runbook both ship `…/ws`, `vivaAgentWsUrl` hands that exact string to
+   * `new WebSocket(...)`, and `vivaApiBaseUrl` derives the REST base by stripping the trailing
+   * `/ws` from it. Refusing a path here dropped the socket source silently — the policy still
+   * looked well-formed, and the browser refused the session's only transport with
+   * `Connecting to 'ws://127.0.0.1:38877/ws' violates … "connect-src 'self' http://127.0.0.1:38877"`.
+   *
+   * A-42 item 2 orders the shape: the value "must carry exactly the configured socket URL's
+   * origin+path shape, never a broadened wildcard". A CSP host-source takes a `path-part`, so the
+   * emitted source is the origin AND the path — the narrowest source that admits the one endpoint
+   * the browser opens: never a wildcard host, never a bare `ws:`/`wss:` scheme source, never a
+   * sibling path on that origin, and never anything the operator did not already name.
+   */
+  test("admits the path-suffixed agent socket URL every consumer configures [A-42/W-07]", () => {
+    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "http://127.0.0.1:38877";
+    process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = "ws://127.0.0.1:38877/ws";
+
+    const csp = responseCsp(proxy(serverPageRequest()));
+    const connectSrc = directive(csp, "connect-src");
+
+    expect(connectSrc).toBe("connect-src 'self' http://127.0.0.1:38877 ws://127.0.0.1:38877/ws");
+    // The path admitted the value; it never widened it.
+    expect(connectSrc).not.toContain("*");
+    expect(connectSrc.split(" ")).not.toContain("ws:");
+    expect(connectSrc.split(" ")).not.toContain("wss:");
+  });
+
+  test("admits the public path-suffixed socket origin the runbook documents [A-42/W-07]", () => {
+    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.viva.example.com";
+    process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = "wss://agent.viva.example.com/ws";
+
+    // One host, two sources: the two envs name the same host over different schemes, and the
+    // socket source carries the endpoint path the runbook documents.
+    expect(directive(responseCsp(proxy(serverPageRequest())), "connect-src")).toBe(
+      "connect-src 'self' https://agent.viva.example.com wss://agent.viva.example.com/ws",
+    );
+  });
+
+  /**
+   * `A-42` item 2 — "exactly the configured socket URL's origin+path shape, NEVER a broadened
+   * wildcard". The socket source is a `path-part` host-source, so it admits the one endpoint the
+   * operator configured and no sibling path on that origin; emitting the bare origin instead
+   * would be strictly broader than the ordered shape, in the direction the order warns against.
+   */
+  test("states the socket endpoint exactly, never the whole origin around it [A-42/W-07]", () => {
+    for (const socket of [
+      "wss://agent.viva.example.com/ws",
+      "wss://agent.viva.example.com/agent/v1/socket",
+      "ws://127.0.0.1:4318/ws",
+    ]) {
+      restoreEnv("NEXT_PUBLIC_VIVA_AGENT_HTTP_URL", undefined);
+      process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = socket;
+
+      const connectSrc = directive(responseCsp(proxy(serverPageRequest())), "connect-src");
+
+      // The whole source list is `'self'` plus this one endpoint, spelled exactly as configured.
+      expect(connectSrc).toBe(`connect-src 'self' ${socket}`);
+      // And the origin around it is NOT a source, so no sibling path rides in on it.
+      expect(connectSrc.split(" ")).not.toContain(new URL(socket).origin);
+    }
+  });
+
+  /**
+   * The two agent envs are different KINDS of value, so they contribute different shapes.
+   * `NEXT_PUBLIC_VIVA_AGENT_HTTP_URL` is a BASE — `vivaAgentHttpBaseUrl` trims its trailing slash
+   * and every caller concatenates a request path onto it, and the deployment runbook documents it
+   * as "the public agent origin" — so a `path-part` there would refuse every request the app
+   * actually makes. It contributes its ORIGIN. Only the socket env names one endpoint opened
+   * verbatim, and only it carries a path into the policy.
+   */
+  test("contributes the HTTP env's origin, because that env is a base and not an endpoint", () => {
+    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "https://agent.viva.example.com/api";
+    restoreEnv("NEXT_PUBLIC_VIVA_AGENT_WS_URL", undefined);
+
+    const connectSrc = directive(responseCsp(proxy(serverPageRequest())), "connect-src");
+
+    expect(connectSrc).toBe("connect-src 'self' https://agent.viva.example.com");
+    // A base URL's own path is not a `path-part`: `…/api/v1/readiness` has to stay admitted.
+    expect(connectSrc).not.toContain("/api");
+  });
+
   test("refuses every unusable agent origin instead of emitting or reflecting it", () => {
     const rejected = [
-      "https://agent.example/socket",
       "https://agent.example/?tenant=1",
       "https://agent.example/#fragment",
       "https://viva:hunter2@agent.example",
@@ -118,6 +201,17 @@ describe("Viva server-mode security headers", () => {
       "agent.example",
       "",
       "   ",
+      // `A-42`: admitting a path admits ONLY a path. Every other disqualification still holds
+      // when the value carries one, and a cross-origin or garbage value is still refused.
+      "https://viva:hunter2@agent.example/ws",
+      "https://agent.example/ws?tenant=1",
+      "https://agent.example/ws#fragment",
+      "http://agent.example/ws",
+      "ftp://agent.example/ws",
+      "agent.example/ws",
+      "/ws",
+      "ws:///ws",
+      "https://agent.example:443/ws",
     ];
 
     for (const value of rejected) {
@@ -130,6 +224,35 @@ describe("Viva server-mode security headers", () => {
     }
   });
 
+  /**
+   * `A-42`: the admitted path is never a channel for a second host. The operator's own path is
+   * emitted verbatim — that is the ordered origin+path shape — so the guarantee to pin is not
+   * that the string is absent but that CSP can only ever read it as a `path-part`: every emitted
+   * source resolves to the host the operator named. Userinfo that spells a host is refused
+   * outright, so there the string is absent from the policy entirely.
+   */
+  test("never admits a host the socket URL's path or userinfo merely spells [A-42]", () => {
+    process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "http://127.0.0.1:38877";
+    process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = "ws://127.0.0.1:38877/ws/evil.example";
+
+    const pathSmuggled = responseCsp(proxy(serverPageRequest()));
+    const smuggledSources = directive(pathSmuggled, "connect-src");
+    expect(smuggledSources).toBe(
+      "connect-src 'self' http://127.0.0.1:38877 ws://127.0.0.1:38877/ws/evil.example",
+    );
+    for (const source of smuggledSources.split(" ").slice(2)) {
+      expect(new URL(source).host).toBe("127.0.0.1:38877");
+    }
+
+    process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = "ws://evil.example@127.0.0.1:38877/ws";
+
+    const userinfoSmuggled = responseCsp(proxy(serverPageRequest()));
+    expect(directive(userinfoSmuggled, "connect-src")).toBe(
+      "connect-src 'self' http://127.0.0.1:38877",
+    );
+    expect(userinfoSmuggled).not.toContain("evil.example");
+  });
+
   test("admits loopback agent origins only over the insecure schemes a dev host uses", () => {
     process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = "http://127.0.0.1:8080";
     process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = "ws://127.0.0.1:8080";
@@ -137,6 +260,56 @@ describe("Viva server-mode security headers", () => {
     expect(directive(responseCsp(proxy(serverPageRequest())), "connect-src")).toBe(
       "connect-src 'self' http://127.0.0.1:8080 ws://127.0.0.1:8080",
     );
+  });
+
+  /**
+   * The insecure-scheme allowance exists only because loopback traffic never leaves the machine,
+   * so it must be spent on hosts that ARE loopback and on nothing that merely reads like one.
+   * `127.0.0.1.evil.example` is an ordinary registrable name whose first label happens to be
+   * `127`, and `localhost.evil.example` likewise; both resolve wherever their owner points them.
+   */
+  test("refuses a public host that only spells the loopback prefix, over either scheme", () => {
+    for (const value of [
+      "http://127.0.0.1.evil.example",
+      "http://127.0.0.1.evil.example:38877",
+      "ws://127.0.0.1.evil.example/ws",
+      "ws://127.0.0.1.evil.example:38877/ws",
+      "http://127.example",
+      "ws://127.0.0.1x/ws",
+      "http://localhost.evil.example",
+      "ws://localhost.evil.example/ws",
+    ]) {
+      process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = value;
+      process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = value;
+
+      const csp = responseCsp(proxy(serverPageRequest()));
+      expect({ connectSrc: directive(csp, "connect-src"), value }).toEqual({
+        connectSrc: "connect-src 'self'",
+        value,
+      });
+      expect(csp).not.toContain("evil.example");
+    }
+  });
+
+  /**
+   * The counterweight to the test above: narrowing the loopback check must not narrow it past the
+   * hosts a dev machine really serves on — all of `127.0.0.0/8`, `localhost`, and IPv6 `[::1]`.
+   */
+  test("still admits every genuine loopback host a dev machine serves on", () => {
+    for (const [http, ws] of [
+      ["http://127.0.0.1:4318", "ws://127.0.0.1:4318/ws"],
+      ["http://127.0.0.2:4318", "ws://127.0.0.2:4318/ws"],
+      ["http://127.255.255.254:4318", "ws://127.255.255.254:4318/ws"],
+      ["http://localhost:4318", "ws://localhost:4318/ws"],
+      ["http://[::1]:4318", "ws://[::1]:4318/ws"],
+    ] as const) {
+      process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL = http;
+      process.env.NEXT_PUBLIC_VIVA_AGENT_WS_URL = ws;
+
+      expect(directive(responseCsp(proxy(serverPageRequest())), "connect-src")).toBe(
+        `connect-src 'self' ${http} ${ws}`,
+      );
+    }
   });
 
   test("states one copy of an origin both agent envs name", () => {
