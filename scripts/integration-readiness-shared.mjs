@@ -40,6 +40,16 @@ export const EXTERNAL_GATE_IDS = Object.freeze(
   "OPS-01 OPS-02 OPS-03 OPS-04 OPS-05 OPS-06".split(" "),
 );
 
+// The three frozen document identifiers live here rather than in the entrypoint because
+// INTEGRATION-010's reconcile module needs them to assemble and classify a run, and a
+// sibling module may never import the entrypoint without forming a cycle. The entrypoint
+// re-exports all three, so Task 1's published import surface is unchanged.
+export const INTEGRATION_EVIDENCE_SCHEMA = "viva.integration_readiness.v1";
+export const MAIN_RECONCILIATION_SCHEMA = "viva.main_reconciliation.v1";
+export const TERMINAL_STATUSES = Object.freeze(
+  "CODE_REMEDIATION_COMPLETE CODE_COMPLETE_EXTERNAL_GATES_PENDING RELEASE_READY".split(" "),
+);
+
 // Neither the Markdown renderer (Task 1) nor the frozen command runner (Task 4) may ever
 // print an environment value behind one of these key markers. The list is the plan's own,
 // in the plan's order and plain spelling. Two of the redaction control's evidence markers
