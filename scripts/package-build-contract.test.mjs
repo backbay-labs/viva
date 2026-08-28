@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -279,6 +280,129 @@ test("@viva/ui-web receives React from its consumer", async () => {
   assert.equal(uiPackage.dependencies?.react, undefined);
   assert.equal(uiPackage.peerDependencies?.react, "^19.2.3");
   assert.equal(uiPackage.devDependencies?.react, "19.2.3");
+});
+
+test("exported @viva/ui-web primitives resolve their required styles in an isolated consumer build", async (t) => {
+  // PACKAGE-07's manifest-shape test above proves the React peer contract;
+  // this test proves the other half of the row-665 obligation — that the
+  // *stylesheet* dependency graph (ui-web's own "./styles.css" export and
+  // its "@viva/tokens" dependency) really resolves for a consumer, not just
+  // that the manifest keys exist. "Isolated" means: real npm-style tarballs
+  // (`bun pm pack`) extracted into a throwaway node_modules tree outside
+  // this repository checkout entirely (os.tmpdir(), not apps/web) — no
+  // workspace:* symlink, no tsconfig.base.json paths, nothing but what the
+  // package.json "exports" map itself publishes. Positive control first,
+  // then two reverted mutations proving a dropped @viva/tokens export or a
+  // dropped @viva/ui-web styles.css export each fail the build (not merely
+  // fail a static regex/toContain check on source text).
+  const workDir = await mkdtemp(join(tmpdir(), "viva-ui-web-isolated-consumer-"));
+  t.after(async () => rm(workDir, { force: true, recursive: true }));
+
+  const uiWebPackage = await readJson("packages/ui-web/package.json");
+  const tokensPackage = await readJson("packages/tokens/package.json");
+  const packRoot = join(workDir, "packed");
+  const consumerDir = join(workDir, "consumer");
+  const nodeModules = join(consumerDir, "node_modules");
+  const scopeDir = join(nodeModules, "@viva");
+  const tokensDir = join(scopeDir, "tokens");
+  const uiWebDir = join(scopeDir, "ui-web");
+  const outDir = join(consumerDir, "out");
+
+  const tarballName = (pkg) => `${pkg.name.replace(/^@/, "").replace("/", "-")}-${pkg.version}.tgz`;
+
+  function pack(pkgDir) {
+    const result = spawnSync("bun", ["pm", "pack", "--quiet", "--destination", packRoot], {
+      cwd: join(root, pkgDir),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  }
+
+  function extract(tarball, destDir) {
+    const result = spawnSync("tar", ["-xzf", join(packRoot, tarball), "-C", destDir, "--strip-components=1"], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  }
+
+  function buildEntry() {
+    return spawnSync("bun", ["build", "entry.tsx", "--target=browser", "--outdir", outDir], {
+      cwd: consumerDir,
+      encoding: "utf8",
+    });
+  }
+
+  await mkdir(packRoot, { recursive: true });
+  await mkdir(tokensDir, { recursive: true });
+  await mkdir(uiWebDir, { recursive: true });
+  pack("packages/tokens");
+  pack("packages/ui-web");
+  extract(tarballName(tokensPackage), tokensDir);
+  extract(tarballName(uiWebPackage), uiWebDir);
+
+  // React is ui-web's peerDependency; link the real installed copy so the
+  // isolated consumer can resolve the automatic JSX runtime it needs.
+  const reactTarget = await realpath(join(root, "packages/ui-web/node_modules/react"));
+  await symlink(reactTarget, join(nodeModules, "react"), "dir");
+
+  await writeFile(
+    join(consumerDir, "package.json"),
+    JSON.stringify({ name: "isolated-ui-web-consumer-probe", private: true, version: "0.0.0" }, null, 2),
+  );
+  await writeFile(
+    join(consumerDir, "entry.tsx"),
+    [
+      'import { ActionCard } from "@viva/ui-web";',
+      'import "@viva/ui-web/styles.css";',
+      "globalThis.__isolatedConsumerProbe = typeof ActionCard;",
+    ].join("\n"),
+  );
+
+  const baseline = buildEntry();
+  assert.equal(baseline.status, 0, `${baseline.stdout}\n${baseline.stderr}`);
+  const bundledCss = await readFile(join(outDir, "entry.css"), "utf8");
+  assert.match(bundledCss, /\.action-card\s*\{/, "ui-web's own styles.css must resolve into the bundle");
+  assert.match(bundledCss, /--viva-plum:/, "styles.css's @viva/tokens/theme.css dependency must be inlined");
+
+  // Mutation A: drop @viva/tokens' own "./theme.css" export. ui-web's
+  // styles.css still declares `@import "@viva/tokens/theme.css";`, so a
+  // real consumer build must fail loudly, not silently ship without tokens.
+  const tokensManifestPath = join(tokensDir, "package.json");
+  const originalTokensManifest = await readFile(tokensManifestPath, "utf8");
+  const tokensManifestWithoutThemeCss = JSON.parse(originalTokensManifest);
+  delete tokensManifestWithoutThemeCss.exports["./theme.css"];
+  await writeFile(tokensManifestPath, JSON.stringify(tokensManifestWithoutThemeCss, null, 2));
+  await rm(outDir, { force: true, recursive: true });
+  const droppedTokensExport = buildEntry();
+  assert.notEqual(
+    droppedTokensExport.status,
+    0,
+    "a dropped @viva/tokens theme.css export must fail the isolated build",
+  );
+  assert.match(droppedTokensExport.stderr, /Could not resolve.*@viva\/tokens\/theme\.css/s);
+
+  await writeFile(tokensManifestPath, originalTokensManifest);
+  await rm(outDir, { force: true, recursive: true });
+  const restoredTokensExport = buildEntry();
+  assert.equal(restoredTokensExport.status, 0, `${restoredTokensExport.stdout}\n${restoredTokensExport.stderr}`);
+
+  // Mutation B: drop @viva/ui-web's own "./styles.css" export. The
+  // consumer's own `import "@viva/ui-web/styles.css";` must then fail.
+  const uiWebManifestPath = join(uiWebDir, "package.json");
+  const originalUiWebManifest = await readFile(uiWebManifestPath, "utf8");
+  const uiWebManifestWithoutStylesCss = JSON.parse(originalUiWebManifest);
+  delete uiWebManifestWithoutStylesCss.exports["./styles.css"];
+  await writeFile(uiWebManifestPath, JSON.stringify(uiWebManifestWithoutStylesCss, null, 2));
+  await rm(outDir, { force: true, recursive: true });
+  const droppedStylesExport = buildEntry();
+  assert.notEqual(
+    droppedStylesExport.status,
+    0,
+    "a dropped @viva/ui-web styles.css export must fail the isolated build",
+  );
+  assert.match(droppedStylesExport.stderr, /Could not resolve.*@viva\/ui-web\/styles\.css/s);
+
+  await writeFile(uiWebManifestPath, originalUiWebManifest);
 });
 
 test("mounted web tests use one exact DOM implementation", async () => {
