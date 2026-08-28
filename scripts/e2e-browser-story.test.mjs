@@ -1,7 +1,8 @@
-// RELEASE-023: the browser harness's decision logic is tested by *running* it,
-// not by reading its source. Every reducer below is imported and exercised
-// directly; `e2e-browser.mjs` is import-safe (its story runs only when the file
-// is the process entrypoint) precisely so this file can do that.
+// RELEASE-030 E2E extraction: the browser story's decision logic is tested by
+// *running* it, not by reading its source. Every reducer below is imported and
+// exercised directly, moved verbatim from `e2e-browser.test.mjs` except for
+// the import path and the two plan-owned tests that moved to
+// `e2e-browser-plan.test.mjs` alongside the reducers they exercise.
 //
 // The retained source scans live in `e2e-browser-static.test.mjs` and cover
 // only structural bans a reducer cannot express ("no REST bearer in browser
@@ -10,47 +11,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  assertHostedSyntheticIdentity,
   assertHostedWebSocketTarget,
   failureControlReplayClientFrames,
   LEARNING_TRUTH_CHECKS,
   normalizeComparableWsUrl,
-  normalizeHostedHttpUrl,
-  normalizeHostedWsUrl,
   postAnswerProtocolProofFromEvents,
   recordServerFramePayload,
   redactSensitiveDiagnostic,
+  summarizeFakeDeviceLongAudioProof,
   summarizeLearningTruth,
+  summarizeTerminalCopyProof,
   summarizeVoiceTransportMatrix,
   terminalProofFromServerEvents,
   VOICE_TRANSPORT_MATRIX_DURATIONS_SECONDS,
   VOICE_TRANSPORT_MATRIX_SOURCE_SAMPLE_RATES_HZ,
   voiceTransportMatrixCellsFromAudioEvidence,
   waitForFailureControlTerminal,
-} from "./e2e-browser.mjs";
-
-test("hosted URL normalization strips credentials-bearing query, fragment, and trailing slash noise", () => {
-  assert.equal(
-    normalizeHostedHttpUrl("https://web.example.com/?session_token=leak#fragment", "TEST_URL"),
-    "https://web.example.com",
-  );
-  assert.equal(
-    normalizeHostedHttpUrl("https://web.example.com/app////", "TEST_URL"),
-    "https://web.example.com/app",
-  );
-  assert.throws(
-    () => normalizeHostedHttpUrl("ws://web.example.com", "TEST_URL"),
-    /TEST_URL must use http:\/\/ or https:\/\//,
-  );
-  assert.equal(
-    normalizeHostedWsUrl("wss://agent.example.com/ws?x=1", "WS_URL"),
-    "wss://agent.example.com/ws",
-  );
-  assert.throws(
-    () => normalizeHostedWsUrl("https://agent.example.com/ws", "WS_URL"),
-    /WS_URL must use ws:\/\/ or wss:\/\//,
-  );
-});
+} from "./e2e-browser-story.mjs";
 
 test("websocket target comparison ignores query and fragment but never the origin or path", () => {
   assert.equal(
@@ -84,18 +61,6 @@ test("the websocket-target failure message never republishes an observed URL's c
   assert.match(message, /attacker\.example\.com/);
   assert.doesNotMatch(message, /hunter2/);
   assert.doesNotMatch(message, /secret-value/);
-});
-
-test("hosted synthetic identity rejection refuses anything that could be a real learner", () => {
-  assert.doesNotThrow(() => assertHostedSyntheticIdentity({ userId: "synthetic-monitor-1" }));
-  assert.doesNotThrow(() => assertHostedSyntheticIdentity({ userId: "hosted-monitor" }));
-  for (const userId of ["user-1", "learner-42", "synthetic-learner-1", "monitor-student"]) {
-    assert.throws(
-      () => assertHostedSyntheticIdentity({ userId }),
-      /requires a synthetic monitor user identity/,
-      `identity ${userId} must be refused`,
-    );
-  }
 });
 
 test("terminal proof is reduced from the observed event stream, never asserted from a flag", () => {
@@ -1089,4 +1054,150 @@ test("the learning-truth summary retains no prompt, transcript, answer, or recap
     visible: learningTruthVisible(),
   });
   assert.equal(JSON.stringify(summary).includes(sentinel), false);
+});
+
+// ---------------------------------------------------------------------------
+// Ledger row 597 / `CRIT-AUDIO-01` (Frontend C8): the fake-device long-audio
+// proof, named on its own rather than only inferred from the six-cell matrix
+// passing as a whole.
+// ---------------------------------------------------------------------------
+
+function fakeDeviceLongAudioCell(overrides = {}) {
+  return matrixCell({
+    duration_seconds: 45,
+    source_sample_rate_hz: 44_100,
+    frames_sent: 45 * 50,
+    final_sequence: 45 * 50 - 1,
+    accepted_final_sequence: 45 * 50 - 1,
+    turn_id: "turn-44100-45",
+    accepted_turn_id: "turn-44100-45",
+    ...overrides,
+  });
+}
+
+test("the fake-device long-audio proof passes only when the required matrix's 44.1 kHz / 45s cell is present and clean", () => {
+  const passing = summarizeFakeDeviceLongAudioProof({
+    required: true,
+    cells: [fakeDeviceLongAudioCell()],
+  });
+  assert.equal(passing.proof_id, "CRIT-AUDIO-01");
+  assert.equal(passing.ledger_row, 597);
+  assert.equal(passing.required, true);
+  assert.equal(passing.passed, true, passing.failures.join(" | "));
+  assert.deepEqual(passing.failures, []);
+});
+
+test("the fake-device long-audio proof fails closed when the 44.1 kHz / 45s cell is missing", () => {
+  const missingCell = summarizeFakeDeviceLongAudioProof({
+    required: true,
+    cells: [matrixCell({ duration_seconds: 45, source_sample_rate_hz: 48_000 })],
+  });
+  assert.equal(missingCell.passed, false);
+  assert.ok(missingCell.failures.some((failure) => /44\.1 kHz \/ 45-second/.test(failure)));
+
+  const noCells = summarizeFakeDeviceLongAudioProof({ required: true, cells: [] });
+  assert.equal(noCells.passed, false);
+});
+
+test("the fake-device long-audio proof fails closed on the same cell invariants the matrix enforces", () => {
+  const broken = summarizeFakeDeviceLongAudioProof({
+    required: true,
+    cells: [fakeDeviceLongAudioCell({ audio_turn_accepted_count: 0 })],
+  });
+  assert.equal(broken.passed, false);
+  assert.ok(broken.failures.some((failure) => /audio_turn_accepted/.test(failure)));
+});
+
+test("the fake-device long-audio proof is recorded but cannot fail a run that did not require the matrix", () => {
+  const notRequired = summarizeFakeDeviceLongAudioProof({ required: false, cells: [] });
+  assert.equal(notRequired.required, false);
+  assert.equal(notRequired.passed, true);
+});
+
+test("the fake-device long-audio proof is not satisfied by an unconditionally-passing impostor's own claim", () => {
+  // Negative control: a reducer that ignores its input entirely still must not
+  // be mistaken for the real one -- the REAL reducer, given the same broken
+  // input, refuses.
+  function impostor() {
+    return { proof_id: "CRIT-AUDIO-01", ledger_row: 597, required: true, passed: true, failures: [] };
+  }
+  assert.equal(impostor().passed, true);
+  const real = summarizeFakeDeviceLongAudioProof({ required: true, cells: [] });
+  assert.equal(real.passed, false);
+});
+
+// ---------------------------------------------------------------------------
+// Ledger row 598 / `WEBSESSION-TERMINAL-01` (Frontend C9): a successful recap
+// must never share the screen with disconnect or retry copy.
+// ---------------------------------------------------------------------------
+
+test("the terminal-copy proof passes only on a visible recap with no disconnect or retry copy beside it", () => {
+  const clean = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: false,
+    recapVisible: true,
+    required: true,
+    retryContradictionVisible: false,
+  });
+  assert.equal(clean.proof_id, "WEBSESSION-TERMINAL-01");
+  assert.equal(clean.ledger_row, 598);
+  assert.equal(clean.passed, true, clean.failures.join(" | "));
+  assert.deepEqual(clean.failures, []);
+});
+
+test("the terminal-copy proof fails closed on disconnect copy beside a successful recap", () => {
+  const withDisconnect = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: true,
+    recapVisible: true,
+    required: true,
+    retryContradictionVisible: false,
+  });
+  assert.equal(withDisconnect.passed, false);
+  assert.ok(withDisconnect.failures.some((failure) => /disconnect copy/.test(failure)));
+});
+
+test("the terminal-copy proof fails closed on retry copy beside a successful recap", () => {
+  const withRetry = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: false,
+    recapVisible: true,
+    required: true,
+    retryContradictionVisible: true,
+  });
+  assert.equal(withRetry.passed, false);
+  assert.ok(withRetry.failures.some((failure) => /retry copy/.test(failure)));
+});
+
+test("the terminal-copy proof fails closed when the recap itself was never visible", () => {
+  const noRecap = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: false,
+    recapVisible: false,
+    required: true,
+    retryContradictionVisible: false,
+  });
+  assert.equal(noRecap.passed, false);
+  assert.ok(noRecap.failures.some((failure) => /recap was not visible/.test(failure)));
+});
+
+test("the terminal-copy proof is recorded but cannot fail a run that did not require it", () => {
+  const notRequired = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: true,
+    recapVisible: false,
+    required: false,
+    retryContradictionVisible: true,
+  });
+  assert.equal(notRequired.required, false);
+  assert.equal(notRequired.passed, true);
+});
+
+test("the terminal-copy proof is not satisfied by an unconditionally-passing impostor's own claim", () => {
+  function impostor() {
+    return { proof_id: "WEBSESSION-TERMINAL-01", ledger_row: 598, required: true, passed: true, failures: [] };
+  }
+  assert.equal(impostor().passed, true);
+  const real = summarizeTerminalCopyProof({
+    disconnectionCopyVisible: true,
+    recapVisible: true,
+    required: true,
+    retryContradictionVisible: false,
+  });
+  assert.equal(real.passed, false);
 });

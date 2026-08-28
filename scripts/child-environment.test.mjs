@@ -251,6 +251,36 @@ test("e2e-browser: local-browser-agent role takes a constructed durable-store UR
   await assertNoSentinelLeak(env, explicit);
 });
 
+// W-07 / A-32: without a session-mint credential configured on the agent
+// itself, nothing may call `record_voice_session` at start -- the newly
+// started session's `voice_sessions` row is never written, its authenticated
+// projection can never validate, and `/session` opens no socket. `config.rs`'s
+// `validate_credentials` also collision-checks every scoped agent credential
+// pairwise, so this must reach the agent byte-distinct from the library-read
+// credential above even though the harness constructs both as local literals.
+test("e2e-browser: local-browser-agent role takes a constructed session-mint credential distinct from the library-read credential", async () => {
+  const explicit = {
+    VIVA_AGENT_BIND_ADDR: "127.0.0.1:0",
+    VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: "viva-local-e2e-agent-scoped-read-material0",
+    VIVA_AGENT_PROVIDER: "synthetic",
+    VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: "viva-local-e2e-session-mint-bearer-material-0",
+    VIVA_VOICE_SESSION_TOKEN_SECRET: "viva-local-e2e-session-token-material-0000",
+  };
+  const env = childEnvironmentFor("local-browser-agent", {
+    parentEnv: HOSTILE_PARENT_ENV,
+    explicit,
+  });
+  assert.equal(
+    env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN,
+    explicit.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN,
+  );
+  assert.notEqual(
+    env.VIVA_AGENT_SESSION_MINT_BEARER_TOKEN,
+    env.VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN,
+  );
+  await assertNoSentinelLeak(env, explicit);
+});
+
 test("e2e-browser: local-browser-web role clears a hostile parent and keeps only its explicit NEXT_PUBLIC values", async () => {
   const explicit = { NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: "http://127.0.0.1:0" };
   const env = childEnvironmentFor("local-browser-web", { parentEnv: HOSTILE_PARENT_ENV, explicit });

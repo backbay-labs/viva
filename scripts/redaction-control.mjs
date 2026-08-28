@@ -2809,6 +2809,227 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*VIVA_AGENT_REST_BEARER_TOKEN:\ "local\-frontend\-harness\-bearer",\s*$/,
     ]),
   },
+  // W-07/HARNESS admission (A-42): the e2e extraction moved the harness's
+  // synthetic-fixture constants, env-key names, and prose into the new module
+  // family; every pattern below is a name or fixture material, never a live
+  // value. Generated from the audit's own detection over the admission diff.
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*export const LOCAL_STORY_AGENT_SCOPED_BEARER = "viva-local-e2e-agent-scoped-read-material0";\s*$/,
+      /^\s*export const LOCAL_STORY_SESSION_MINT_BEARER = "viva-local-e2e-session-mint-bearer-material-0";\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "hosted_rest_bearer_token",
+    patterns: Object.freeze([
+      /^\s*const hostedRestBearerToken = process\.env\.VIVA_E2E_HOSTED_REST_BEARER_TOKEN\?\.trim\(\) \?\? "";\s*$/,
+      /^\s*if \(plan\.hostedMode && !plan\.hostedRestBearerToken\) \{\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "local_story_bootstrap_token_secret",
+    patterns: Object.freeze([
+      /^\s*export const LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET = "viva-local-e2e-bootstrap-token-material-0";\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "local_story_session_token_secret",
+    patterns: Object.freeze([
+      /^\s*export const LOCAL_STORY_SESSION_TOKEN_SECRET = "viva-local-e2e-session-token-material-0000";\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*process\.env\.VIVA_VOICE_SESSION_TOKEN_SECRET \?\? "local-e2e-session-token-secret",\s*$/,
+      /^\s*"Local browser E2E requires VIVA_E2E_AGENT_DATABASE_URL: a disposable, migrated, fixture-seeded PostgreSQL 16 URL\. The merged agent refuses signed-session mode over a volatile store, its library snapshot then reports every start action session_token_unavailable, and \/session opens no socket without an authenticated study projection -- so no local run without a durable store can reach an authenticated session\.",\s*$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET:\s*$/,
+      /^\s*\*    start action `session_token_unavailable`, so the landing's Start control\s*$/,
+      /^\s*export const LOCAL_STORY_SESSION_TOKEN_SECRET = "viva-local-e2e-session-token-material-0000";\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "viva_failure_control_secret",
+    patterns: Object.freeze([
+      /^\s*VIVA_FAILURE_CONTROL_SECRET:\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-plan.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET:\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\? LOCAL_STORY_SESSION_TOKEN_SECRET\s*$/,
+      /^\s*\? plan\.failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET\s*$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: plan\.failureControlPlan\.enabled\s*$/,
+      /^\s*: LOCAL_STORY_SESSION_TOKEN_SECRET,\s*$/,
+      /^\s*\? plan\.failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET\s*$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: plan\.failureControlPlan\.enabled\s*$/,
+      /^\s*LOCAL_STORY_SESSION_TOKEN_SECRET,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "viva_agent_library_read_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: plan\.localSignedSessionMode\s*$/,
+      /^\s*VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "viva_agent_rest_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_REST_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "viva_agent_session_mint_bearer_token",
+    patterns: Object.freeze([
+      /^\s*VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: plan\.localSignedSessionMode\s*$/,
+      /^\s*VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: LOCAL_STORY_SESSION_MINT_BEARER,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "viva_session_bootstrap_token_secret",
+    patterns: Object.freeze([
+      /^\s*VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-runtime.mjs",
+    marker: "viva_voice_session_token_secret",
+    patterns: Object.freeze([
+      /^\s*\? plan\.failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET\s*$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: plan\.failureControlPlan\.enabled\s*$/,
+      /^\s*\? plan\.failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET\s*$/,
+      /^\s*VIVA_VOICE_SESSION_TOKEN_SECRET: plan\.failureControlPlan\.enabled\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-actions.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*\.replace\(\/Bearer\\s\+\[A-Za-z0-9\._~\+\/=-\]\+\/gi, "Bearer redacted"\);\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-actions.mjs",
+    marker: "password",
+    patterns: Object.freeze([
+      /^\s*url\.password = "";\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-actions.mjs",
+    marker: "session_bootstrap_token",
+    patterns: Object.freeze([
+      /^\s*session_bootstrap_token: action\.session_bootstrap_token,\s*$/,
+      /^\s*if \(!studySet\?\.user_id \|\| !action\?\.session_bootstrap_token\) \{\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-actions.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*!sessionPayload\.session_token\s*$/,
+      /^\s*const tokenParamNames = \["session_token", "token"\];\s*$/,
+      /^\s*sessionPayload\.session_token,\s*$/,
+      /^\s*session_token: session\.sessionToken,\s*$/,
+      /^\s*\.replace\(\/#session_token=\[\^\\s"'<>\)\]\*\/gi, "#redacted-session-fragment"\)\s*$/,
+      /^\s*\.replace\(\/\[\?&\]session_token=\[\^&\\s"'<>\)\]\*\/gi, "\?redacted_session_param=1"\)\s*$/,
+      /^\s*const tokenParamNames = \["session_token", "token"\];\s*$/,
+      /^\s*return `\/session\?\$\{params\.toString\(\)\}#session_token=\$\{encodeURIComponent\(\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-actions.mjs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*source_context: \[\],\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-evidence.mjs",
+    marker: "answer_text",
+    patterns: Object.freeze([
+      /^\s*\* in one place: free text \(`question\.prompt`, `evaluation\.answer_text`,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-matrix.mjs",
+    marker: "transcript_final",
+    patterns: Object.freeze([
+      /^\s*`\$\{label\}: observed \$\{cell\.transcript_final_count\} final transcripts, expected exactly 1`,\s*$/,
+      /^\s*transcript_final_count: Array\.isArray\(turn\.transcripts\) \? turn\.transcripts\.length : 0,\s*$/,
+      /^\s*if \(cell\.transcript_final_count !== 1\) \{\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-runner.mjs",
+    marker: "back_forward_replayed_token",
+    patterns: Object.freeze([
+      /^\s*back_forward_replayed_token: forwardCheck\.token_param_visible,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-runner.mjs",
+    marker: "bfcache_restore_replayed_token",
+    patterns: Object.freeze([
+      /^\s*bfcache_restore_replayed_token: bfcacheRestoreReplayedToken,\s*$/,
+      /^\s*const bfcacheRestoreReplayedToken = bfcacheEvents\.some\(\(event\) => event\.token_param_visible\);\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-runner.mjs",
+    marker: "refresh_replayed_token",
+    patterns: Object.freeze([
+      /^\s*refresh_replayed_token: refreshCheck\.token_param_visible,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-runner.mjs",
+    marker: "session_secret",
+    patterns: Object.freeze([
+      /^\s*sessionSecret: failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser-story-runner.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\["expired_token", `\/session#session_token=\$\{bootstrapToken\("expired"\)\}`\],\s*$/,
+      /^\s*\["initial_load", `\/session#session_token=\$\{bootstrapToken\("initial"\)\}`\],\s*$/,
+      /^\s*\["malformed_token", "\/session#session_token=%20%20"\],\s*$/,
+      /^\s*\["replayed_token", `\/session#session_token=\$\{bootstrapToken\("replayed"\)\}`\],\s*$/,
+      /^\s*sessionSecret: failureControlEnv\.VIVA_VOICE_SESSION_TOKEN_SECRET,\s*$/,
+      /^\s*await auditPage\.goto\(`\$\{webUrl\}\/session#session_token=\$\{bootstrapToken\("history"\)\}`, \{\s*$/,
+      /^\s*const tokenParamNames = \["session_token", "token"\];\s*$/,
+      /^\s*sessionToken: session\.sessionToken,\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/e2e-browser.mjs",
+    marker: "hosted_rest_bearer_token",
+    patterns: Object.freeze([
+      /^\s*\? authenticatedHostedFetchOptions\(plan\.hostedRestBearerToken\)\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
