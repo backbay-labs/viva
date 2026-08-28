@@ -61,9 +61,7 @@ function runBuild(extraEnv = {}) {
         NEXT_PUBLIC_VIVA_AGENT_HTTP_URL: "https://agent-a.invalid",
         NEXT_PUBLIC_VIVA_AGENT_WS_URL: "wss://agent-a.invalid/ws",
         NEXT_PUBLIC_VIVA_API_URL: "https://api-a.invalid",
-        NEXT_PUBLIC_VIVA_STATIC_EXPORT: "0",
         TURBO_TELEMETRY_DISABLED: "1",
-        VIVA_STATIC_EXPORT: "0",
         ...extraEnv,
       },
     },
@@ -101,8 +99,6 @@ function dryRunHash(publicApiUrl) {
       env: {
         ...process.env,
         NEXT_PUBLIC_VIVA_API_URL: publicApiUrl,
-        NEXT_PUBLIC_VIVA_STATIC_EXPORT: "0",
-        VIVA_STATIC_EXPORT: "0",
       },
     },
   );
