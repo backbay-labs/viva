@@ -11,16 +11,12 @@ pub use app::{
     build_router, AppState, RecorderStats, VoiceEvidenceRecorder, VoiceUsageAggregate,
     VoiceUsageRecorder, WsTimeouts,
 };
-/// `A-32`: the session-mint authority, added by the amendment rather than by the
-/// original access surface, and exported on its own line so the grouped `config`
-/// re-export below keeps the exact shape the release audits already read.
-pub use config::SessionMintAccess;
 pub use config::{
     build_brain, build_study_store, validate_runtime_store_preflight, verify_session_token_at,
     AccessError, ExpectedSessionBinding, FailureControlConfig, FailureControlScenario, IpNetwork,
     IpNetworkError, OperatorAccess, ProjectionReadAccess, ProjectionRejection, RealtimeProvider,
-    RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError, SessionTokenClaims,
-    SessionTokenError, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
+    RecorderLimits, RedactedSecret, ServiceConfig, ServiceConfigError, SessionMintAccess,
+    SessionTokenClaims, SessionTokenError, TrustedProxyConfig, VoiceLimitConfig, VoiceWsAccess,
     EXPIRY_CLOCK_SKEW_SECONDS, VIVA_SESSION_TOKEN_HEADER,
 };
 pub use dev_seed::{
