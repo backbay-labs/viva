@@ -334,3 +334,9 @@ Lane 12b-a proved with a minimal-crate experiment that Plan 12 Task 14's "prune 
 
 1. **Row 689's proof executed and admitted** (PR #138, squashed — the first-pass authority guard was self-confirming). The runbook's operation-by-credential matrix and the derived false-authority oracle are the row's enforcing mechanism.
 2. **Namespace RATIFIED**: Plan 15's coordinator phase owns `scripts/public-contract*.mjs` (the entrypoint plus extracted sibling modules, mirroring A-39.3), each file under the Plan-12 unbudgeted 1200-line ceiling. The pin lives in the drift oracle rather than the Plan-12-owned `deployment-runbook.test.mjs`, which stays byte-identical — the correct ownership reading.
+
+## A-46 (2026-08-28) — CI-WIRING admission; the production-web harness order proceeds
+
+1. **A-43.2 executed and admitted** (node-12B appendix PR #139, squashed — the history contains the review-killed retry-tolerance state). The structural SIGTERM fix, the exact-count step pin, both workflow wirings, the consumer leg, and the hyphenated-shape scan extension are in. **Task 9 caveat recorded**: the required workflow's verify leg checks a same-run self-signed bundle — never creditable as hosted OPS proof.
+2. **Routed to the Plan-15 namespace**: `assertHostedConsumptionBoundary`'s mutable-latest blind spot (the landed tree is double-pinned by the lane's own exact-artifact assertion meanwhile) — closes at the coordinator's next Plan-15 namespace touch.
+3. **W07-PROD-WEB proceeds** (A-44.2's order, the lane now free): the e2e harness's local web spawns `next build` + `next start`.
