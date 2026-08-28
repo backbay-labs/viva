@@ -157,6 +157,86 @@ test("provider failure observability defines reusable sanitized log queries", ()
   }
 });
 
+// ROWS 348/522, RELEASE-013 in-tree half: every existing assertion over the
+// BAC-527 rollback query (`live_monitor_failure`, backing rollback threshold
+// `live_monitor_consecutive_failures`) only regex-matches the railway_query
+// *text*. None ever evaluates it as a predicate against a real produced
+// artifact, so a change that silently broke the query's actual matching
+// semantics (while leaving the substrings these regexes look for intact --
+// e.g. reordering the threshold operator, or drifting the artifact selector)
+// would pass every existing test. This hand-translates the query's own
+// disjuncts into an executable predicate and evaluates it against real
+// live-provider-smoke evidence shapes (matching
+// liveMonitorConsecutiveFailuresFromEvidence's actual schema/monitor
+// contract in scripts/live-provider-smoke.mjs).
+test("ROWS 348/522, RELEASE-013: the BAC-527 rollback query's artifact: selector and predicate actually match a produced live-provider-smoke artifact once the rollback count reaches two, and reject it before then", () => {
+  const railwayQuery = providerFailureQueriesById().get("live_monitor_failure").railway_query;
+
+  const selectorMatch = railwayQuery.match(/^artifact:"([^"]+)"/);
+  assert(selectorMatch, "query must open with an artifact: selector");
+  // Equality, not a regex `.match` for mere presence: the selector's exact
+  // literal is what a real query engine would filter artifacts by.
+  assert.equal(selectorMatch[1], "viva.live_provider_smoke.v1");
+
+  const thresholdMatch = railwayQuery.match(
+    /monitor\.live_monitor_consecutive_failures:">=(\d+)"/,
+  );
+  assert(thresholdMatch, "query must carry a >=N consecutive-failures clause");
+  assert.equal(Number(thresholdMatch[1]), 2, "BAC-527's rollback threshold is exactly 2");
+
+  const atThreshold = {
+    schema: "viva.live_provider_smoke.v1",
+    status: "failed",
+    failure_class: "timeout",
+    monitor: {
+      live_monitor_consecutive_failures: 2,
+      terminal_reason: "provider_timeout",
+      signal: null,
+    },
+  };
+  assert.equal(
+    evaluateLiveMonitorFailureRailwayQuery(railwayQuery, atThreshold),
+    true,
+    "a produced artifact at the BAC-527 rollback count (2) must match the query",
+  );
+
+  const belowThreshold = {
+    ...atThreshold,
+    monitor: { ...atThreshold.monitor, live_monitor_consecutive_failures: 1 },
+  };
+  assert.equal(
+    evaluateLiveMonitorFailureRailwayQuery(railwayQuery, belowThreshold),
+    false,
+    "a produced artifact below the BAC-527 rollback count must not match the query",
+  );
+
+  const wrongSchema = { ...atThreshold, schema: "viva.hosted_monitor_run.v1" };
+  assert.equal(
+    evaluateLiveMonitorFailureRailwayQuery(railwayQuery, wrongSchema),
+    false,
+    "the artifact: selector must reject a different schema even when every other field would otherwise match",
+  );
+});
+
+// A hand translation of live_monitor_failure's own OR-disjuncts (query text
+// above) into an executable predicate over a real produced artifact object
+// -- not a generic query-language interpreter, and not the production
+// module's own logic (that would prove nothing about drift between the two).
+function evaluateLiveMonitorFailureRailwayQuery(railwayQuery, artifact) {
+  const selector = railwayQuery.match(/^artifact:"([^"]+)"/)?.[1];
+  if (artifact.schema !== selector) return false;
+  const threshold = Number(
+    railwayQuery.match(/monitor\.live_monitor_consecutive_failures:">=(\d+)"/)?.[1],
+  );
+  return (
+    artifact.failure_class === "live_monitor_failure" ||
+    (Number.isSafeInteger(artifact.monitor?.live_monitor_consecutive_failures) &&
+      artifact.monitor.live_monitor_consecutive_failures >= threshold) ||
+    artifact.monitor?.signal === "live_monitor_failure" ||
+    artifact.monitor?.terminal_reason === "configuration_error"
+  );
+}
+
 test("token refresh query only counts blocked refreshes when rate limited", () => {
   const railwayQuery = providerFailureQueriesById().get("token_refresh_failure").railway_query;
 

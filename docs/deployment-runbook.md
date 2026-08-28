@@ -459,7 +459,14 @@ bun run hosted:monitor
 `railway.json` is intentionally scoped to the `viva-hosted-monitor` service. Do
 not connect hosted web or hosted agent services to the repo root without a
 service-specific Railway config path, or they will inherit the monitor
-Dockerfile, cron schedule, and start command. `railway.json` configures a
+Dockerfile, cron schedule, and start command. This is about Railway's own
+service-config discovery root, a separate concern from the Docker **build
+context** both Dockerfiles use — see
+[Container supply chain](#container-supply-chain-release-026) below, which
+builds `agent/Dockerfile` and `Dockerfile.monitor` from the repository root
+as their build context so each `COPY` can reach everything it needs; that
+build-context requirement does not change which `railway.json` a hosted
+service discovers. `railway.json` configures a
 short-lived Railway cron service with
 `cronSchedule: "*/30 * * * *"` and `restartPolicyType: "NEVER"`. Railway cron
 jobs must exit when the task finishes; a still-active prior execution causes the
@@ -906,6 +913,16 @@ is `true`:
 - recomputes the HMAC over the stored payload with its own secret and
   rejects a mismatch (a wrong secret, or any tamper to the bundle after it
   was written);
+- separately re-checks freshness **at verification time**, via
+  `assertFreshProductionEvidence`: it recomputes `evidence.generated_at`'s
+  age against this command's own "now", independent of whatever
+  `production_release_gate.allowed` said back when the bundle was generated,
+  and rejects a bundle that is stale at verification time using the same
+  canonical `VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS` override (24 hours by
+  default) every other freshness seam honors — so a bundle that was
+  genuinely fresh at generation but has since aged past the window is
+  rejected here even though its stored `gate.allowed` still says `true`. A
+  future-dated `generated_at` is rejected the same way;
 - separately requires `VIVA_RELEASE_RUN_ID`, `VIVA_RELEASE_DEPLOY_SHA`,
   `VIVA_RELEASE_WEB_DEPLOY_ID`, and `VIVA_RELEASE_AGENT_DEPLOY_ID` from its
   own environment and rejects a bundle whose bound identity
@@ -985,16 +1002,34 @@ mismatch, and a base-image `build_inputs` digest can never masquerade as
 deployed provenance because the gate never reads `build_inputs` when
 checking `deployment_outputs`.
 
-Local image/runtime verification (not hosted or deployed proof):
+Local image/runtime verification (not hosted or deployed proof) — run
+`node scripts/container-runtime-smoke.mjs` for the bounded, timed,
+repeatable form of these same six checks; equivalently, by hand:
 
 ```sh
-docker build -f agent/Dockerfile agent -t viva-agent-supply-chain-test
+docker build -f agent/Dockerfile . -t viva-agent-supply-chain-test
 docker run --rm --entrypoint sh viva-agent-supply-chain-test \
   -c 'test "$(id -u)" = 10001 && test "$(id -g)" = 10001'
 docker build -f Dockerfile.monitor . -t viva-monitor-supply-chain-test
 docker run --rm --entrypoint sh viva-monitor-supply-chain-test \
   -c 'test "$(id -u)" != 0 && test "$(bun --version)" = 1.3.3 && test -r /app/evidence/live-smoke-answer.pcm && test -w /app/evidence'
+docker run --rm --read-only --tmpfs /tmp --entrypoint sh viva-agent-supply-chain-test \
+  -c 'test "$(id -u)" = 10001 && touch /tmp/agent-write-probe'
+docker run --rm --read-only --tmpfs /tmp \
+  --tmpfs /app/evidence:rw,uid=1001,gid=1001,mode=0750 --entrypoint sh viva-monitor-supply-chain-test \
+  -c 'test "$(id -u)" != 0 && touch /tmp/monitor-write-probe && touch /app/evidence/monitor-write-probe'
 ```
+
+Both builds use the repository root as their build context, not `agent`:
+`agent/crates/agent-domain`'s `include_str!` of
+`packages/core/src/learner-loop-contract.json` reaches a sibling of `agent/`
+that a context scoped to `agent/` alone cannot COPY (Docker refuses a path
+outside the build context); `agent/Dockerfile`'s own COPY instructions are
+prefixed accordingly, and a root `.dockerignore` keeps that wider context
+from sending host-only build output (`node_modules`, `agent/target`, `.git`,
+…) to the daemon. The monitor's `--tmpfs /app/evidence` mount uses
+`uid=1001,gid=1001` — confirmed by running `id pwuser` inside the built
+image — because the Playwright base image's `pwuser` is not uid/gid 1000.
 
 ## Logs And Evidence Redaction
 

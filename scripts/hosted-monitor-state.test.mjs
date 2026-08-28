@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY,
@@ -759,6 +760,19 @@ function fakeStore({ seed = {}, ignoreConditionalHeaders = false } = {}) {
   };
   return { fetchImpl, objects, calls };
 }
+
+// ROW 475/QLT-06: under Node 24 an unref'd abort timer let the event loop
+// consider itself idle before this correctness-critical CAS-request deadline
+// fired, silently cancelling requests. The fix (never unref'd) is comment-
+// only until pinned by a test.
+test("ROW 475/QLT-06: the CAS request's abort timer is never unref'd between its declaration and its cleanup", () => {
+  const source = readFileSync(new URL("./hosted-monitor-state.mjs", import.meta.url), "utf8");
+  const declIndex = source.indexOf('const timer = setTimeout(() => controller.abort(), timeoutMs);');
+  assert.notEqual(declIndex, -1, "expected timer declaration not found");
+  const clearIndex = source.indexOf("clearTimeout(timer)", declIndex);
+  assert.notEqual(clearIndex, -1, "expected clearTimeout(timer) not found after declaration");
+  assert.doesNotMatch(source.slice(declIndex, clearIndex), /timer\.unref\(\)/);
+});
 
 function fakeResponse(status, etag, text) {
   return {

@@ -442,21 +442,32 @@ function signHostedLiveSmokeSession(claims, secret) {
  * margin, so it always retains its full validity window regardless of how
  * long any earlier plan run took to execute.
  *
- * The signed claims carry exactly the fields the deployed agent's
- * `SessionTokenClaims` (agent/crates/agent-service/src/config.rs) accepts:
- * `user_id`, `study_set_id`, `session_id`, `expires_at`, `nonce`. That struct
- * derives `#[serde(deny_unknown_fields)]`, so any additional claim -- a run
- * id, deploy SHA, agent deploy id, or provider mode -- makes the deployed
- * server reject the whole token as malformed before any provider work, not
- * merely ignore the extra field. `run.runId`, `run.deploySha`,
- * `run.agentDeployId`, and `run.provider` stay on the returned run object,
- * outside the signed envelope, alongside the rest of the run's already
- * non-secret configuration, so they still correlate this specific
- * materialization in the sanitized hosted summary. Binding them
+ * ROW 356/RELEASE-021 ADJUDICATION: the signed claims carry exactly the
+ * fields the deployed agent's `SessionTokenClaims`
+ * (agent/crates/agent-service/src/config.rs) requires and accepts --
+ * `user_id`, `study_set_id`, `session_id`, `issued_at`, `not_before`,
+ * `expires_at`, `nonce` (matching the deployed agent's own signed-token
+ * mint helper in agent/crates/agent-service/src/app.rs: `not_before` equals `issued_at`,
+ * both taken from this call's own moment). That struct derives
+ * `#[serde(deny_unknown_fields)]` over a closed field set this lane does not
+ * own (Rust capability source under agent/crates), so a run id,
+ * deploy SHA, agent deploy id, or provider mode claim would make the
+ * deployed server reject the whole token as malformed before any provider
+ * work, not merely ignore the extra field -- adding one is not a change this
+ * lane can safely make. `run.runId`, `run.deploySha`, `run.agentDeployId`,
+ * and `run.provider` stay on the returned run object, outside the signed
+ * envelope, alongside the rest of the run's already non-secret
+ * configuration; run/deploy identity binding for this same live-smoke leg is
+ * enforced at a different, already-proven seam instead --
+ * production-release-gate.mjs's `summarizeLiveSmoke` requires exact equality
+ * between the live-smoke evidence's own reported `run_id`/`agent_deploy_id`/
+ * `deploy_sha` fields and `VIVA_RELEASE_RUN_ID`/`VIVA_RELEASE_AGENT_DEPLOY_ID`/
+ * `VIVA_RELEASE_DEPLOY_SHA` before a production release can ever become
+ * `allowed: true` (Task 10, RELEASE-003/007/008). Binding them
  * cryptographically into the verified token itself would require extending
- * that struct (the way `failure_control` is already nested there), which is
- * capability source this lane does not own -- a deferred voice-lane
- * handoff, not silently dropped scope.
+ * that Rust struct (the way `failure_control` is already nested there) --
+ * capability source this lane does not own, a deferred voice-lane handoff,
+ * not silently dropped scope.
  */
 export function materializeHostedLiveSmokeRun(
   run,
@@ -468,6 +479,15 @@ export function materializeHostedLiveSmokeRun(
     user_id: run.identity.user_id,
     study_set_id: run.identity.study_set_id,
     session_id: run.identity.session_id,
+    // ROW 356/RELEASE-021 LIVE DEFECT (fixed here): issued_at/not_before were
+    // missing entirely. config.rs's list of required signed-claim names
+    // requires both -- its claims decoder rejects any claims object
+    // that omits either with MissingClaim, before it even reaches the
+    // issued_at <= not_before < expires_at time-order check. Every hosted
+    // live-smoke token minted without them would have been rejected by any
+    // real deployed agent.
+    issued_at: nowSeconds,
+    not_before: nowSeconds,
     expires_at: nowSeconds + Math.ceil(run.timeoutMs / 1000) + 60,
     nonce: randomUUID(),
   };
@@ -478,6 +498,24 @@ export function materializeHostedLiveSmokeRun(
       VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession(claims, secret),
     },
   };
+}
+
+// ROW 356/RELEASE-021: the one place `main()`'s per-run loop decides what to
+// actually spawn -- extracted so the "mint immediately before this specific
+// run, never earlier" placement is itself directly testable. `now` is a
+// zero-argument PROVIDER, not a raw value: `main()` never captures one
+// timestamp above the loop and threads it through every iteration -- each
+// call here reads `now()` itself, fresh, so a future edit that hoisted the
+// mint back up to plan-construction time (one shared `now` reused across
+// every run) is caught by calling this twice with a provider that changes
+// between calls, the same way real wall-clock time would advance across a
+// slow leading run.
+export function prepareRunForSpawn(run, { env = process.env, now = defaultNowSeconds } = {}) {
+  return run.runner === "live-provider-smoke" ? materializeHostedLiveSmokeRun(run, env, now()) : run;
+}
+
+function defaultNowSeconds() {
+  return Math.floor(Date.now() / 1000);
 }
 
 function uuidFromStableInput(value) {
@@ -619,9 +657,10 @@ async function main() {
     // RELEASE-016/021: mint the live-smoke session capability immediately
     // before this specific run is spawned -- never earlier in the loop, and
     // never at plan construction -- so its TTL is always measured from this
-    // moment, not from however long any preceding run took.
-    const spawnRun =
-      run.runner === "live-provider-smoke" ? materializeHostedLiveSmokeRun(run) : run;
+    // moment, not from however long any preceding run took. No `now` is
+    // captured above this loop and passed in: prepareRunForSpawn's own
+    // default reads the live clock itself, fresh, on every call.
+    const spawnRun = prepareRunForSpawn(run);
     let outcome = await runHostedMonitorCommand(spawnRun, runDir, evidenceArtifactDir);
     const resultRead = await readRunResult(evidenceArtifactDir, run);
     if (outcome.status === "passed" && !resultRead.result) {
@@ -1356,7 +1395,7 @@ function sanitizeRunId(value) {
 // publish screenshots durably must add PNG upload, checksum, redaction,
 // content type, retry, and fetch-after-publish proof together, not resurrect
 // a dormant content-type branch alone.
-function contentTypeFor(file) {
+export function contentTypeFor(file) {
   if (file.endsWith(".json")) return "application/json";
   if (file.endsWith(".log") || file.endsWith(".txt")) return "text/plain; charset=utf-8";
   return "application/octet-stream";

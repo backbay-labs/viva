@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+import { DEFAULT_MAX_EVIDENCE_AGE_SECONDS } from "./production-release-gate.mjs";
 import {
   matrixResultsFromHostedMonitorEvidence,
   readHostedMonitorEvidence,
@@ -299,6 +300,105 @@ test("hosted monitor evidence checks every passed run's deploy ids against the s
   );
 });
 
+test("ROW 337/RELEASE-007: a passed hosted-monitor run with a missing, false, or non-boolean sanitized field fails the whole import closed instead of being silently dropped from results", () => {
+  for (const sanitizedValue of [undefined, false, "yes", 1]) {
+    const run = hostedRun("provider_rate_limited");
+    if (sanitizedValue === undefined) delete run.sanitized;
+    else run.sanitized = sanitizedValue;
+
+    assert.throws(
+      () =>
+        matrixResultsFromHostedMonitorEvidence(hostedManifest({ runs: [run] }), {
+          env: {},
+          now,
+          productionRequested: false,
+          requiredScenarioIds: [],
+        }),
+      /must be sanitized/,
+      `sanitized=${JSON.stringify(sanitizedValue)} must fail closed, not be silently filtered out`,
+    );
+  }
+
+  // A run that never claims "passed" is not a candidate for results at all
+  // -- this row is scoped to the sanitized field specifically, not a general
+  // widening of what counts as a result.
+  assert.doesNotThrow(() =>
+    matrixResultsFromHostedMonitorEvidence(
+      hostedManifest({ runs: [hostedRun("provider_rate_limited", { status: "failed", sanitized: false })] }),
+      { env: {}, now, productionRequested: false, requiredScenarioIds: [] },
+    ),
+  );
+});
+
+test("ROW 337/RELEASE-007: a provider-failure observation entry with a missing, false, or non-boolean sanitized field fails the whole import closed instead of being silently dropped", async () => {
+  const root = await tempRoot();
+  try {
+    for (const sanitizedValue of [undefined, false, "yes", 1]) {
+      const observationsPath = path.join(
+        root,
+        "artifacts/provider-failure-observability/observations.json",
+      );
+      const observation = { query_id: "provider_429", sanitized: true };
+      if (sanitizedValue === undefined) delete observation.sanitized;
+      else observation.sanitized = sanitizedValue;
+      await writeJson(observationsPath, {
+        schema: "viva.provider_failure_observations.v1",
+        generated_at: now.toISOString(),
+        run_id: "release-run-1",
+        observations: [observation],
+        sanitized: true,
+      });
+
+      await assert.rejects(
+        () =>
+          readProviderFailureObservations({
+            env: { VIVA_RELEASE_RUN_ID: "release-run-1" },
+            now,
+            productionRequested: false,
+            requiredQueryIds: [],
+            root,
+          }),
+        /must be sanitized/,
+        `observation sanitized=${JSON.stringify(sanitizedValue)} must fail closed, not be silently filtered out`,
+      );
+    }
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("ROW 337/RELEASE-007: a non-production import of top-level-unsanitized provider-failure observability evidence fails closed", async () => {
+  const root = await tempRoot();
+  try {
+    const observationsPath = path.join(root, "artifacts/provider-failure-observability/observations.json");
+    await writeJson(observationsPath, {
+      schema: "viva.provider_failure_observations.v1",
+      generated_at: now.toISOString(),
+      run_id: "release-run-1",
+      observations: [{ query_id: "provider_429", sanitized: true }],
+      sanitized: false,
+    });
+
+    // Unlike the manifest/run/observation-entry checks above, this is proof
+    // that the *existing* top-level throw (release-evidence-imports.mjs's
+    // `if (evidence.sanitized !== true)`) actually executes -- it was never
+    // exercised by any prior test, production-required or not.
+    await assert.rejects(
+      () =>
+        readProviderFailureObservations({
+          env: { VIVA_RELEASE_RUN_ID: "release-run-1" },
+          now,
+          productionRequested: false,
+          requiredQueryIds: [],
+          root,
+        }),
+      /provider failure observations must be sanitized/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test("provider failure observations are required for production release checks", async () => {
   const root = await tempRoot();
   try {
@@ -312,6 +412,130 @@ test("provider failure observations are required for production release checks",
           root,
         }),
       /provider failure observations are required/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("ROW 341/RELEASE-011: the hosted-monitor import rejection boundary's default staleness window is the exact same DEFAULT_MAX_EVIDENCE_AGE_SECONDS constant the release gate uses, not an independently-declared duplicate that happens to share its value", async () => {
+  const root = await tempRoot();
+  try {
+    const manifestPath = path.join(root, "artifacts/hosted-monitor/pr/release-run-1/manifest.json");
+    // One second past the shared canonical default -- if the rejection
+    // boundary declared its own duplicate literal (even a byte-identical
+    // one), this could still drift from the real constant on any future
+    // edit; a genuinely shared import cannot.
+    await writeJson(
+      manifestPath,
+      hostedManifest({
+        run_id: "release-run-1",
+        generated_at: new Date(now.getTime() - (DEFAULT_MAX_EVIDENCE_AGE_SECONDS + 1) * 1000).toISOString(),
+      }),
+    );
+
+    await assert.rejects(
+      () =>
+        readHostedMonitorEvidence({
+          env: {
+            VIVA_RELEASE_RUN_ID: "release-run-1",
+            VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath,
+          },
+          mode: "production",
+          now,
+          productionRequested: true,
+          root,
+        }),
+      /hosted monitor manifest is stale/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("ROW 341/RELEASE-011: only VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS -- the same override the bundle and gate honor -- controls the hosted-monitor import's staleness window; the old, wrong-priority VIVA_RELEASE_HOSTED_MONITOR_MAX_AGE_SECONDS no longer has any effect", async () => {
+  const root = await tempRoot();
+  try {
+    const manifestPath = path.join(root, "artifacts/hosted-monitor/pr/release-run-1/manifest.json");
+    // Two hours old: stale under the default 24h window only if the default
+    // were far shorter, so exercise it against a tight canonical override
+    // instead, honored identically to the gate/bundle seams.
+    await writeJson(
+      manifestPath,
+      hostedManifest({
+        run_id: "release-run-1",
+        generated_at: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+      }),
+    );
+
+    // Before the fix: VIVA_RELEASE_HOSTED_MONITOR_MAX_AGE_SECONDS took
+    // priority over VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS, so this stale
+    // manifest would have passed under the huge, irrelevant legacy value
+    // instead of correctly failing under the canonical one-hour override.
+    await assert.rejects(
+      () =>
+        readHostedMonitorEvidence({
+          env: {
+            VIVA_RELEASE_RUN_ID: "release-run-1",
+            VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath,
+            VIVA_RELEASE_HOSTED_MONITOR_MAX_AGE_SECONDS: "999999",
+            VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS: "3600",
+          },
+          mode: "production",
+          now,
+          productionRequested: true,
+          root,
+        }),
+      /hosted monitor manifest is stale/,
+    );
+
+    // The same override, honored, also lets a manifest older than the
+    // *default* pass -- proving VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS is
+    // genuinely read, not merely that the legacy variable is ignored.
+    const manifest = await readHostedMonitorEvidence({
+      env: {
+        VIVA_RELEASE_RUN_ID: "release-run-1",
+        VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath,
+        VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS: String(3 * 60 * 60),
+      },
+      mode: "production",
+      now,
+      productionRequested: true,
+      root,
+    });
+    assert.equal(manifest.run_id, "release-run-1");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("ROW 341/RELEASE-011: the same canonical VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS override governs provider-failure observation staleness", async () => {
+  const root = await tempRoot();
+  try {
+    const observationsPath = path.join(root, "artifacts/provider-failure-observability/observations.json");
+    await writeJson(observationsPath, {
+      schema: "viva.provider_failure_observations.v1",
+      generated_at: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+      run_id: "release-run-1",
+      observations: [{ query_id: "provider_429", sanitized: true }],
+      sanitized: true,
+    });
+
+    await assert.rejects(
+      () =>
+        readProviderFailureObservations({
+          env: {
+            VIVA_RELEASE_RUN_ID: "release-run-1",
+            VIVA_RELEASE_PROVIDER_FAILURE_OBSERVATIONS_PATH: observationsPath,
+            VIVA_RELEASE_HOSTED_MONITOR_MAX_AGE_SECONDS: "999999",
+            VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS: "3600",
+          },
+          now,
+          productionRequested: false,
+          requiredQueryIds: [],
+          root,
+        }),
+      /provider failure observations is stale/,
     );
   } finally {
     await rm(root, { force: true, recursive: true });
