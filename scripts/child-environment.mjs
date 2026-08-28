@@ -129,7 +129,10 @@ const ROLE_EXPLICIT_KEYS = Object.freeze({
     "VIVA_VOICE_WS_ALLOWED_ORIGINS",
   ]),
   // e2e-browser.mjs (local, non-hosted mode only): the local `bun run --cwd
-  // apps/web dev` child it supervises itself.
+  // apps/web build` then `bun run --cwd apps/web start` children it
+  // supervises itself (W07-PROD-WEB / A-44.2: production-shaped, replacing
+  // `next dev` -- both the one-shot build and the started server share this
+  // role's environment).
   //
   // W-07: the server-side keys below are the merged D-07 Branch A landing
   // contract's own configuration. Without them the landing's library row
