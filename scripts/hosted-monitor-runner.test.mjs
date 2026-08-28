@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,11 +14,13 @@ import {
   applyHostedLiveMonitorState,
   buildHostedMonitorPlan,
   buildObjectKey,
+  contentTypeFor,
   hostedMonitorChildEnv,
   isPublishableHostedArtifact,
   isRejectedHostedArtifact,
   materializeHostedLiveSmokeRun,
   normalizeHostedUrl,
+  prepareRunForSpawn,
   publishableHostedFiles,
   publishHostedEvidence,
   putS3Object,
@@ -358,16 +361,13 @@ test("hosted monitor resolves durable state and schedules bounded live smoke on 
   assert.equal(liveSessionClaims.study_set_id, "live-monitor-study-set");
   assert.equal(liveSessionClaims.user_id, "synthetic-live-monitor-user");
   assert.equal(typeof liveSessionClaims.nonce, "string");
-  // The signed claims carry exactly the fields the deployed agent's
-  // `SessionTokenClaims` (agent/crates/agent-service/src/config.rs) accepts
-  // -- that struct derives `#[serde(deny_unknown_fields)]`, so a run id,
-  // deploy SHA, agent deploy id, or provider mode claim would make the
-  // deployed server reject the whole token as malformed before any provider
-  // work. Run/deploy/provider binding for audit lives on the materialized
-  // run object instead, outside the signed envelope.
+  // Exactly the deployed agent's required SessionTokenClaims fields (ROW 356:
+  // issued_at/not_before were previously missing here entirely -- see the
+  // "signs only claims..." test below and materializeHostedLiveSmokeRun's
+  // own adjudication comment).
   assert.deepEqual(
     Object.keys(liveSessionClaims).sort(),
-    ["expires_at", "nonce", "session_id", "study_set_id", "user_id"],
+    ["expires_at", "issued_at", "nonce", "not_before", "session_id", "study_set_id", "user_id"],
   );
   assert.equal(materialized.runId, plan.runId);
   assert.equal(materialized.deploySha, "abc123hostedsha");
@@ -509,15 +509,13 @@ test("materializeHostedLiveSmokeRun requires the signing secret and never leaks 
 });
 
 test("materializeHostedLiveSmokeRun signs only claims the deployed agent's SessionTokenClaims wire format accepts", () => {
-  // agent/crates/agent-service/src/config.rs's `SessionTokenClaims` derives
-  // `#[serde(deny_unknown_fields)]` over exactly `user_id`, `study_set_id`,
-  // `session_id`, `expires_at`, `nonce`, and an optional `failure_control`
-  // this runner never sets. Any other claim -- a run id, deploy SHA, agent
-  // deploy id, or provider mode -- makes the deployed server's
-  // `SessionTokenClaims::verify` reject the whole token as malformed
-  // (`session_auth_failed`) before any provider work, not merely ignore the
-  // extra field. This pins the exact accepted key set so a future change
-  // cannot silently reintroduce an unparseable claim.
+  // config.rs's SessionTokenClaims derives deny_unknown_fields over exactly
+  // these 7 required names plus optional failure_control (unset here); a
+  // claims object missing any of the 7, or carrying an extra one (a run id,
+  // deploy SHA, agent deploy id, or provider mode), is rejected before any
+  // provider work. Cross-checked against the real Rust source below so the
+  // two cannot silently drift the way ROW 356 found issued_at/not_before
+  // already had.
   const secretEnv = { VIVA_VOICE_SESSION_TOKEN_SECRET: "the-signing-secret" };
   const run = fixtureLiveSmokeRun();
 
@@ -527,17 +525,105 @@ test("materializeHostedLiveSmokeRun signs only claims the deployed agent's Sessi
     secretEnv.VIVA_VOICE_SESSION_TOKEN_SECRET,
   );
 
-  assert.deepEqual(
-    Object.keys(claims).sort(),
-    ["expires_at", "nonce", "session_id", "study_set_id", "user_id"],
-  );
+  const requiredClaimNames =
+    "expires_at,issued_at,nonce,not_before,session_id,study_set_id,user_id".split(",");
+  assert.deepEqual(Object.keys(claims).sort(), requiredClaimNames);
   for (const forbiddenClaim of ["run_id", "deploy_sha", "agent_deploy_id", "provider_mode"]) {
-    assert.equal(
-      forbiddenClaim in claims,
-      false,
-      `signed claims must never carry ${forbiddenClaim} -- the deployed SessionTokenClaims struct rejects it`,
-    );
+    assert.equal(forbiddenClaim in claims, false, `must never carry ${forbiddenClaim}`);
   }
+
+  // Cross-file drift guard: reads config.rs's own
+  // SESSION_TOKEN_REQUIRED_CLAIM_NAMES directly, rather than re-trusting the
+  // comment above.
+  const configRs = readFileSync(
+    new URL("../agent/crates/agent-service/src/config.rs", import.meta.url),
+    "utf8",
+  );
+  const requiredMatch = configRs.match(
+    /const SESSION_TOKEN_REQUIRED_CLAIM_NAMES: &\[&str\] = &\[([^\]]+)\];/,
+  );
+  assert(requiredMatch, "could not locate SESSION_TOKEN_REQUIRED_CLAIM_NAMES in config.rs");
+  const rustRequiredClaimNames = [...requiredMatch[1].matchAll(/"([a-z_]+)"/g)]
+    .map((match) => match[1])
+    .sort();
+  assert.deepEqual(rustRequiredClaimNames, requiredClaimNames);
+});
+
+// ROW 356/RELEASE-021: main()'s per-run loop is not exported, so nothing
+// could previously prove *where* the live-smoke mint happened -- only that
+// materializeHostedLiveSmokeRun itself, called directly and in isolation,
+// used whatever nowSeconds it was handed. This exercises the actual
+// extracted call site the loop now delegates to, with an injected clock
+// PROVIDER that changes between calls -- proving each call reads it fresh,
+// per call, the way real elapsed wall-clock time would. A future edit that
+// hoisted the mint to plan time (reading `now()` once, sharing that one
+// value across every run) would make both calls below observe the same
+// clock value and fail the `notEqual`.
+test("ROW 356/RELEASE-021: prepareRunForSpawn reads its clock provider fresh on every call, so hoisting the live-smoke mint to plan time (one shared now for every run) is caught", () => {
+  const clockValues = [1_000, 5_000]; // simulates ~66 minutes elapsing before the second run spawns
+  let callCount = 0;
+  const now = () => {
+    callCount += 1;
+    return clockValues[callCount - 1];
+  };
+  const env = { VIVA_VOICE_SESSION_TOKEN_SECRET: "the-signing-secret" };
+  const run = fixtureLiveSmokeRun();
+
+  const first = prepareRunForSpawn(run, { env, now });
+  const second = prepareRunForSpawn(run, { env, now });
+
+  const firstClaims = decodedSignedSession(first.env.VIVA_LIVE_SMOKE_SESSION_TOKEN, env.VIVA_VOICE_SESSION_TOKEN_SECRET);
+  const secondClaims = decodedSignedSession(second.env.VIVA_LIVE_SMOKE_SESSION_TOKEN, env.VIVA_VOICE_SESSION_TOKEN_SECRET);
+
+  assert.equal(callCount, 2, "each call must read the clock provider itself, exactly once");
+  assert.equal(firstClaims.issued_at, 1_000);
+  assert.equal(secondClaims.issued_at, 5_000);
+  assert.notEqual(
+    firstClaims.expires_at,
+    secondClaims.expires_at,
+    "a plan-time hoist would call now() once and share one expires_at across every run",
+  );
+  // Single-use at this seam too (not only when materializeHostedLiveSmokeRun
+  // is called directly, above): each spawn-time mint gets its own fresh nonce.
+  assert.notEqual(firstClaims.nonce, secondClaims.nonce, "each spawn-time mint must use a fresh nonce");
+
+  // A non-live-smoke run is passed through untouched, at neither call site's
+  // clock cost -- prepareRunForSpawn's own contract for the non-materializing
+  // branch.
+  const otherRun = fixtureLiveSmokeRun({ runner: "hosted-e2e-matrix" });
+  assert.equal(prepareRunForSpawn(otherRun, { env, now }), otherRun);
+});
+
+// The behavioral test above proves the extracted seam itself is correct
+// when called fresh, per iteration -- it says nothing about whether main()'s
+// loop actually calls it that way, since main() is not exported. This closes
+// that remaining gap: no local variable capturing a "now" (a raw
+// Math.floor(Date.now()/1000) or a captured provider) exists anywhere ahead
+// of the per-run loop for prepareRunForSpawn to be handed -- the loop calls
+// it with no second argument at all, so every call gets prepareRunForSpawn's
+// own live default, read fresh, in that call.
+test("ROW 356/RELEASE-021: main()'s per-run loop calls prepareRunForSpawn with no captured/hoisted now argument", () => {
+  const source = readFileSync(new URL("./hosted-monitor-runner.mjs", import.meta.url), "utf8");
+  const mainStart = source.indexOf("async function main()");
+  assert.notEqual(mainStart, -1);
+  const loopStart = source.indexOf("for (const run of plan.runs)", mainStart);
+  assert.notEqual(loopStart, -1);
+  const preLoopSource = source.slice(mainStart, loopStart);
+  // Not a blanket ban on Date.now() text (the unrelated publish-deadline
+  // computation above the loop legitimately uses it) -- specifically, no
+  // *declared local variable* whose name reads as a clock/now value or
+  // provider exists for prepareRunForSpawn to be handed instead of its own
+  // live default.
+  assert.doesNotMatch(
+    preLoopSource,
+    /\bconst\s+\w*[Nn]ow\w*\s*=/,
+    "main() must not capture a clock value or provider above the per-run loop",
+  );
+  const loopSource = source.slice(loopStart);
+  assert.match(loopSource, /const spawnRun = prepareRunForSpawn\(run\);/);
+  // The one call site itself passes no second argument -- every call gets
+  // prepareRunForSpawn's own live default, not something main() threads in.
+  assert.doesNotMatch(loopSource, /prepareRunForSpawn\(run,/);
 });
 
 test("the resolved plan's decision/matrix state and the materialized run's hosted summary pass redaction audit against a hostile parent", async () => {
@@ -1795,6 +1881,17 @@ test("hosted monitor only publishes text evidence files", async () => {
     assert.equal(isPublishableHostedArtifact("result.json"), true);
     assert.equal(isPublishableHostedArtifact("e2e.stdout.log"), true);
     assert.equal(isPublishableHostedArtifact("source-folio.png"), false);
+    // ROW 682/RELEASE-025: the dead image/png content-type branch's absence
+    // was comment-only until now -- a PNG (never reachable via
+    // publishableHostedFiles above, but contentTypeFor's own contract) must
+    // still fall through to the generic binary type, not image/png.
+    assert.equal(contentTypeFor("source-folio.png"), "application/octet-stream");
+    // ROW 475/QLT-06: putS3Object's abort deadline must stay referenced --
+    // an unref'd timer let Node 24's event loop end before it fired.
+    const src = readFileSync(new URL("./hosted-monitor-runner.mjs", import.meta.url), "utf8");
+    const decl = src.indexOf("const timeout = setTimeout(() => controller.abort(), timeoutMs);");
+    assert.notEqual(decl, -1, "the abort timer declaration must exist for the unref pin to bind");
+    assert.doesNotMatch(src.slice(decl, src.indexOf("clearTimeout(timeout)", decl)), /timeout\.unref/);
     assert.equal(isRejectedHostedArtifact("trace.zip"), true);
     assert.equal(isRejectedHostedArtifact("trace.tar"), true);
     assert.equal(isRejectedHostedArtifact("trace.tgz"), true);

@@ -1,7 +1,11 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-const DEFAULT_MAX_EVIDENCE_AGE_SECONDS = 24 * 60 * 60;
+import {
+  DEFAULT_MAX_EVIDENCE_AGE_SECONDS,
+  positiveIntegerOrDefault,
+} from "./production-release-gate.mjs";
+
 const PROVIDER_FAILURE_OBSERVATIONS_SCHEMA = "viva.provider_failure_observations.v1";
 const HOSTED_MONITOR_SCHEMA = "viva.hosted_monitor_run.v1";
 
@@ -48,12 +52,23 @@ export function matrixResultsFromHostedMonitorEvidence(
   const requiredScenarioIdSet = new Set(requiredScenarioIds);
   const expectedDeployIds = releaseDeployIdsFromEnv(env);
   const runs = Array.isArray(manifest.runs) ? manifest.runs : [];
-  const passedRuns = runs.filter(
-    (run) =>
-      run?.status === "passed" &&
-      run.sanitized === true &&
-      typeof run.scenario_id === "string" &&
-      run.scenario_id.length > 0,
+  const passedRunCandidates = runs.filter((run) => run?.status === "passed");
+  // ROW 337/RELEASE-007: a passed run's sanitized field must fail the whole
+  // import closed when missing, false, or any non-boolean value -- never be
+  // silently dropped from `results`. A silent drop here could mask exactly
+  // why a producer stopped emitting an expected scenario (indistinguishable
+  // from that scenario simply never having run), while every other imported
+  // artifact level (the manifest itself, provider-failure observation
+  // entries below) already fails closed the same way.
+  for (const run of passedRunCandidates) {
+    if (run.sanitized !== true) {
+      throw new Error(
+        `hosted monitor run for scenario ${run.scenario_id ?? "<unknown>"} must be sanitized`,
+      );
+    }
+  }
+  const passedRuns = passedRunCandidates.filter(
+    (run) => typeof run.scenario_id === "string" && run.scenario_id.length > 0,
   );
 
   if (productionRequested) {
@@ -134,16 +149,21 @@ export async function readProviderFailureObservations({
   if (evidence.sanitized !== true) {
     throw new Error("provider failure observations must be sanitized");
   }
-  const observations = Array.isArray(evidence.observations)
-    ? evidence.observations
-        .filter(
-          (entry) =>
-            entry?.sanitized === true &&
-            typeof entry.query_id === "string" &&
-            entry.query_id.length > 0,
-        )
-        .map((entry) => ({ ...entry }))
-    : [];
+  const rawObservations = Array.isArray(evidence.observations) ? evidence.observations : [];
+  // ROW 337/RELEASE-007: same fail-closed rule as the hosted-monitor run
+  // level above -- a missing, false, or non-boolean sanitized field on an
+  // individual observation entry must reject the whole import, not be
+  // silently dropped from the returned list.
+  for (const entry of rawObservations) {
+    if (entry?.sanitized !== true) {
+      throw new Error(
+        `provider failure observation ${entry?.query_id ?? "<unknown>"} must be sanitized`,
+      );
+    }
+  }
+  const observations = rawObservations
+    .filter((entry) => typeof entry.query_id === "string" && entry.query_id.length > 0)
+    .map((entry) => ({ ...entry }));
 
   if (productionRequested) {
     const observedQueryIds = new Set(observations.map((entry) => entry.query_id));
@@ -255,14 +275,20 @@ function releaseDeployIdsFromEnv(env) {
   };
 }
 
+// ROW 341/RELEASE-011: the exact same override name, default constant, and
+// positive-integer parser the release bundle (release-check-core.mjs's
+// buildReleaseGateEvidence) and production gate (production-release-gate.mjs's
+// buildProductionReleaseGateEvidence) both use -- this import rejection
+// boundary is a fourth seam over the same freshness policy, not an
+// independent one. There is deliberately no second, hosted-monitor-specific
+// override: RELEASE-011 named exactly this drift (a fourth inconsistently-
+// hardcoded default, and a variable an operator's real
+// VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS override could not reach).
 function maxEvidenceAgeSeconds(env) {
-  const value = Number.parseInt(
-    env.VIVA_RELEASE_HOSTED_MONITOR_MAX_AGE_SECONDS ??
-      env.VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS ??
-      "",
-    10,
+  return positiveIntegerOrDefault(
+    env.VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS,
+    DEFAULT_MAX_EVIDENCE_AGE_SECONDS,
   );
-  return Number.isInteger(value) && value > 0 ? value : DEFAULT_MAX_EVIDENCE_AGE_SECONDS;
 }
 
 async function readOptionalJson(file) {

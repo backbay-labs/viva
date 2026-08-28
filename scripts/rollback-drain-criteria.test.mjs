@@ -342,6 +342,55 @@ test("rollback drain coverage names only states the validated learner-loop contr
 });
 
 
+// ROWS 339/672, RELEASE-009: rollback-drain-criteria.mjs calls the shared
+// assertNoForbiddenEvidenceMarkers producer/consumer scanner at four sites
+// (rollbackCriteriaEvidence, evaluateRollbackDecision, buildRollbackReleaseEvidence,
+// assertRollbackReleaseGate). Every prior test here only proved a *clean*
+// input produces clean output (`doesNotMatch`); none ever proved a poisoned
+// input actually gets rejected -- so deleting the call at any of the four
+// sites left every test in this file green. These two tests exercise the
+// two sites that take real caller-controlled data with an unconstrained
+// echo surface, using the canonical markers RELEASE-009's proof requirement
+// names by example.
+for (const marker of ["pcm16_base64", "CARTESIA_API_KEY"]) {
+  test(`ROWS 339/672, RELEASE-009: buildRollbackReleaseEvidence rejects a poisoned env value carrying the canonical forbidden marker ${marker}`, () => {
+    assert.throws(
+      () =>
+        buildRollbackReleaseEvidence({
+          env: { VIVA_RELEASE_OWNER: `hostile owner name embedding ${marker}` },
+          generatedAt: new Date("2026-06-25T00:00:00Z"),
+        }),
+      new RegExp(`forbidden payload marker: ${marker}`),
+    );
+  });
+
+  test(`ROWS 339/672, RELEASE-009: assertRollbackReleaseGate rejects a poisoned evidence object carrying the canonical forbidden marker ${marker}, even when every other gate condition is satisfied`, () => {
+    // A real, clean, non-production evidence object -- assertRollbackReleaseGate's
+    // production-blocked branch only throws when production_requested is
+    // true, so a non-production evidence reaches the shared marker check
+    // regardless of `allowed`, proving this call site specifically (not
+    // merely the production-blocked throw a few lines above it).
+    const evidence = buildRollbackReleaseEvidence({
+      env: {
+        VIVA_WEB_DEPLOY_ID: "generic-web-deploy",
+        VIVA_AGENT_DEPLOY_ID: "generic-agent-deploy",
+        VIVA_AGENT_PROVIDER: "fake_cartesia_gemini",
+      },
+      generatedAt: new Date("2026-06-25T00:00:00Z"),
+    });
+    assert.equal(evidence.production_release_gate.production_requested, false);
+    assert.doesNotThrow(() => assertRollbackReleaseGate(evidence));
+
+    const poisoned = JSON.parse(JSON.stringify(evidence));
+    poisoned.production_snapshot.web_deploy_id = `hostile-value-${marker}`;
+
+    assert.throws(
+      () => assertRollbackReleaseGate(poisoned),
+      new RegExp(`forbidden payload marker: ${marker}`),
+    );
+  });
+}
+
 // RELEASE-028 bypass control: this consumer's own hostile variant. If the
 // published validator ever stopped rejecting unknown keys, this test fails
 // here rather than letting an unchecked state reach the gate.

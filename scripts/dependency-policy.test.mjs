@@ -149,6 +149,38 @@ test("root package.json exposes fail-closed audit scripts and validate runs them
   );
 });
 
+// ROW 475/QLT-06: "Supported Node runtime is pinned" -- the required proof's
+// local-repository half. .github/workflows/validate.yml (HARNESS-W07
+// ownership, not modified here -- only read below, the same read-only
+// drift-guard pattern hosted-monitor-runner.test.mjs uses against
+// agent/crates/agent-service/src/config.rs) already pins `node-version: 24`
+// in CI; nothing pinned it for a local developer/nvm session until now.
+//
+// The row's ledger proof text also names "hosted reproduction passes": that
+// is `RELEASE-027`'s GitHub Actions job (plan ~:423-429) actually re-running
+// scripts/hosted-monitor-state.test.mjs/hosted-monitor-runner.test.mjs on a
+// Node-24 GitHub-hosted runner, which is HARNESS-W07's CI-workflow file, not
+// anything this local worktree can invoke or observe -- DEFERRED, reported
+// as an external/CI-hosted routing item, not delivered here.
+test("ROW 475/QLT-06: the supported Node runtime is pinned locally (.nvmrc and package.json engines.node), matching the workflow's Node 24", async () => {
+  const nvmrc = (await readFile(join(root, ".nvmrc"), "utf8")).trim();
+  assert.equal(nvmrc, "24");
+
+  const rootPackage = await readJson("package.json");
+  assert.equal(rootPackage.engines?.node, "24.x");
+
+  // Read-only cross-check against the actual CI pin, so "matching the
+  // workflow's Node 24" is a verified fact, not just an unread claim.
+  const workflow = await readText(".github/workflows/validate.yml");
+  const nodeVersionPins = [...workflow.matchAll(/node-version:\s*["']?(\S+?)["']?\s*$/gm)].map(
+    (match) => match[1],
+  );
+  assert(nodeVersionPins.length > 0, "validate.yml has no node-version pin to compare against");
+  for (const pin of nodeVersionPins) {
+    assert.equal(pin, "24", `validate.yml node-version drifted from the local .nvmrc/engines.node pin: ${pin}`);
+  }
+});
+
 test("root dev dependencies carry the exact pins the program depends on", async () => {
   const rootPackage = await readJson("package.json");
   const devDependencies = rootPackage.devDependencies ?? {};

@@ -12,6 +12,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  assertFreshProductionEvidence,
   assertProductionReleaseGate,
   assertReleaseBundleIntegrity,
 } from "./production-release-gate.mjs";
@@ -51,7 +52,7 @@ const EXPECTED_IDENTITY_FIELDS = Object.freeze([
  * Strictly verify a stored release evidence bundle from a fresh caller
  * environment. Throws on any failure; never mutates `evidence`.
  */
-export function verifyReleaseBundleEvidence(evidence, { env = process.env } = {}) {
+export function verifyReleaseBundleEvidence(evidence, { env = process.env, now = new Date() } = {}) {
   const gate = evidence?.production_release_gate ?? null;
   const productionRequested = gate?.production_requested === true;
 
@@ -59,6 +60,10 @@ export function verifyReleaseBundleEvidence(evidence, { env = process.env } = {}
   assertProductionReleaseGate(evidence, { env });
 
   if (productionRequested) {
+    // ROW 341/RELEASE-011: re-verify age against *this* verification's own
+    // now, independent of the stored (generation-time) `gate.allowed` --
+    // see assertFreshProductionEvidence's own comment.
+    assertFreshProductionEvidence(evidence, { env, now });
     for (const field of EXPECTED_IDENTITY_FIELDS) {
       assertIdentityFieldMatches(field, gate, env);
     }

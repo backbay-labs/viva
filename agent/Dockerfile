@@ -12,10 +12,20 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates clang cmake pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates ./crates
-COPY fixtures ./fixtures
-COPY migrations ./migrations
+# ROW 365/529/685 LIVE DEFECT (fixed here): agent-domain's lib.rs reaches
+# four directories up via include_str! to read
+# packages/core/src/learner-loop-contract.json -- a sibling of agent/, not
+# reachable from a build context scoped to agent/ alone (Docker refuses a
+# COPY that steps outside its context). The build context is the repository
+# root now (see the build command in docs/deployment-runbook.md and
+# scripts/container-runtime-smoke.mjs); every source COPY below is prefixed
+# accordingly, and packages/core is copied to the exact absolute path that
+# same four-levels-up traversal resolves to from /app/crates/agent-domain/src.
+COPY agent/Cargo.toml agent/Cargo.lock agent/rust-toolchain.toml ./
+COPY agent/crates ./crates
+COPY agent/fixtures ./fixtures
+COPY agent/migrations ./migrations
+COPY packages/core /packages/core
 
 RUN cargo build --manifest-path Cargo.toml --release -p agent-service
 

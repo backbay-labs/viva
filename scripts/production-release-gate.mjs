@@ -162,6 +162,41 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
   };
 }
 
+// ROW 341/RELEASE-011: `gate.allowed`/`gate.evidence_age_seconds` are computed
+// once, at bundle-generation time, and then stored -- a downstream verifier
+// that only checks the stored `gate.allowed` (scripts/verify-release-bundle.mjs,
+// before this) never re-examines whether the bundle is *still* fresh as of
+// its own, later "now". This recomputes staleness independently, against the
+// caller's own injected `now` and the same canonical
+// `VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS` override every other freshness seam
+// (the release_gate summary, the production gate itself, the hosted-monitor
+// import boundary) honors -- so a bundle that was fresh when generated but
+// has since aged past the window is rejected at verification time even
+// though its stored `gate.allowed` still says `true`.
+export function assertFreshProductionEvidence(evidence, { env = process.env, now = new Date() } = {}) {
+  const generatedAt = parseDate(evidence?.generated_at);
+  if (generatedAt === null) {
+    throw new Error(
+      "release bundle verification requires a valid evidence generated_at timestamp",
+    );
+  }
+  const observedAt = now instanceof Date ? now : new Date(now);
+  const maxAgeSeconds = positiveIntegerOrDefault(
+    env.VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS,
+    DEFAULT_MAX_EVIDENCE_AGE_SECONDS,
+  );
+  const ageSeconds = Math.floor((observedAt.getTime() - generatedAt.getTime()) / 1000);
+  if (ageSeconds < 0) {
+    throw new Error("release bundle verification failed: evidence generated_at is future-dated");
+  }
+  if (ageSeconds > maxAgeSeconds) {
+    throw new Error(
+      `release bundle verification failed: evidence is stale at verification time (age_seconds=${ageSeconds}, max_age_seconds=${maxAgeSeconds})`,
+    );
+  }
+  return { age_seconds: ageSeconds, max_age_seconds: maxAgeSeconds };
+}
+
 export function assertProductionReleaseGate(evidence, { env = process.env } = {}) {
   const gate = evidence?.production_release_gate ?? evidence;
   if (gate?.schema !== PRODUCTION_RELEASE_GATE_SCHEMA) {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { containerRuntimeSmokeSteps } from "./container-runtime-smoke.mjs";
 
 const RUNBOOK_PATH = "docs/deployment-runbook.md";
 
@@ -330,6 +331,9 @@ test("deployment runbook covers the beta operating path and stop rules", async (
     "never silently downgraded",
     "sha256-self",
     "wrong secret, or any tamper",
+    "stale at verification time",
+    "VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS",
+    "future-dated",
     "rejected exactly like a tampered one",
     "verification failure, never a silently skipped check",
     "assertProductionReleaseGate",
@@ -419,7 +423,16 @@ test("RELEASE-004: downstream bundle verification is wired as a package script",
   assert.equal(packageJson.scripts["release:verify"], "node scripts/verify-release-bundle.mjs");
 });
 
-test("hosted monitor agent targets can deploy from the agent directory", async () => {
+// ROWS 365/529/685 LIVE DEFECT fix: agent/Dockerfile targets the agent
+// service, but `docker build -f agent/Dockerfile agent` (the plan's original
+// build-context recipe) can never succeed -- agent-domain's include_str! of
+// packages/core/src/learner-loop-contract.json reaches outside a context
+// scoped to agent/ alone. The Dockerfile now requires the repository root as
+// its build context (see the real command in container-runtime-smoke.mjs and
+// docs/deployment-runbook.md); this test pins that its COPY sources are
+// repo-root-relative, not agent-directory-relative, so a future edit cannot
+// silently revert to the broken agent-only recipe.
+test("hosted monitor agent Dockerfile targets the agent service and requires the repository root as its build context, not the agent directory alone", async () => {
   const dockerfile = await readFile("agent/Dockerfile", "utf8");
   assert.match(dockerfile, /cargo build --manifest-path Cargo\.toml --release -p agent-service/);
   assert.match(
@@ -427,10 +440,41 @@ test("hosted monitor agent targets can deploy from the agent directory", async (
     /VIVA_AGENT_BIND_ADDR=\$\{VIVA_AGENT_BIND_ADDR:-0\.0\.0\.0:\$\{PORT:-4318\}\}/,
   );
   assert.doesNotMatch(dockerfile, /Dockerfile\.monitor|hosted:monitor/);
+  // Repo-root-relative COPY sources: `docker build -f agent/Dockerfile agent`
+  // cannot provide these paths, only `docker build -f agent/Dockerfile .` can.
+  assert.match(dockerfile, /^COPY agent\/Cargo\.toml agent\/Cargo\.lock agent\/rust-toolchain\.toml/m);
+  assert.match(dockerfile, /^COPY agent\/crates /m);
+  assert.match(dockerfile, /^COPY packages\/core /m);
   // RELEASE-026: pinned digests and a non-root runtime user.
   assert.match(dockerfile, /^FROM rust:1\.94\.1-slim-bookworm@sha256:[0-9a-f]{64} AS builder$/m);
   assert.match(dockerfile, /^FROM debian:bookworm-slim@sha256:[0-9a-f]{64} AS runtime$/m);
   assert.match(dockerfile, /\nUSER 10001:10001\s*\n/);
+});
+
+// ROWS 365/529/685: the runbook's hand-written example commands must not
+// drift from scripts/container-runtime-smoke.mjs's own step definitions --
+// the actually-executed source of truth (see its own comment on why the
+// build context and tmpfs uid/gid are what they are).
+test("ROWS 365/529/685: the runbook's container-supply-chain commands match container-runtime-smoke.mjs's real steps", async () => {
+  const runbook = await readFile(RUNBOOK_PATH, "utf8");
+  const section = requiredSection(runbook, "### Container supply chain (RELEASE-026)")
+    // The runbook line-wraps long commands with a trailing `\` continuation;
+    // collapse that back to the single-line form containerRuntimeSmokeSteps
+    // itself produces before comparing.
+    .replaceAll(/ \\\n\s*/g, " ");
+  const steps = containerRuntimeSmokeSteps();
+  for (const step of steps) {
+    // The runbook renders this as a human-typed shell line: any arg
+    // containing a space (only ever the trailing `-c` shell predicate) is
+    // single-quoted there, unlike the bare argv array containerRuntimeSmokeSteps
+    // itself returns.
+    const shellForm = step.args.map((arg) => (arg.includes(" ") ? `'${arg}'` : arg)).join(" ");
+    assert.match(
+      section,
+      new RegExp(escapeRegExp(shellForm)),
+      `runbook is missing or drifted from the real ${step.id} command`,
+    );
+  }
 });
 
 function requiredSection(markdown, heading) {

@@ -1,0 +1,15 @@
+# ROWS 365/529/685, RELEASE-026: both agent/Dockerfile and Dockerfile.monitor
+# build from the repository root so agent-domain's include_str! of
+# packages/core/src/learner-loop-contract.json is inside the build context.
+# Without this file, that context is the entire checkout -- multiple
+# gigabytes of host-only Rust/JS build output the images never need.
+node_modules
+**/node_modules
+agent/target
+.git
+artifacts
+.next
+**/.next
+.turbo
+dist
+coverage

@@ -10,19 +10,26 @@ import {
   assertReleaseBundleIntegrity,
   buildProductionReleaseGateEvidence,
   buildReleaseBundleIntegrity,
+  DEFAULT_MAX_EVIDENCE_AGE_SECONDS,
   finalizeReleaseEvidenceBundle,
 } from "./production-release-gate.mjs";
 import { verifyReleaseBundleEvidence } from "./verify-release-bundle.mjs";
 
 const SHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const GENERATED_AT = new Date("2026-06-25T00:30:00.000Z");
+// ROW 341/RELEASE-011: the verifier now independently re-checks freshness
+// against its own "now" (see assertFreshProductionEvidence), so every fixed-
+// GENERATED_AT bundle below verifies at a fixed, nearby "verification
+// happened shortly after generation" instant -- never real Date.now(), which
+// only drifts further from GENERATED_AT with every day this suite runs.
+const VERIFY_NOW = new Date(GENERATED_AT.getTime() + 5 * 60 * 1000);
 const AGENT_IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const MONITOR_IMAGE_DIGEST = `sha256:${"b".repeat(64)}`;
 
 test("RELEASE-004: verifies a correctly signed, exactly-identity-matched production bundle and returns a sanitized summary", () => {
   const evidence = productionBundle();
 
-  const summary = verifyReleaseBundleEvidence(evidence, { env: productionEnv() });
+  const summary = verifyReleaseBundleEvidence(evidence, { env: productionEnv(), now: VERIFY_NOW });
 
   assert.equal(summary.schema, "viva.release_bundle_verification.v1");
   assert.equal(summary.verified, true);
@@ -95,7 +102,9 @@ test("RELEASE-004: rejects a correct HMAC computed with the wrong secret", () =>
 
 test("RELEASE-004: correct HMAC and exact secret pass integrity, then assertProductionReleaseGate runs over the stored bundle and rejects an honestly incomplete one", () => {
   const complete = productionBundle();
-  assert.doesNotThrow(() => verifyReleaseBundleEvidence(complete, { env: productionEnv() }));
+  assert.doesNotThrow(() =>
+    verifyReleaseBundleEvidence(complete, { env: productionEnv(), now: VERIFY_NOW }),
+  );
 
   // `finalizeReleaseEvidenceBundle` itself refuses to return an incomplete
   // production bundle (it throws via its own internal
@@ -121,7 +130,7 @@ test("RELEASE-004: correct HMAC and exact secret pass integrity, then assertProd
     assertReleaseBundleIntegrity(incomplete, { env, requireHmac: true }),
   );
   assert.throws(
-    () => verifyReleaseBundleEvidence(incomplete, { env }),
+    () => verifyReleaseBundleEvidence(incomplete, { env, now: VERIFY_NOW }),
     /production release blocked/,
   );
 });
@@ -160,6 +169,7 @@ test("RELEASE-004: rejects a correctly-signed but stale bundle whose bound run_i
       () =>
         verifyReleaseBundleEvidence(evidence, {
           env: { ...productionEnv(), [key]: mismatchedValue },
+          now: VERIFY_NOW,
         }),
       /does not match the verifier's expected release identity/,
       `expected a rejection for a mismatched ${key}`,
@@ -168,7 +178,9 @@ test("RELEASE-004: rejects a correctly-signed but stale bundle whose bound run_i
 
   // Unmodified, the same bundle still verifies -- proving each mismatch
   // above is what triggered the rejection, not some other fixture defect.
-  assert.doesNotThrow(() => verifyReleaseBundleEvidence(evidence, { env: productionEnv() }));
+  assert.doesNotThrow(() =>
+    verifyReleaseBundleEvidence(evidence, { env: productionEnv(), now: VERIFY_NOW }),
+  );
 });
 
 test("RELEASE-004: a missing expected-identity value is a verification failure, not a silently skipped check", () => {
@@ -176,8 +188,52 @@ test("RELEASE-004: a missing expected-identity value is a verification failure, 
   const envMissingRunId = { ...productionEnv(), VIVA_RELEASE_RUN_ID: undefined };
 
   assert.throws(
-    () => verifyReleaseBundleEvidence(evidence, { env: envMissingRunId }),
+    () => verifyReleaseBundleEvidence(evidence, { env: envMissingRunId, now: VERIFY_NOW }),
     /requires VIVA_RELEASE_RUN_ID/,
+  );
+});
+
+test("ROW 341/RELEASE-011: the verifier rejects a bundle that was fresh at generation time once it has since aged past the max-age window -- it does not merely trust the stored gate.allowed", () => {
+  const evidence = productionBundle();
+  // The stored gate said fresh (`allowed: true`) as of GENERATED_AT; nothing
+  // about the bundle's own content changes here -- only how much later this
+  // verification claims to be happening.
+  assert.equal(evidence.production_release_gate.allowed, true);
+
+  const justPastDefaultWindow = new Date(
+    GENERATED_AT.getTime() + (DEFAULT_MAX_EVIDENCE_AGE_SECONDS + 1) * 1000,
+  );
+  assert.throws(
+    () =>
+      verifyReleaseBundleEvidence(evidence, { env: productionEnv(), now: justPastDefaultWindow }),
+    /evidence is stale at verification time/,
+  );
+  // The bundle's own stored gate is untouched by the rejection above.
+  assert.equal(evidence.production_release_gate.allowed, true);
+});
+
+test("ROW 341/RELEASE-011: the verifier's own VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS override -- the exact same variable the bundle and gate honor -- controls the verifier's freshness window too", () => {
+  const evidence = productionBundle();
+  const wellPastDefaultWindow = new Date(
+    GENERATED_AT.getTime() + (DEFAULT_MAX_EVIDENCE_AGE_SECONDS + 1) * 1000,
+  );
+
+  // Rejected under the default window.
+  assert.throws(
+    () =>
+      verifyReleaseBundleEvidence(evidence, { env: productionEnv(), now: wellPastDefaultWindow }),
+    /evidence is stale at verification time/,
+  );
+
+  // The identical age, verified again, now passes once the caller's own
+  // environment widens the same canonical override.
+  assert.doesNotThrow(() =>
+    verifyReleaseBundleEvidence(evidence, {
+      env: productionEnv({
+        VIVA_RELEASE_EVIDENCE_MAX_AGE_SECONDS: String(DEFAULT_MAX_EVIDENCE_AGE_SECONDS * 2),
+      }),
+      now: wellPastDefaultWindow,
+    }),
   );
 });
 
@@ -202,7 +258,7 @@ test("RELEASE-004: the CLI accepts exactly one evidence path, verifies a stored 
   const dir = await mkdtemp(path.join(tmpdir(), "viva-verify-release-bundle-"));
   try {
     const evidencePath = path.join(dir, "evidence.json");
-    const evidence = productionBundle();
+    const evidence = freshProductionBundle();
     await writeFile(evidencePath, JSON.stringify(evidence));
 
     const ok = spawnSync(
@@ -236,7 +292,7 @@ test("RELEASE-004: the documented downstream form (docs/deployment-runbook.md), 
   const dir = await mkdtemp(path.join(tmpdir(), "viva-verify-release-bundle-bun-"));
   try {
     const evidencePath = path.join(dir, "evidence.json");
-    const evidence = productionBundle();
+    const evidence = freshProductionBundle();
     await writeFile(evidencePath, JSON.stringify(evidence));
 
     // package.json's own "release:verify" script is `node
@@ -260,11 +316,33 @@ test("RELEASE-004: the documented downstream form (docs/deployment-runbook.md), 
   }
 });
 
-function productionBundle({ envOverrides = {}, evidenceOverrides = {} } = {}) {
+function productionBundle({ envOverrides = {}, evidenceOverrides = {}, now = GENERATED_AT } = {}) {
   return finalizeReleaseEvidenceBundle({
     evidence: completeEvidence(evidenceOverrides),
     env: productionEnv(envOverrides),
-    now: GENERATED_AT,
+    now,
+  });
+}
+
+// ROW 341/RELEASE-011: a bundle generated at real "now", for the CLI tests
+// below, whose own default `now` is the real wall clock at verification
+// time (a few milliseconds later) -- so freshness passes on its own
+// (comfortably inside even the default 24h window) without an explicit
+// override, and the CLI tests stay focused on secret/exit-code behavior.
+function freshProductionBundle(overrides = {}) {
+  const generatedAt = new Date();
+  return productionBundle({
+    ...overrides,
+    evidenceOverrides: {
+      generated_at: generatedAt.toISOString(),
+      // completeLiveSmoke()'s own generated_at is otherwise fixed at
+      // GENERATED_AT -- freshness there is a separate, pre-existing gate
+      // requirement (not this row's concern), so it has to move with the
+      // rest of the bundle to keep it satisfied at a live "now".
+      live_smoke: completeLiveSmoke({ generated_at: generatedAt.toISOString() }),
+      ...(overrides.evidenceOverrides ?? {}),
+    },
+    now: generatedAt,
   });
 }
 

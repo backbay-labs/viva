@@ -238,6 +238,68 @@ test("RELEASE-005/006: release-check.mjs's own top-level catch quarantines the r
   }
 });
 
+test("ROW 332/RELEASE-002: release-check.mjs's independent failure-control throw fires before any command runs -- a real defense-in-depth layer, not merely source text a caller could delete unnoticed", async () => {
+  // scripts/failure-control-harness.mjs's own BAC-528 comment documents this
+  // as a *second, separate* layer from `enabled_for_release`: even if that
+  // evidence field were ever wrong, this in-process guard must independently
+  // refuse to build release evidence at all while the harness plan is
+  // enabled. Deleting the throw at release-check.mjs:116-118 left every
+  // other test green, because nothing actually executed this exact script
+  // with an enabled plan -- so this spawns the real script (never imported
+  // directly: it runs its whole pipeline at module top level), the same
+  // pattern the ENOENT quarantine test above uses.
+  const artifactDir = await withTempDir();
+  const emptyPathDir = await withTempDir();
+  const failureArtifactDir = path.resolve(repoRoot, "artifacts/release-check-failures");
+  try {
+    // PATH is deliberately empty, exactly like the ENOENT quarantine test
+    // above: the throw must fire before release-check.mjs ever tries to
+    // spawn `bun`/`cargo` at all, so this run stays fast and hermetic
+    // (no real command, provider, or build ever runs) regardless of what
+    // is or isn't installed in the test environment.
+    const result = spawnSync(process.execPath, [path.join(repoRoot, "scripts/release-check.mjs")], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        VIVA_RELEASE_ARTIFACT_DIR: artifactDir,
+        PATH: emptyPathDir,
+        VIVA_FAILURE_CONTROL_ENABLED: "1",
+        VIVA_FAILURE_CONTROL_SCENARIO: "provider_rate_limited",
+        VIVA_FAILURE_CONTROL_SECRET: "release-check-test-failure-control-secret",
+        VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS: "synthetic-user-1",
+        VIVA_FAILURE_CONTROL_STUDY_SET_IDS: "synthetic-study-set-1",
+        VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: "https://viva.test",
+        VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY: "3",
+      },
+      timeout: 15_000,
+    });
+
+    assert.notEqual(result.status, 0, result.stderr);
+    assert.match(
+      result.stderr,
+      /failure-control harness must be disabled for release evidence generation/,
+    );
+
+    const failureJson = JSON.parse(
+      await readFile(path.join(failureArtifactDir, "failure.json"), "utf8"),
+    );
+    assert.match(
+      failureJson.error,
+      /failure-control harness must be disabled for release evidence generation/,
+    );
+    // The throw fires before the very first command (generated_artifact_hygiene)
+    // is even registered -- proving this is release-check.mjs's own
+    // independent, in-process guard, not something a spawned command's
+    // (evidence-derived) exit status merely happens to report.
+    assert.deepEqual(failureJson.commands, []);
+  } finally {
+    await rm(failureArtifactDir, { recursive: true, force: true });
+    await rm(artifactDir, { recursive: true, force: true }).catch(() => {});
+    await rm(emptyPathDir, { recursive: true, force: true });
+  }
+});
+
 test("release-check-core: providerReadinessChildEnv builds the readiness child's environment from the explicit target config only, never a hostile, ambient parent", () => {
   const target = {
     provider: "cartesia_gemini",
