@@ -2483,11 +2483,22 @@ async function mintSessionFromLibrary(input: {
   }
 
   const upstream = agentLibraryUrl(agentBaseUrl, input.userId, {
+    // `A-38.2`: a resume names its own mint operation, and that operation writes
+    // nothing. Naming nothing made this request indistinguishable from a plain library
+    // read — which this credential deliberately has no authority for — so on a
+    // non-loopback bind the agent refused the resume before any gate: the third
+    // sibling of the `A-32` deadlock family, and the one that stranded a learner who
+    // came back to a session already open.
+    //
+    // It cannot borrow the start's selector to say so. The agent mints a fresh session
+    // id before recording, so `record_start_for` on a resume would insert a *second*
+    // open session and move `open_session_id` onto one the learner never entered.
+    mintResumeForStudySetId: input.actionName === "resume" ? input.studySetId : undefined,
     // `A-32`: a start mint asks the agent to record the session it is about to hand
     // the browser, for the one study set it is starting — that durable row is what
     // the projection requires before the socket may open. A resume names a session
     // that already exists, so it asks for no write, and no other reader of the
-    // library snapshot sends this selector at all.
+    // library snapshot sends either selector at all.
     recordStartForStudySetId: input.actionName === "start" ? input.studySetId : undefined,
   });
   if (!upstream) {
@@ -3790,7 +3801,7 @@ function sessionIdFromAction(value: unknown): string | null {
 function agentLibraryUrl(
   agentBaseUrl: string,
   userId: string,
-  options: { recordStartForStudySetId?: string } = {},
+  options: { mintResumeForStudySetId?: string; recordStartForStudySetId?: string } = {},
 ): URL | null {
   try {
     const url = new URL(`${trimTrailingSlash(agentBaseUrl)}/study-sets/library`);
@@ -3799,6 +3810,14 @@ function agentLibraryUrl(
     // names, and only because this is the mint. Omitted, the snapshot is a read.
     if (options.recordStartForStudySetId) {
       url.searchParams.set("record_start_for", options.recordStartForStudySetId);
+    }
+    // `A-38.2`: the resume's own operation marker. It authorizes no write — the agent's
+    // record gate reads `record_start_for` alone — and exists so a resume presenting
+    // the session-mint credential is a named mint operation rather than a plain library
+    // read the credential has no authority for. Exactly one of the two is ever set:
+    // naming both names no single operation and the agent refuses it.
+    if (options.mintResumeForStudySetId) {
+      url.searchParams.set("mint_resume_for", options.mintResumeForStudySetId);
     }
     return url;
   } catch {

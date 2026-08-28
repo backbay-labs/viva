@@ -5201,6 +5201,42 @@ async fn library_snapshot_response(
     library_snapshot_response_for_user(app, "user-1", record_start_for, bearer).await
 }
 
+/// Which operation a library request names, written the way the wire writes it.
+///
+/// `A-34.2` admitted the start mint on `record_start_for`, the selector that names
+/// its one durable write. `A-38.2` admits the resume mint on `mint_resume_for`, the
+/// sibling that names no write at all — a resume signs a token for a session that
+/// already exists. Naming neither is the plain listing read; naming both names no
+/// single operation, which is its own measurement.
+#[derive(Clone, Copy, Debug)]
+enum LibraryOperation<'a> {
+    /// No operation named: the landing render, the panel refresh, the read-scoped proxy.
+    PlainRead,
+    /// `record_start_for`: the start mint, which records the one set it names.
+    StartMint(&'a str),
+    /// `A-38.2` `mint_resume_for`: the resume mint, which records nothing.
+    ResumeMint(&'a str),
+    /// Both selectors at once — an ambiguous request that names no single operation.
+    BothSelectors(&'a str),
+}
+
+impl LibraryOperation<'_> {
+    fn query_suffix(self) -> String {
+        match self {
+            LibraryOperation::PlainRead => String::new(),
+            LibraryOperation::StartMint(study_set_id) => {
+                format!("&record_start_for={study_set_id}")
+            }
+            LibraryOperation::ResumeMint(study_set_id) => {
+                format!("&mint_resume_for={study_set_id}")
+            }
+            LibraryOperation::BothSelectors(study_set_id) => {
+                format!("&record_start_for={study_set_id}&mint_resume_for={study_set_id}")
+            }
+        }
+    }
+}
+
 /// The same read naming an arbitrary subject. `user_id` is a request parameter, not
 /// a claim, so which subject a credential may name is its own measurement: the
 /// `A-34.2` review fix is that the session mint may name the trusted user and no
@@ -5211,12 +5247,40 @@ async fn library_snapshot_response_for_user(
     record_start_for: Option<&str>,
     bearer: Option<&str>,
 ) -> (StatusCode, serde_json::Value) {
-    let uri = match record_start_for {
-        Some(study_set_id) => {
-            format!("/study-sets/library?user_id={user_id}&record_start_for={study_set_id}")
-        }
-        None => format!("/study-sets/library?user_id={user_id}"),
+    let operation = match record_start_for {
+        Some(study_set_id) => LibraryOperation::StartMint(study_set_id),
+        None => LibraryOperation::PlainRead,
     };
+    library_operation_response(app, user_id, operation, bearer).await
+}
+
+/// `A-38.2`: the resume mint's request, for the service's own trusted user.
+async fn resume_mint_response(
+    app: &axum::Router,
+    study_set_id: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    library_operation_response(
+        app,
+        "user-1",
+        LibraryOperation::ResumeMint(study_set_id),
+        bearer,
+    )
+    .await
+}
+
+/// One request builder for every operation shape above, so the credential, the
+/// origin, and the parse are identical across them and only the selector differs.
+async fn library_operation_response(
+    app: &axum::Router,
+    user_id: &str,
+    operation: LibraryOperation<'_>,
+    bearer: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let uri = format!(
+        "/study-sets/library?user_id={user_id}{}",
+        operation.query_suffix()
+    );
     let mut request = Request::builder()
         .method("GET")
         .uri(uri)
@@ -6127,6 +6191,325 @@ async fn the_upgrade_bearer_reads_another_learners_library_and_still_does_not_mi
     assert!(
         inner.snapshot().sessions.is_empty(),
         "the upgrade bearer left a durable session behind",
+    );
+}
+
+/// `A-38.2`: the third sibling of the `A-32` deadlock family, closed end to end.
+///
+/// `apps/web/app/api/viva-session/shared.ts` sets its record selector only when the
+/// action is a start, so a resume presented `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`
+/// with no operation named — and `A-34.2`'s pin refuses exactly that, because a
+/// credential naming no operation is a plain library read the mint does not hold.
+/// On a public bind the resume was therefore `401` before any gate saw it: the
+/// learner who closed the tab mid-session could not get back in, and neither could
+/// `POST /api/viva-session/refresh`, which mints the same way.
+///
+/// The resume names its own operation, and the operation is a mint without a write.
+/// What it buys is exactly what the start mint already buys minus the record — the
+/// snapshot, whose `resume` action carries the signed token for the session that
+/// already exists — so it is strictly less authority than the admission `A-34.2`
+/// ratified, held by the same credential, for the same trusted subject.
+///
+/// End to end on the bind that requires the credential: the mint starts a session,
+/// the resume mints against it, its token projects, and its socket is an idempotent
+/// replay of the one session rather than a second one.
+#[tokio::test]
+async fn public_bind_resume_mints_through_the_session_mint_credential() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let state = public_bind_signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (status, minted) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the start sets up the resume: {minted}"
+    );
+    let started_session_id = library_study_set(&minted, "biology-midterm")["actions"]["start"]
+        ["session_id"]
+        .as_str()
+        .expect("minted session id")
+        .to_owned();
+    let started_writes = store.writes();
+    assert_eq!(
+        started_writes.len(),
+        1,
+        "the start recorded its one session"
+    );
+
+    let (status, payload) = resume_mint_response(
+        &app,
+        "biology-midterm",
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the resume mint must be admitted on the bind that requires its credential: {payload}"
+    );
+    let resume = library_study_set(&payload, "biology-midterm")["actions"]["resume"].clone();
+    assert_eq!(
+        resume["available"], true,
+        "the resume mint must be answered with an available resume: {resume}"
+    );
+    assert_eq!(
+        resume["session_id"], started_session_id,
+        "the resume must name the session the start committed: {resume}"
+    );
+    let resume_token = resume["session_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+        .expect("the resume mint must carry the signed token the browser resumes with")
+        .to_owned();
+
+    assert_eq!(
+        store.writes(),
+        started_writes,
+        "the resume mint recorded a session: a resume names one that already exists",
+    );
+    assert_eq!(
+        inner.snapshot().sessions.len(),
+        1,
+        "the resume mint left a second durable session behind",
+    );
+
+    let (status, projection) =
+        projection_after_start(&app, "biology-midterm", &started_session_id, &resume_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connectionEligible requires the resumed session to project before the socket: {projection}"
+    );
+    assert_eq!(projection["session"]["id"], started_session_id);
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    let mut request = token_only_request(&url, &resume_token);
+    request
+        .headers_mut()
+        .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+    let (mut socket, _) = connect_async(request)
+        .await
+        .expect("the resume credential opens the socket on a public bind");
+    assert_eq!(read_server_frame(&mut socket).await, ServerFrame::ready());
+    socket
+        .send(WsMessage::Text(
+            session_config_json_with_ids_and_token(
+                "biology-midterm",
+                &started_session_id,
+                &resume_token,
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            read_server_frame(&mut socket).await,
+            ServerFrame::Event { .. }
+        ),
+        "the resumed session proceeds to its next question"
+    );
+    assert_eq!(
+        inner
+            .snapshot()
+            .sessions
+            .iter()
+            .filter(|session| session.voice_session_id == started_session_id)
+            .count(),
+        1,
+        "the resumed socket's own provisioning created a second session"
+    );
+
+    socket.close(None).await.unwrap();
+    let _ = read_server_frames_until_close(&mut socket).await;
+}
+
+/// `A-38.2`, the candidate mechanism the amendment asked to be verified, and why it
+/// was not taken: the record operation is idempotent per session, not per study set.
+///
+/// `A-32` made the socket's own provisioning an idempotent replay of the row the
+/// start committed — keyed on the session id the start minted. A resume that
+/// presented `record_start_for` for the same study set would not replay that row:
+/// [`recorded_signed_start_action`] mints a fresh v4 identifier first, so every
+/// resume inserts a *new* open session, and `open_session_id` is the most recent
+/// open one. The learner's next resume would name a session they never entered,
+/// and one row would accumulate per resume.
+///
+/// That is the state clobber, measured rather than argued, and it is why the resume
+/// names a selector that authorizes no write instead. A future change that routes a
+/// resume back through the start selector fails here.
+#[tokio::test]
+async fn the_start_selector_opens_a_second_session_when_a_resume_names_it() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let mut minted_session_ids = Vec::new();
+    for attempt in 0..2 {
+        let (status, payload) = library_snapshot_response(
+            &app,
+            Some("biology-midterm"),
+            Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "start mint {attempt}: {payload}");
+        minted_session_ids.push(
+            library_study_set(&payload, "biology-midterm")["actions"]["start"]["session_id"]
+                .as_str()
+                .expect("minted session id")
+                .to_owned(),
+        );
+    }
+    assert_ne!(
+        minted_session_ids[0], minted_session_ids[1],
+        "the start selector mints a fresh identifier every time, so it cannot replay a row"
+    );
+    assert_eq!(
+        store.writes().len(),
+        2,
+        "two inserts, not one insert and one replay: {:?}",
+        store.writes(),
+    );
+    assert_eq!(
+        inner.snapshot().sessions.len(),
+        2,
+        "the second start left a second durable open session behind",
+    );
+
+    let (status, payload) = resume_mint_response(
+        &app,
+        "biology-midterm",
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        library_study_set(&payload, "biology-midterm")["actions"]["resume"]["session_id"],
+        minted_session_ids[1],
+        "the learner's resume target moved to the session the second write opened",
+    );
+}
+
+/// `A-38.2`: the resume mint keeps every pin the start mint answers to.
+///
+/// Three properties, each one an existing pin restated for the new selector rather
+/// than assumed to carry over:
+///
+/// * `A-34.2`'s no-operation pin is untouched — it is asserted whole in
+///   [`the_session_mint_credential_is_refused_without_the_mint_operation`], and this
+///   selector does not make a credential that names nothing into an operation.
+/// * `A-36.2`'s cross-user narrowing holds: the resume mint may name the service's
+///   own trusted user and no other, on either bind shape.
+/// * `A-36.3`'s read credential is refused for it, exactly as it is for the start
+///   selector — a resume asks for a session token, which `A-38.1` withholds from the
+///   read credential precisely because that token opens a socket by itself.
+///
+/// And the ambiguous request — both selectors at once — names no single operation, so
+/// it is refused rather than resolved in either direction: the fail-closed answer is
+/// the one that cannot smuggle a write into a resume.
+#[tokio::test]
+async fn the_resume_mint_keeps_the_scoped_credential_pins() {
+    for (shape, build, expected_status, expected_error) in [
+        (
+            "loopback",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::FORBIDDEN,
+            "library_snapshot_auth_required",
+        ),
+        (
+            "public bind",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                public_bind_signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::UNAUTHORIZED,
+            "library_snapshot_auth_failed",
+        ),
+    ] {
+        let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        seed_other_learners_startable_set(&inner);
+        let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+        let app = build_router(build(store.clone(), inner.clone()));
+
+        let (status, body) = library_operation_response(
+            &app,
+            OTHER_LEARNER,
+            LibraryOperation::ResumeMint(OTHER_LEARNER_STUDY_SET),
+            Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "the resume mint must not name another learner on the {shape} bind: {body}"
+        );
+        assert_eq!(body["error"], expected_error, "on the {shape} bind");
+        assert!(
+            body.get("study_sets").is_none(),
+            "the refusal must not carry another learner's library on the {shape} bind: {body}"
+        );
+        assert!(
+            store.writes().is_empty(),
+            "the {shape} bind recorded a session for a refused cross-user resume: {:?}",
+            store.writes(),
+        );
+    }
+
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, body) = resume_mint_response(
+        &app,
+        "biology-midterm",
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the read credential must not be admitted for the resume mint either: {body}"
+    );
+    assert_eq!(body["error"], "library_snapshot_auth_failed");
+    assert!(
+        !body.to_string().contains(FIXTURE_LIBRARY_READ_CREDENTIAL),
+        "the refusal must not echo the credential: {body}"
+    );
+
+    for (credential, name) in [
+        (FIXTURE_SESSION_MINT_CREDENTIAL, "the session mint"),
+        (FIXTURE_LIBRARY_READ_CREDENTIAL, "the library read"),
+    ] {
+        let (status, body) = library_operation_response(
+            &app,
+            "user-1",
+            LibraryOperation::BothSelectors("biology-midterm"),
+            Some(credential),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "naming both operations names no single operation, so {name} credential is refused: {body}"
+        );
+    }
+    assert!(
+        store.writes().is_empty(),
+        "an ambiguous request recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "an ambiguous request left a durable session behind",
     );
 }
 
