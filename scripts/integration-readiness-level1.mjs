@@ -516,7 +516,7 @@ export function reconcileLevelOne(input) {
   let duplicates = 0;
   for (const row of ledger.rows) {
     if (row.disposition === "DUPLICATE_ALIAS") continue;
-    const key = `${row.section} ${row.source_key}`;
+    const key = `${row.section}\u0000${row.source_key}`;
     if (bySection.has(key)) duplicates += 1;
     bySection.set(key, row);
   }
