@@ -3030,6 +3030,53 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*\? authenticatedHostedFetchOptions\(plan\.hostedRestBearerToken\)\s*$/,
     ]),
   },
+  // A-43/P15 admission: the integration-readiness family's five disclosed
+  // lines — the GUARDED marker list, the plain argv binding A-39.1 ordered,
+  // a cargo-filter spec string, a deny-first keep-list key NAME, and the
+  // plan's own published disposable Postgres value. Names and plan-published
+  // fixture material only, never a live value.
+  {
+    file: "scripts/integration-readiness-shared.mjs",
+    marker: "source_context",
+    patterns: Object.freeze([
+      /^\s*"KEY TOKEN SECRET BEARER PASSWORD AUDIO TRANSCRIPT ANSWER PROMPT SOURCE_CONTEXT"\.split\(" "\),\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/integration-readiness-shared.mjs",
+    marker: "Bearer ",
+    patterns: Object.freeze([
+      /^\s*"KEY TOKEN SECRET BEARER PASSWORD AUDIO TRANSCRIPT ANSWER PROMPT SOURCE_CONTEXT"\.split\(" "\),\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/integration-readiness.mjs",
+    marker: "token",
+    patterns: Object.freeze([
+      /^\s*const literal = record\.argv\.every\(\(token\) => typeof token === "string" && token !== ""\);\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/integration-readiness-level2.mjs",
+    marker: "session_token",
+    patterns: Object.freeze([
+      /^\s*\{ id: "session_token_nonce_admission", owner: "VOICE\/SERVICE", filter: "session_token" \},\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/integration-readiness-level2.mjs",
+    marker: "viva_release_bundle_signing_secret",
+    patterns: Object.freeze([
+      /^\s*keep: Object\.freeze\(\["VIVA_RELEASE_BUNDLE_SIGNING_SECRET"\]\),\s*$/,
+    ]),
+  },
+  {
+    file: "scripts/integration-readiness-level3.mjs",
+    marker: "disposable_postgres_password",
+    patterns: Object.freeze([
+      /^\s*export const DISPOSABLE_POSTGRES_PASSWORD = "viva_test_only";\s*$/,
+    ]),
+  },
 ]);
 
 const AUDITED_FILE_EXTENSIONS = new Set([".js", ".mjs", ".ts", ".tsx", ".rs", ".yml", ".yaml"]);
