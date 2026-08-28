@@ -191,6 +191,64 @@ test("e2e-browser spawns every local child through the shared explicit child-env
   assert.doesNotMatch(source, /env: \{ \.\.\.process\.env, \.\.\.extraEnv \}/);
 });
 
+test("W07-PROD-WEB: the local web child is production-shaped -- `next build` completes before `next start` runs, never `next dev`", async () => {
+  const source = await readFile(E2E_BROWSER_RUNTIME_PATH, "utf8");
+
+  // A-44.2 / Level 2's own "production-shaped" mandate: the browser story
+  // must measure the shipped CSP surface, never next dev's nonce-less
+  // devtools styles (A-44.2's own style-src ruling: the shipping
+  // configuration serves zero CSP violations of any directive).
+  const buildArgsMatch = source.match(
+    /args:\s*\[\s*"run",\s*"--cwd",\s*"apps\/web",\s*"build",?\s*\]/,
+  );
+  assert.ok(buildArgsMatch, "spawnLocalWeb must build the app's production bundle via its own build script");
+
+  const startArgsMatch = source.match(
+    /args:\s*\[\s*"run",\s*"--cwd",\s*"apps\/web",\s*"start",\s*"--",\s*"--hostname",\s*"127\.0\.0\.1",\s*"--port",\s*String\(webPort\),?\s*\]/,
+  );
+  assert.ok(startArgsMatch, "spawnLocalWeb must start the built production server on the allocated port");
+
+  assert.doesNotMatch(
+    source,
+    /"apps\/web",\s*"dev",/,
+    "no `next dev` invocation may remain in the runtime module",
+  );
+
+  // Adversarial review (W07-PROD-WEB amendment): the check this replaced
+  // compared bare `"build"`/`"start"` string-literal positions, which could
+  // match anywhere in the file (a comment, for instance), not the real
+  // invocations. Comparing the two matches captured above by their own
+  // `.index` ties the ordering claim to the args arrays this test just
+  // proved exist. Source-text order is not control-flow order in general, so
+  // the regex below -- the actual execution-order proof (`await
+  // buildLocalWeb(...)` strictly precedes `return spawnLocalChild(...)`) --
+  // still does the real work; this corroborates it against the two concrete
+  // argv literals.
+  assert.ok(
+    buildArgsMatch.index < startArgsMatch.index,
+    "the build step's args array must be defined before the start step's",
+  );
+  assert.match(
+    source,
+    /await buildLocalWeb\(env,\s*plan\.artifactDir\);\s*\n\s*return spawnLocalChild/,
+    "spawnLocalWeb must await the build to completion before spawning the started server",
+  );
+});
+
+test("W07-PROD-WEB: the local web build is bounded by an explicit, finite deadline, with a single code path and no dev-mode escape hatch", async () => {
+  const source = await readFile(E2E_BROWSER_RUNTIME_PATH, "utf8");
+
+  assert.match(source, /export const LOCAL_WEB_BUILD_TIMEOUT_MS = \d+/);
+  assert.match(source, /timeoutMs: LOCAL_WEB_BUILD_TIMEOUT_MS/);
+  // Single code path: nothing in this module may branch the local web child
+  // back to dev shape, silently or otherwise -- every matrix leg and every
+  // CI job must always exercise the shipped configuration. Targeted at real
+  // code shapes (an identifier or env var naming a dev toggle), not prose --
+  // this file's own doc comments legitimately discuss the absence of one.
+  assert.doesNotMatch(source, /\bdevMode\b/i);
+  assert.doesNotMatch(source, /VIVA_E2E_\w*DEV\w*/);
+});
+
 test("hosted browser E2E records answer-resolution latency evidence", async () => {
   const source = await readFile(E2E_BROWSER_STORY_RUNNER_PATH, "utf8");
 
