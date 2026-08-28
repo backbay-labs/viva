@@ -6130,6 +6130,474 @@ async fn the_upgrade_bearer_reads_another_learners_library_and_still_does_not_mi
     );
 }
 
+/// `A-36.3`: the sibling deadlock, on the same bind, for the other scoped credential.
+///
+/// The browser's BFF reads this route with `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN`
+/// (`apps/web/app/api/viva-library/[[...path]]/route.ts:481`), and `main.rs` wires
+/// that credential into `ProjectionReadAccess` and nowhere else — so
+/// `library_snapshot`'s own bearer check never consulted it. On a non-loopback bind
+/// that check compares against `VIVA_VOICE_WS_BEARER_TOKEN`, `CredentialCollision`
+/// makes the two byte-distinct at startup, and the same bind's validation *requires*
+/// the read key: the browser's plain library read answered `401` with the credential
+/// the deployment told it to send. No library rendered. That is the exact deadlock
+/// class `A-34.2` closed for the mint, one credential over.
+///
+/// What is admitted is the read-only snapshot operation, for the service's own
+/// trusted user, from the canonical origin — precisely the trust
+/// [`ProjectionReadAccess`] already places in this credential, and no more. The
+/// assertions after the status are what "read-only" means here, stated one property
+/// at a time: no durable session, no mutation capability, no export. The fourth
+/// property — no `session_token`, because that token alone opens the socket — is
+/// [`the_library_read_snapshot_withholds_the_socket_credential`]'s, so a regression
+/// there names itself rather than arriving inside this test's summary.
+#[tokio::test]
+async fn a_public_bind_plain_library_snapshot_admits_the_scoped_read_credential() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, payload) =
+        library_snapshot_response(&app, None, Some(FIXTURE_LIBRARY_READ_CREDENTIAL)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the browser's own read credential must reach the snapshot on a public bind: {payload}"
+    );
+    assert_eq!(payload["user_id"], "user-1");
+    let biology = library_study_set(&payload, "biology-midterm");
+    assert_eq!(biology["question_count"], 1);
+    assert_eq!(
+        biology["actions"]["start"]["available"], true,
+        "the read snapshot still offers its start actions: {biology}"
+    );
+    assert!(
+        !payload
+            .to_string()
+            .contains(FIXTURE_LIBRARY_READ_CREDENTIAL),
+        "the snapshot must not echo the credential that read it"
+    );
+
+    assert_eq!(
+        biology["actions"]["delete"]["available"], false,
+        "the read credential must not carry delete authority: {biology}"
+    );
+    assert_eq!(
+        biology["actions"]["delete"]["unavailable_reason"], "mutation_auth_required",
+        "the read credential's delete refusal must be the mutation gate's own: {biology}"
+    );
+    assert!(
+        biology["actions"]["delete"]["control_token"].is_null(),
+        "the read credential must not be handed a mutation capability: {biology}"
+    );
+    assert_eq!(
+        payload["privacy"]["export"]["available"], false,
+        "the read credential must not carry export authority: {payload}"
+    );
+    assert!(
+        store.writes().is_empty(),
+        "the plain read recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the plain read left a durable session behind",
+    );
+}
+
+/// `A-36.3`, the first negative direction: the read credential reads, and reading is
+/// all it does.
+///
+/// This is [`the_session_mint_credential_is_refused_without_the_mint_operation`] in
+/// reverse, and deliberately the same shape. A request presenting the scoped read
+/// credential *and* naming a start is asking for the write authority
+/// `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` exists to hold — the credential the
+/// browser's read-scoped proxy deliberately does not have. That is not the read-only
+/// operation this admission covers, so it is refused outright rather than quietly
+/// downgraded to a read: a caller that asked to start a session and got `200` back
+/// has been told it started one.
+///
+/// The export surface, which consults neither scoped credential, stays closed to it
+/// too, and the store is asserted empty on both counts — a leak here would record a
+/// session under an authority that never held the record right.
+#[tokio::test]
+async fn the_library_read_credential_is_refused_for_the_mint_operation() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let (status, body) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the read credential must not be admitted for the mint operation: {body}"
+    );
+    assert_eq!(body["error"], "library_snapshot_auth_failed");
+    assert!(
+        body.get("study_sets").is_none(),
+        "the refusal must not carry the snapshot it refused: {body}"
+    );
+    assert!(
+        !body.to_string().contains(FIXTURE_LIBRARY_READ_CREDENTIAL),
+        "the refusal must not echo the credential: {body}"
+    );
+
+    let export = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/export?user_id=user-1")
+                .header("origin", STARTED_SESSION_ORIGIN)
+                .header(
+                    "authorization",
+                    format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        export.status(),
+        StatusCode::UNAUTHORIZED,
+        "the read credential must not export the library either",
+    );
+
+    assert!(
+        store.writes().is_empty(),
+        "a refused mint recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "a refused mint left a durable session behind",
+    );
+}
+
+/// `A-36.3`, the second negative direction: the read credential names the trusted
+/// user, and no other.
+///
+/// `A-36.2` ratified exactly this narrowing for the session mint, on the reasoning
+/// that a scoped credential admitted for its own operation gains no cross-user
+/// reach. The read credential is the same case: `ProjectionReadAccess` never reads
+/// for a subject a verified token does not name, so the mirror of that trust cannot
+/// read for a subject the *query string* names. The route's own cross-user rule —
+/// which predates both scoped credentials — is left exactly where it was found, on
+/// both bind shapes.
+///
+/// The seeded set is startable, so a gate that admitted this request would hand back
+/// another learner's whole library; the store assertions catch the worse outcome
+/// underneath it.
+#[tokio::test]
+async fn the_library_read_credential_is_not_cross_user_authority() {
+    for (shape, build, expected_status, expected_error) in [
+        (
+            "loopback",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::FORBIDDEN,
+            "library_snapshot_auth_required",
+        ),
+        (
+            "public bind",
+            (|store: Arc<dyn StudyMemoryStore>, brain: Arc<dyn StudyMemoryStore>| {
+                public_bind_signed_start_state(store, brain)
+            }) as fn(Arc<dyn StudyMemoryStore>, Arc<dyn StudyMemoryStore>) -> AppState,
+            StatusCode::UNAUTHORIZED,
+            "library_snapshot_auth_failed",
+        ),
+    ] {
+        let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+        seed_other_learners_startable_set(&inner);
+        let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+        let app = build_router(build(store.clone(), inner.clone()));
+
+        let (status, body) = library_snapshot_response_for_user(
+            &app,
+            OTHER_LEARNER,
+            None,
+            Some(FIXTURE_LIBRARY_READ_CREDENTIAL),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "the read credential must not name another learner on the {shape} bind: {body}"
+        );
+        assert_eq!(body["error"], expected_error, "on the {shape} bind");
+        assert!(
+            body.get("study_sets").is_none(),
+            "the refusal must not carry another learner's library on the {shape} bind: {body}"
+        );
+
+        assert!(
+            store.writes().is_empty(),
+            "the {shape} bind recorded a session for a refused cross-user read: {:?}",
+            store.writes(),
+        );
+        assert!(
+            inner.snapshot().sessions.is_empty(),
+            "the {shape} bind left a durable session behind",
+        );
+    }
+}
+
+/// `A-36.3`, the third negative direction: the canonical origin is part of the trust
+/// this credential already carries, so the mirror keeps it.
+///
+/// `ProjectionReadAccess::authorize` refuses a request with no `Origin` header before
+/// it looks at any credential — an empty allow-list denies rather than answering
+/// `*`, because this route returns learner state. A *foreign* origin never reaches
+/// the authentication check at all: `optional_cors_json_headers` answers `403
+/// origin_denied` first on any bind whose allow-list is non-empty, which a public
+/// bind's validation guarantees. An *absent* origin is the case that does reach it,
+/// and is exactly where a mirror that skipped the check would let a non-browser
+/// caller in on the browser's credential.
+#[tokio::test]
+async fn the_library_read_credential_is_refused_without_the_canonical_origin() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/study-sets/library?user_id=user-1")
+                .header(
+                    "authorization",
+                    format!("Bearer {FIXTURE_LIBRARY_READ_CREDENTIAL}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the read credential must carry the canonical origin the projection demands of it: {body}"
+    );
+    assert_eq!(body["error"], "library_snapshot_auth_failed");
+    assert!(
+        body.get("study_sets").is_none(),
+        "the refusal must not carry the snapshot it refused: {body}"
+    );
+}
+
+/// `A-36.3` review fix, the third negative direction and the one the first pass
+/// missed: read-only has to mean read-only on the wire, not only at the store call.
+///
+/// A start or resume action carries a `session_token`, and D-07's token-only upgrade
+/// path (`authenticate_upgrade`) accepts that token ALONE as WebSocket authority —
+/// no upgrade bearer needed — after which the socket's own provisioning records the
+/// `voice_sessions` row. So handing this credential a session token hands it durable
+/// session creation by one more hop, which is exactly the authority `A-36.3` reserves
+/// to `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`. The route's own store stays untouched
+/// either way, which is why the HTTP-level write assertions cannot see this and this
+/// test has to.
+///
+/// For every caller the route already admitted, the token is no new authority —
+/// loopback trust and the upgrade bearer each open the socket on their own — so
+/// nothing is withheld from them (see
+/// [`a_loopback_library_snapshot_keeps_its_session_tokens`] and
+/// [`public_bind_start_projection_and_socket_complete_the_entry_flow`]). The
+/// library-read credential is the one caller for which it *is* new: it cannot open a
+/// socket by itself.
+///
+/// What survives is the whole browser contract: the action stays `available` and
+/// keeps its `session_id`, which is all `apps/web`'s BFF reads before attaching its
+/// own same-origin bootstrap token (`attachVivaSessionBootstrapTokenToAction`
+/// requires `available === true`; `sessionIdFromAction` reads `session_id`). The
+/// browser's real session token comes from `POST /api/viva-session/start`, which
+/// presents the session-mint credential — and the BFF drops every upstream `*_token`
+/// key before the browser sees the body regardless.
+#[tokio::test]
+async fn the_library_read_snapshot_withholds_the_socket_credential() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(public_bind_signed_start_state(store.clone(), inner.clone()));
+
+    // Mint first, so the read below sees a live session and its `resume` action is
+    // available: a resume token opens the socket on a session that already exists,
+    // which is if anything the worse leak of the two.
+    let (status, minted) = library_snapshot_response(
+        &app,
+        Some("biology-midterm"),
+        Some(FIXTURE_SESSION_MINT_CREDENTIAL),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mint sets up the read: {minted}"
+    );
+    let minted_writes = store.writes();
+    assert_eq!(minted_writes.len(), 1, "the mint recorded its one session");
+
+    let (status, payload) =
+        library_snapshot_response(&app, None, Some(FIXTURE_LIBRARY_READ_CREDENTIAL)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read credential still reads the library on a public bind: {payload}"
+    );
+    let biology = library_study_set(&payload, "biology-midterm");
+    for action in ["start", "resume"] {
+        assert_eq!(
+            biology["actions"][action]["available"], true,
+            "{action} must stay available — the BFF attaches its bootstrap token only to an available action: {biology}"
+        );
+        assert!(
+            biology["actions"][action]["session_id"].is_string(),
+            "{action} must keep its session id — the BFF's resume bootstrap reads it: {biology}"
+        );
+        assert!(
+            biology["actions"][action]["session_token"].is_null(),
+            "{action} handed the read credential a token that opens the socket: {biology}"
+        );
+    }
+    assert!(
+        !payload.to_string().contains("session_token"),
+        "the read-credential snapshot carries a session token somewhere: {payload}"
+    );
+
+    assert_eq!(
+        store.writes(),
+        minted_writes,
+        "the read itself recorded a session",
+    );
+}
+
+/// `A-36.3` review fix, the same property proved the way the reviewer disproved its
+/// first pass: by trying, against a live server, everything the snapshot hands back.
+///
+/// The field-name assertion above is only as good as the field names it knows. This
+/// one takes every string the read-credential snapshot returns — session ids, titles,
+/// statuses, prose, and anything a later field adds — and presents each as the
+/// token-only upgrade credential. Every one must be refused, and no durable session
+/// may exist afterwards. That is the reviewer's probe inverted: it found a string in
+/// this body that opened the socket and provisioned a session, so this asserts there
+/// is none.
+///
+/// The upgrade bearer is configured on this bind, so a refusal here is the socket's
+/// own authentication answering, not a service that admits nobody: the same server
+/// admits the minted credential in
+/// [`public_bind_start_projection_and_socket_complete_the_entry_flow`].
+#[tokio::test]
+async fn nothing_in_the_library_read_snapshot_opens_the_socket() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let state = public_bind_signed_start_state(store.clone(), store.clone());
+    let app = build_router(state.clone());
+
+    let (status, payload) =
+        library_snapshot_response(&app, None, Some(FIXTURE_LIBRARY_READ_CREDENTIAL)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the read credential still reads the library on a public bind: {payload}"
+    );
+
+    let mut candidates = Vec::new();
+    collect_json_strings(&payload, &mut candidates);
+    candidates.push(FIXTURE_LIBRARY_READ_CREDENTIAL.to_owned());
+    candidates.sort();
+    candidates.dedup();
+    assert!(
+        candidates.len() > 5,
+        "the probe must have a snapshot to probe: {candidates:?}"
+    );
+
+    let Some(url) = spawn_server(state).await else {
+        return;
+    };
+    for candidate in &candidates {
+        let mut request = token_only_request(&url, candidate);
+        request
+            .headers_mut()
+            .insert("origin", HeaderValue::from_static(STARTED_SESSION_ORIGIN));
+        assert!(
+            connect_async(request).await.is_err(),
+            "a value the read-credential snapshot handed back opened the socket: {candidate:?}"
+        );
+    }
+
+    assert!(
+        store.writes().is_empty(),
+        "a socket opened on the read-credential snapshot recorded a session: {:?}",
+        store.writes(),
+    );
+    assert!(
+        inner.snapshot().sessions.is_empty(),
+        "the read credential reached durable session creation",
+    );
+}
+
+/// Every string leaf of a JSON value, in document order. The probe above needs the
+/// values, not the paths: any one of them reaching the socket is the finding.
+fn collect_json_strings(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => into.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, into);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values() {
+                collect_json_strings(field, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `A-36.3` review fix: the withholding is scoped to the admission that needed it,
+/// so the loopback bind is left exactly as it was found.
+///
+/// On a loopback bind `unauthenticated_paste_allowed` is true and the same request is
+/// answered with no `Authorization` header at all, so a caller that chooses to send
+/// the read credential is not being admitted *by* it and gains nothing from it. There
+/// is nothing to withhold, and withholding anyway would strip session tokens from the
+/// local development and fixture-seeding flows that read this route.
+#[tokio::test]
+async fn a_loopback_library_snapshot_keeps_its_session_tokens() {
+    let inner = Arc::new(data::InMemoryStudyStore::seeded_fixture());
+    let store = Arc::new(StartedSessionAuditStore::new(inner.clone()));
+    let app = build_router(signed_start_state(store.clone(), inner.clone()));
+
+    for bearer in [None, Some(FIXTURE_LIBRARY_READ_CREDENTIAL)] {
+        let payload = library_snapshot_json_with_bearer(&app, None, bearer).await;
+        let start = library_study_set(&payload, "biology-midterm")["actions"]["start"].clone();
+        assert_eq!(
+            start["available"], true,
+            "the loopback read still offers a start with bearer {bearer:?}: {start}"
+        );
+        assert!(
+            start["session_token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "the loopback read lost its signed start with bearer {bearer:?}: {start}"
+        );
+    }
+
+    assert!(
+        store.writes().is_empty(),
+        "a plain loopback read recorded a session: {:?}",
+        store.writes(),
+    );
+}
+
 /// `D-04 CONFIRM_DELETE`: no restore route exists. This characterization is the guard
 /// that a later half-implementation cannot land silently.
 #[tokio::test]

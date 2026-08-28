@@ -198,6 +198,33 @@ impl ProjectionReadAccess {
             .any(|allowed| allowed.eq_ignore_ascii_case(origin))
     }
 
+    /// True only for a request carrying exactly the configured library-read
+    /// credential in the `Authorization` position, compared in constant time.
+    fn credential_presented(&self, headers: &HeaderMap) -> bool {
+        let Some(provided) = authorization_bearer_from_headers(headers) else {
+            return false;
+        };
+        constant_time_eq(
+            self.library_read_bearer.as_str().as_bytes(),
+            provided.as_bytes(),
+        )
+    }
+
+    /// `A-36.3`: the trust this credential already carries, offered to the one other
+    /// route that must honor it — the read-only library snapshot.
+    ///
+    /// It is [`Self::authorize`] minus the session token, because a library snapshot
+    /// is bound to no session: the same allowed origin, and the same constant-time
+    /// comparison against the same credential, decided by the same two helpers so the
+    /// two surfaces cannot drift. It grants nothing else. What the snapshot route may
+    /// do with a `true` here — which subject it may name, that it may not record,
+    /// export, or delete, and that it is served no `session_token`, since that token
+    /// alone opens a WebSocket through [`authenticate_upgrade`] — is that route's own
+    /// decision, unchanged by this.
+    pub(crate) fn authorizes_snapshot_read(&self, headers: &HeaderMap) -> bool {
+        self.origin_allowed(headers) && self.credential_presented(headers)
+    }
+
     /// Verifies origin, the scoped service bearer, and the signed access credential
     /// in that order, and returns the credential's verified claims. The nonce store
     /// is never consulted: this is a read, and a read never consumes a nonce.
@@ -209,13 +236,7 @@ impl ProjectionReadAccess {
         if !self.origin_allowed(headers) {
             return Err(ProjectionRejection::Forbidden);
         }
-        let Some(provided) = authorization_bearer_from_headers(headers) else {
-            return Err(ProjectionRejection::Unauthorized);
-        };
-        if !constant_time_eq(
-            self.library_read_bearer.as_str().as_bytes(),
-            provided.as_bytes(),
-        ) {
+        if !self.credential_presented(headers) {
             return Err(ProjectionRejection::Unauthorized);
         }
         let mut tokens = headers.get_all(VIVA_SESSION_TOKEN_HEADER).iter();
