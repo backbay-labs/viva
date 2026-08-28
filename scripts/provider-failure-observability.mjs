@@ -1,6 +1,4 @@
-import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
-  type: "json",
-};
+import { RELEASE_LEARNER_LOOP_CONTRACT as learnerLoopContract } from "./release-contract-validation.mjs";
 import { assertNoForbiddenEvidenceMarkers } from "./redaction-control.mjs";
 import {
   REQUIRED_ROLLBACK_TRIGGER_IDS,

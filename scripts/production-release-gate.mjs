@@ -1,7 +1,12 @@
 import { createHash, createHmac } from "node:crypto";
+import {
+  assertNoForbiddenEvidenceMarkers as assertNoForbiddenEvidenceMarkersCanonical,
+  FORBIDDEN_EVIDENCE_MARKERS as REDACTION_CONTROL_FORBIDDEN_EVIDENCE_MARKERS,
+} from "./redaction-control.mjs";
 
 export const PRODUCTION_RELEASE_GATE_SCHEMA = "viva.production_release_gate.v1";
 export const RELEASE_BUNDLE_INTEGRITY_SCHEMA = "viva.release_bundle_integrity.v1";
+export const CONTAINER_PROVENANCE_SCHEMA = "viva.container_provenance.v1";
 export const DEFAULT_MAX_EVIDENCE_AGE_SECONDS = 24 * 60 * 60;
 
 export const REQUIRED_RECOVERY_SCENARIOS = Object.freeze([
@@ -29,20 +34,20 @@ export const REQUIRED_PROVIDER_FAILURE_OBSERVATIONS = Object.freeze([
 ]);
 
 const ACCEPTED_LIMITER_STATES = new Set(["enabled", "configured", "observed"]);
+
+// RELEASE-005/006/009/010/011: scripts/redaction-control.mjs is the one
+// canonical marker/assertion implementation; this file layers only the
+// markers meaningful specifically in gate/release-evidence context
+// (RELEASE-002/020's raw_prompt/provider_prompt) explicitly on top of it,
+// rather than hand-maintaining an independent, silently drifting duplicate
+// of the whole list (this file's own prior list had already drifted --
+// omitting several markers redaction-control.mjs's canonical list already
+// had -- which is exactly what let scripts/release-check.mjs's own
+// separate ad-hoc list grow a third, partially-overlapping copy).
+export const GATE_ONLY_EVIDENCE_MARKERS = Object.freeze(["raw_prompt", "provider_prompt"]);
 export const FORBIDDEN_EVIDENCE_MARKERS = Object.freeze([
-  "pcm16_base64",
-  "answer_text",
-  "transcript_final",
-  "source_context",
-  "pasted_text",
-  "session_token",
-  "viva1.",
-  "session-secret",
-  "raw_prompt",
-  "provider_prompt",
-  "CARTESIA_API_KEY",
-  "GEMINI_API_KEY",
-  "Bearer ",
+  ...REDACTION_CONTROL_FORBIDDEN_EVIDENCE_MARKERS,
+  ...GATE_ONLY_EVIDENCE_MARKERS,
 ]);
 
 export function finalizeReleaseEvidenceBundle({ evidence, env = process.env, now = new Date() }) {
@@ -62,7 +67,7 @@ export function finalizeReleaseEvidenceBundle({ evidence, env = process.env, now
   };
 
   assertReleaseBundleIntegrity(finalized, { env });
-  assertProductionReleaseGate(finalized);
+  assertProductionReleaseGate(finalized, { env });
   return finalized;
 }
 
@@ -104,8 +109,10 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
     skip_browser_requested: env.VIVA_RELEASE_CHECK_SKIP_BROWSER === "1",
     hosted_browser_evidence: summarizeHostedBrowserEvidence(hostedBrowser),
     live_smoke: summarizeLiveSmoke(evidence.live_smoke, {
+      env,
       maxAgeSeconds,
       now: observedAt,
+      productionRequested,
     }),
     submitted_answer_recovery_matrix: summarizeRecoveryMatrix(evidence.hosted_e2e_matrix),
     provider_failure_recovery_proof: summarizeProviderFailureProof(
@@ -117,6 +124,10 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
     durability: summarizeDurability({ env, evidence, hostedBrowser }),
     rollback_owner_decision: summarizeRollbackOwnerDecision(evidence.rollback_drain),
     issue_proofs: summarizeIssueProofs({ env, evidence }),
+    container_provenance: summarizeContainerProvenance({
+      env,
+      containerProvenance: evidence.container_provenance,
+    }),
     deploy_identity: {
       release_deploy_ids: releaseDeployIds,
       live_deploy_ids: liveDeployIds,
@@ -151,18 +162,105 @@ export function buildProductionReleaseGateEvidence({ evidence, env = process.env
   };
 }
 
-export function assertProductionReleaseGate(evidence) {
+export function assertProductionReleaseGate(evidence, { env = process.env } = {}) {
   const gate = evidence?.production_release_gate ?? evidence;
   if (gate?.schema !== PRODUCTION_RELEASE_GATE_SCHEMA) {
     throw new Error("Invalid production release gate schema");
   }
-  assertNoForbiddenEvidenceMarkers(gate);
+  assertNoForbiddenEvidenceMarkers(gate, { env });
   if (gate.production_requested === true && gate.allowed !== true) {
     throw new Error(
       `production release blocked: ${gate.reason}; missing=${gate.missing_required_evidence.join(",")}`,
     );
   }
   return gate;
+}
+
+// RELEASE-026: `build_inputs` (the pinned base-image digests and Bun archive
+// checksums) is always knowable locally from the committed Dockerfiles, so
+// the caller (scripts/release-check.mjs) parses those files itself and
+// passes the result straight through here unchanged. `deployment_outputs`
+// is knowable only from the *selected deployment* -- it is derived solely
+// from VIVA_RELEASE_AGENT_IMAGE_DIGEST/VIVA_RELEASE_MONITOR_IMAGE_DIGEST,
+// never from `buildInputs`, so a base-image digest can never masquerade as
+// deployed provenance and a non-production run (where these are never set)
+// truthfully records "not_proven" rather than inferring anything from a
+// FROM line or a local `docker build`.
+export function buildContainerProvenanceEvidence({ buildInputs, env = process.env }) {
+  const agentImageDigest = sha256DigestOrNull(env.VIVA_RELEASE_AGENT_IMAGE_DIGEST);
+  const monitorImageDigest = sha256DigestOrNull(env.VIVA_RELEASE_MONITOR_IMAGE_DIGEST);
+  const proven = agentImageDigest !== null && monitorImageDigest !== null;
+  return {
+    schema: CONTAINER_PROVENANCE_SCHEMA,
+    build_inputs: buildInputs ?? null,
+    deployment_outputs: {
+      status: proven ? "proven" : "not_proven",
+      agent_image_digest: agentImageDigest,
+      monitor_image_digest: monitorImageDigest,
+    },
+    sanitized: true,
+  };
+}
+
+// An immutable image reference: `<name[:tag]>@sha256:<64 lowercase hex>`.
+export function isPinnedImageRef(value) {
+  return typeof value === "string" && /^\S+@sha256:[0-9a-f]{64}$/.test(value);
+}
+
+// A bare digest, e.g. what a registry/deploy tool reports for a built image:
+// `sha256:<64 lowercase hex>`, never a tag and never an upper-case algorithm.
+export function isSha256Digest(value) {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function sha256DigestOrNull(value) {
+  const normalized = stringOrNull(value);
+  return normalized !== null && isSha256Digest(normalized) ? normalized : null;
+}
+
+function isHex64(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function areContainerBuildInputsPinned(buildInputs) {
+  const baseImages = buildInputs?.base_images ?? {};
+  const bunArchives = buildInputs?.bun_archives ?? {};
+  return (
+    isPinnedImageRef(baseImages.rust_builder) &&
+    isPinnedImageRef(baseImages.debian_runtime) &&
+    isPinnedImageRef(baseImages.playwright_monitor) &&
+    isHex64(bunArchives["linux/amd64"]?.sha256) &&
+    isHex64(bunArchives["linux/arm64"]?.sha256) &&
+    buildInputs?.bun_version === "1.3.3"
+  );
+}
+
+function summarizeContainerProvenance({ env, containerProvenance }) {
+  const deploymentOutputs = containerProvenance?.deployment_outputs;
+  const recordedAgentDigest = sha256DigestOrNull(deploymentOutputs?.agent_image_digest);
+  const recordedMonitorDigest = sha256DigestOrNull(deploymentOutputs?.monitor_image_digest);
+  // The *verifying* environment's own expected digests -- deliberately
+  // re-read from `env` here rather than trusted from the stored evidence,
+  // exactly like RELEASE-003/007/008's run_id/deploy_sha binding: a stale or
+  // tampered stored digest must disagree with what this call was told to
+  // expect, not silently agree with itself.
+  const expectedAgentDigest = sha256DigestOrNull(env.VIVA_RELEASE_AGENT_IMAGE_DIGEST);
+  const expectedMonitorDigest = sha256DigestOrNull(env.VIVA_RELEASE_MONITOR_IMAGE_DIGEST);
+  return {
+    schema: containerProvenance?.schema ?? null,
+    build_inputs_pinned: areContainerBuildInputsPinned(containerProvenance?.build_inputs),
+    deployment_outputs_status: deploymentOutputs?.status ?? null,
+    agent_image_digest: recordedAgentDigest,
+    monitor_image_digest: recordedMonitorDigest,
+    agent_image_digest_match:
+      recordedAgentDigest !== null &&
+      expectedAgentDigest !== null &&
+      recordedAgentDigest === expectedAgentDigest,
+    monitor_image_digest_match:
+      recordedMonitorDigest !== null &&
+      expectedMonitorDigest !== null &&
+      recordedMonitorDigest === expectedMonitorDigest,
+  };
 }
 
 export function buildReleaseBundleIntegrity({ evidence, env = process.env }) {
@@ -184,10 +282,32 @@ export function buildReleaseBundleIntegrity({ evidence, env = process.env }) {
   };
 }
 
-export function assertReleaseBundleIntegrity(evidence, { env = process.env } = {}) {
+export function assertReleaseBundleIntegrity(evidence, { env = process.env, requireHmac = false } = {}) {
   const integrity = evidence?.release_bundle?.integrity;
   if (integrity?.schema !== RELEASE_BUNDLE_INTEGRITY_SCHEMA) {
     throw new Error("release bundle integrity is missing");
+  }
+  if (requireHmac) {
+    // RELEASE-004: a downstream production verification must never accept
+    // whichever algorithm the *verifying* environment happens to imply.
+    // Before Task 11, a verifying environment with no secret silently
+    // recomputed "expected" as a self-hash, so a self-signed (or
+    // self-signed-relabeled) bundle would trivially "match" itself. Require
+    // a real secret, and require the *stored* bundle to already claim a
+    // real HMAC signed with a real key, before any signature is compared.
+    if (stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET) === null) {
+      throw new Error(
+        "release bundle integrity requires VIVA_RELEASE_BUNDLE_SIGNING_SECRET to verify a production bundle",
+      );
+    }
+    if (integrity.signature_algorithm !== "hmac-sha256") {
+      throw new Error("release bundle integrity must use hmac-sha256 for a production bundle");
+    }
+    if (integrity.signature_key_present !== true) {
+      throw new Error(
+        "release bundle integrity must have signature_key_present for a production bundle",
+      );
+    }
   }
   const expected = buildReleaseBundleIntegrity({ evidence, env });
   if (
@@ -220,6 +340,9 @@ function missingProductionEvidence(gate, { env, evidence }) {
   pushUnless(missing, "provider_mode_and_model", gate.hosted_browser_evidence.provider_model_present);
   pushUnless(missing, "postgres_durability", gate.durability.production_durable);
   pushUnless(missing, "budget_capped_live_smoke", gate.live_smoke.passed_budget_capped);
+  pushUnless(missing, "live_smoke_run_id_match", gate.live_smoke.run_id_match);
+  pushUnless(missing, "live_smoke_agent_deploy_match", gate.live_smoke.agent_deploy_match);
+  pushUnless(missing, "live_smoke_deploy_sha_match", gate.live_smoke.deploy_sha_match);
   pushUnless(
     missing,
     "submitted_answer_recovery_matrix",
@@ -234,6 +357,21 @@ function missingProductionEvidence(gate, { env, evidence }) {
   pushUnless(missing, "config_parity", gate.config_parity.complete);
   pushUnless(missing, "budget_caps_provider_limiter", gate.budget_controls.complete);
   pushUnless(missing, "rollback_owner_proceed", gate.rollback_owner_decision.allowed);
+  pushUnless(
+    missing,
+    "container_build_inputs_pinned",
+    gate.container_provenance.build_inputs_pinned,
+  );
+  pushUnless(
+    missing,
+    "container_agent_image_digest",
+    gate.container_provenance.agent_image_digest_match,
+  );
+  pushUnless(
+    missing,
+    "container_monitor_image_digest",
+    gate.container_provenance.monitor_image_digest_match,
+  );
   pushUnless(missing, "bac528_harness_disabled", gate.issue_proofs.bac_528_harness_disabled);
   pushUnless(missing, "bac531_consent_deletion_proof", gate.issue_proofs.bac_531_consent_deletion);
   pushUnless(missing, "bac529_gemini_quota_sufficiency", gate.issue_proofs.bac_529_quota_sufficient);
@@ -264,7 +402,10 @@ function summarizeHostedBrowserEvidence(hostedBrowser) {
   };
 }
 
-function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}) {
+function summarizeLiveSmoke(
+  liveSmoke,
+  { env = {}, maxAgeSeconds = null, now = null, productionRequested = false } = {},
+) {
   const caps = liveSmoke?.caps ?? {};
   const capSummary = {
     max_duration_ms: numberOrNull(caps.max_duration_ms),
@@ -302,6 +443,33 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     liveSmoke.provider === "cartesia_gemini" &&
     budgetCapped &&
     remoteCostCapped;
+
+  // RELEASE-003/007/008: fresh, budget-capped evidence is not by itself
+  // proof this smoke ran against *this* release's own run and deploy.
+  // run_id/agent_deploy_id/deploy_sha are the release's own primary
+  // identity keys and are all always required in production -- a missing
+  // expected value (an unset VIVA_RELEASE_RUN_ID/_AGENT_DEPLOY_ID/
+  // _DEPLOY_SHA, or live smoke evidence that omits the field) is a
+  // verification failure, not a skip, exactly like a real mismatch. Each
+  // gets its own distinct missing-evidence id (live_smoke_run_id_match /
+  // live_smoke_agent_deploy_match / live_smoke_deploy_sha_match) so a
+  // binding failure never collapses into budget_capped_live_smoke's
+  // diagnostic.
+  const expectedRunId = stringOrNull(env.VIVA_RELEASE_RUN_ID);
+  const expectedAgentDeployId = stringOrNull(env.VIVA_RELEASE_AGENT_DEPLOY_ID);
+  const expectedDeploySha = stringOrNull(env.VIVA_RELEASE_DEPLOY_SHA);
+  const liveSmokeRunId = stringOrNull(liveSmoke?.run_id);
+  const liveSmokeAgentDeployId = stringOrNull(liveSmoke?.agent_deploy_id);
+  const liveSmokeDeploySha = stringOrNull(liveSmoke?.deploy_sha);
+  const runIdMatch =
+    !productionRequested || (expectedRunId !== null && liveSmokeRunId === expectedRunId);
+  const agentDeployMatch =
+    !productionRequested ||
+    (expectedAgentDeployId !== null && liveSmokeAgentDeployId === expectedAgentDeployId);
+  const deployShaMatch =
+    !productionRequested ||
+    (expectedDeploySha !== null && liveSmokeDeploySha === expectedDeploySha);
+
   return {
     present: liveSmoke?.schema === "viva.live_provider_smoke.v1",
     generated_at: liveSmoke?.generated_at ?? null,
@@ -310,6 +478,12 @@ function summarizeLiveSmoke(liveSmoke, { maxAgeSeconds = null, now = null } = {}
     enabled: liveSmoke?.enabled === true,
     status: liveSmoke?.status ?? null,
     provider: liveSmoke?.provider ?? null,
+    run_id: liveSmokeRunId,
+    agent_deploy_id: liveSmokeAgentDeployId,
+    deploy_sha: liveSmokeDeploySha,
+    run_id_match: runIdMatch,
+    agent_deploy_match: agentDeployMatch,
+    deploy_sha_match: deployShaMatch,
     caps: capSummary,
     readiness_voice_limits: {
       max_session_cost_usd: readinessVoiceLimit,
@@ -520,17 +694,18 @@ function stripIntegrityFields(evidence) {
   return clone;
 }
 
-function assertNoForbiddenEvidenceMarkers(value) {
+function assertNoForbiddenEvidenceMarkers(value, { env = process.env } = {}) {
+  // The one canonical implementation: structural forbidden-field checking
+  // plus text-marker/secret-value scanning, driven by the caller's own
+  // injected `env` -- never a bare, hardcoded `process.env` read internally.
+  assertNoForbiddenEvidenceMarkersCanonical(value, {
+    context: "production release evidence",
+    env,
+  });
   const serialized = JSON.stringify(value);
-  for (const needle of FORBIDDEN_EVIDENCE_MARKERS) {
+  for (const needle of GATE_ONLY_EVIDENCE_MARKERS) {
     if (serialized.includes(needle)) {
       throw new Error(`production release evidence includes forbidden payload marker: ${needle}`);
-    }
-  }
-  for (const [name, envValue] of Object.entries(process.env)) {
-    if (!/(KEY|TOKEN|SECRET|PASSWORD)/i.test(name)) continue;
-    if (envValue && envValue.length >= 8 && serialized.includes(envValue)) {
-      throw new Error(`production release evidence includes secret value from ${name}`);
     }
   }
 }
@@ -590,7 +765,7 @@ function positiveWithin(value, max) {
   return typeof value === "number" && value > 0 && value <= max;
 }
 
-function positiveIntegerOrDefault(value, fallback) {
+export function positiveIntegerOrDefault(value, fallback) {
   const parsed = positiveIntegerOrNull(value);
   return parsed ?? fallback;
 }

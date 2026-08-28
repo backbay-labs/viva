@@ -48,6 +48,10 @@ const EXPECTED_OVERSIZED_ERROR = "text frame exceeds maximum size";
 const EXPECTED_OVERSIZED_CLOSE_REASON = "text frame too large";
 
 const selectedCase = parseSelectedCase(process.argv.slice(2));
+// RELEASE-023: the required voice-transport matrix claims both common device
+// capture rates. The rate is a CLI argument rather than an environment
+// variable so no new `VIVA_*` name has to be declared in turbo.json.
+const sourceSampleRateHz = parseSourceSampleRate(process.argv.slice(2));
 // Fixed, gitignored output directory. It is deliberately not env-configurable:
 // a new `VIVA_*` override would have to be declared in `turbo.json`, which this
 // lane does not own.
@@ -120,6 +124,7 @@ try {
       case: selectedCase,
       negativeControlSeconds: NEGATIVE_CONTROL_SECONDS,
       session,
+      sourceSampleRateHz,
       stepTimeoutMs,
       streamedTurnSeconds: STREAMED_TURN_SECONDS,
       wsUrl,
@@ -150,6 +155,7 @@ try {
     observation,
     page_errors: pageErrors,
     page_url: pageUrl,
+    source_sample_rate_hz: sourceSampleRateHz,
     store: summarizeStore(agentReadiness?.store),
     ws_url: wsUrl,
   };
@@ -188,6 +194,26 @@ try {
   if (bundleDir) await rm(bundleDir, { recursive: true, force: true }).catch(() => {});
 }
 
+/** RELEASE-023: `--source-rate <hz>` selects the device capture rate to prove. */
+function parseSourceSampleRate(argv) {
+  let raw = null;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--source-rate") {
+      raw = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--source-rate=")) raw = arg.slice("--source-rate=".length);
+  }
+  if (raw === null || raw === undefined) return null;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 8_000 || value > 192_000) {
+    throw new Error(`--source-rate must be an integer sample rate in Hz; received ${raw}`);
+  }
+  return value;
+}
+
 function parseSelectedCase(argv) {
   let selected = STREAMED_TURNS_CASE;
   for (let index = 0; index < argv.length; index += 1) {
@@ -201,6 +227,11 @@ function parseSelectedCase(argv) {
       selected = arg.slice("--case=".length);
       continue;
     }
+    if (arg === "--source-rate") {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--source-rate=")) continue;
     throw new Error(`Unknown argument: ${arg}`);
   }
   if (!KNOWN_CASES.has(selected)) {
@@ -415,10 +446,6 @@ async function bundleBrowserEntry(outDir, env) {
     `process.env.NEXT_PUBLIC_VIVA_AGENT_HTTP_URL=${JSON.stringify(env.agentHttpUrl)}`,
     "--define",
     "process.env.NEXT_PUBLIC_VIVA_API_URL=undefined",
-    "--define",
-    "process.env.VIVA_STATIC_EXPORT=undefined",
-    "--define",
-    "process.env.NEXT_PUBLIC_VIVA_STATIC_EXPORT=undefined",
   ];
   const { code, stderr, stdout } = await runCommand("bun", args);
   if (code !== 0) {

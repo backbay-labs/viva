@@ -1,8 +1,12 @@
 import { stat } from "node:fs/promises";
 import path from "node:path";
 
+// D-09 STRUCTURED_PREVIEW_EVIDENCE, Branch B (non-product evidence): the
+// harness-authored "pending_local_preview" frame is intentionally absent from
+// this list. It is normalized separately below into `non_product_evidence`
+// and can never satisfy a required product frame, screenshot count, or
+// production release proof.
 const REQUIRED_BROWSER_STORY_FRAME_IDS = [
-  "pending_local_preview",
   "server_ready_study_set",
   "active_synthetic_manuscript",
   "second_tab_session_cap",
@@ -105,7 +109,7 @@ export function assertReleaseBrowserEvidence(evidence) {
       failures.push(`browser_story.frames ${frameId} must include a screenshot`);
     }
   }
-  if (browserStory.screenshot_count < REQUIRED_BROWSER_STORY_FRAME_IDS.length) {
+  if (browserStory.product_screenshot_count < REQUIRED_BROWSER_STORY_FRAME_IDS.length) {
     failures.push(
       `browser_story.frames must include at least ${REQUIRED_BROWSER_STORY_FRAME_IDS.length} screenshots`,
     );
@@ -194,17 +198,29 @@ export async function assertBrowserStoryArtifactFiles(result, rootDir) {
   }
 }
 
+// D-09 STRUCTURED_PREVIEW_EVIDENCE, Branch B: a frame is product evidence
+// unless it is explicitly tagged as a harness-authored structured preview.
+// Only product frames can satisfy REQUIRED_BROWSER_STORY_FRAME_IDS, count
+// toward `product_screenshot_count`, or otherwise back production release
+// proof; structured previews are normalized separately into
+// `non_product_evidence` and are inert for every release gate below.
+function isProductFrame(frame) {
+  return frame?.kind !== "structured_preview";
+}
+
 function normalizeBrowserStory(story) {
   const frames = Array.isArray(story?.frames) ? story.frames : [];
   const commandSummary = isRecord(story?.command_summary) ? story.command_summary : null;
   const artifactAudit = isRecord(story?.artifact_audit) ? story.artifact_audit : null;
-  const frameIds = frames
+  const productFrames = frames.filter(isProductFrame);
+  const nonProductFrames = frames.filter((frame) => !isProductFrame(frame));
+  const frameIds = productFrames
     .map((frame) => (typeof frame?.id === "string" ? frame.id : null))
     .filter(Boolean);
-  const screenshots = frames
+  const productScreenshots = productFrames
     .map((frame) => (typeof frame?.screenshot === "string" ? frame.screenshot : null))
     .filter(Boolean);
-  const frameScreenshotIds = frames
+  const frameScreenshotIds = productFrames
     .map((frame) =>
       typeof frame?.id === "string" &&
       typeof frame?.screenshot === "string" &&
@@ -213,7 +229,12 @@ function normalizeBrowserStory(story) {
         : null,
     )
     .filter(Boolean);
-  const artifactFiles = Array.from(new Set(["browser-story.json", "result.json", ...screenshots]))
+  const allScreenshots = frames
+    .map((frame) => (typeof frame?.screenshot === "string" ? frame.screenshot : null))
+    .filter(Boolean);
+  const artifactFiles = Array.from(
+    new Set(["browser-story.json", "result.json", ...allScreenshots]),
+  )
     .filter(isSafeRelativeArtifactName)
     .sort();
 
@@ -227,16 +248,25 @@ function normalizeBrowserStory(story) {
     fixture_hash_count: countFixtureHashes(story?.fixture_hashes),
     frame_ids: frameIds,
     frame_screenshot_ids: frameScreenshotIds,
+    non_product_evidence: normalizeNonProductEvidence(nonProductFrames),
     agent_provider: typeof story?.agent_provider === "string" ? story.agent_provider : null,
     sanitized: story?.sanitized === true,
     schema: typeof story?.schema === "string" ? story.schema : null,
-    screenshot_count: new Set(screenshots).size,
+    product_screenshot_count: new Set(productScreenshots).size,
     trace_retained: typeof story?.trace_retained === "boolean" ? story.trace_retained : null,
     validation_run_id:
       typeof commandSummary?.validation_run_id === "string"
         ? commandSummary.validation_run_id
         : null,
   };
+}
+
+function normalizeNonProductEvidence(frames) {
+  return frames.map((frame) => ({
+    id: typeof frame?.id === "string" ? frame.id : null,
+    kind: typeof frame?.kind === "string" ? frame.kind : null,
+    screenshot: typeof frame?.screenshot === "string" ? frame.screenshot : null,
+  }));
 }
 
 function normalizeStoreDurabilityMode(store) {

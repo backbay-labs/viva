@@ -118,6 +118,187 @@ test("provider failure observations are loaded from release evidence artifacts",
   }
 });
 
+test("hosted monitor evidence requires VIVA_RELEASE_RUN_ID before resolving any production path, even an explicit manifest path", async () => {
+  const root = await tempRoot();
+  try {
+    const manifestPath = path.join(root, "artifacts/hosted-monitor/pr/release-run-1/manifest.json");
+    await writeJson(manifestPath, hostedManifest({ run_id: "release-run-1" }));
+
+    await assert.rejects(
+      () =>
+        readHostedMonitorEvidence({
+          env: { VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath },
+          mode: "production",
+          now,
+          productionRequested: true,
+          root,
+        }),
+      /VIVA_RELEASE_RUN_ID/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor evidence rejects a manifest whose run_id differs by one character", async () => {
+  const root = await tempRoot();
+  try {
+    const manifestPath = path.join(root, "artifacts/hosted-monitor/pr/release-run-1/manifest.json");
+    await writeJson(manifestPath, hostedManifest({ run_id: "release-run-2" }));
+
+    await assert.rejects(
+      () =>
+        readHostedMonitorEvidence({
+          env: {
+            VIVA_RELEASE_RUN_ID: "release-run-1",
+            VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath,
+          },
+          mode: "production",
+          now,
+          productionRequested: true,
+          root,
+        }),
+      /run_id does not match VIVA_RELEASE_RUN_ID/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor evidence rejects a manifest with sanitized missing, null, or false", async () => {
+  const root = await tempRoot();
+  try {
+    for (const sanitizedValue of [undefined, null, false]) {
+      const manifest = hostedManifest({ run_id: "release-run-1" });
+      if (sanitizedValue === undefined) delete manifest.sanitized;
+      else manifest.sanitized = sanitizedValue;
+      const manifestPath = path.join(root, "artifacts/hosted-monitor/pr/release-run-1/manifest.json");
+      await writeJson(manifestPath, manifest);
+
+      await assert.rejects(
+        () =>
+          readHostedMonitorEvidence({
+            env: {
+              VIVA_RELEASE_RUN_ID: "release-run-1",
+              VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH: manifestPath,
+            },
+            mode: "production",
+            now,
+            productionRequested: true,
+            root,
+          }),
+        /sanitized/,
+        `sanitized=${sanitizedValue} must be rejected`,
+      );
+    }
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor evidence never falls back to the lexicographic latest manifest in production", async () => {
+  const root = await tempRoot();
+  try {
+    // Lexicographically, "run-2" sorts after "run-1" -- a "latest" fallback
+    // would silently pick "run-2", an arbitrary unrequested run, for a
+    // production release that never named which run it wanted.
+    await writeJson(
+      path.join(root, "artifacts/hosted-monitor/pr/run-1/manifest.json"),
+      hostedManifest({ run_id: "run-1" }),
+    );
+    await writeJson(
+      path.join(root, "artifacts/hosted-monitor/pr/run-2/manifest.json"),
+      hostedManifest({ run_id: "run-2" }),
+    );
+
+    await assert.rejects(
+      () =>
+        readHostedMonitorEvidence({
+          env: {},
+          mode: "production",
+          now,
+          productionRequested: true,
+          root,
+        }),
+      /VIVA_RELEASE_RUN_ID/,
+    );
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor evidence may still use the lexicographic latest manifest for non-production convenience", async () => {
+  const root = await tempRoot();
+  try {
+    await writeJson(
+      path.join(root, "artifacts/hosted-monitor/pr/run-1/manifest.json"),
+      hostedManifest({ run_id: "run-1" }),
+    );
+    await writeJson(
+      path.join(root, "artifacts/hosted-monitor/pr/run-2/manifest.json"),
+      hostedManifest({ run_id: "run-2" }),
+    );
+
+    const manifest = await readHostedMonitorEvidence({
+      env: {},
+      mode: "production",
+      now,
+      productionRequested: false,
+      root,
+    });
+
+    assert.equal(manifest.run_id, "run-2");
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test("hosted monitor evidence requires complete expected deploy identity in production before trusting any run's reported deploy ids", () => {
+  assert.throws(
+    () =>
+      matrixResultsFromHostedMonitorEvidence(hostedManifest(), {
+        // VIVA_RELEASE_WEB_DEPLOY_ID/VIVA_RELEASE_AGENT_DEPLOY_ID absent --
+        // silently skipping the deploy-identity check here would let a
+        // manifest's own (unverified) deploy ids stand in unexamined.
+        env: { VIVA_RELEASE_RUN_ID: "release-run-1" },
+        now,
+        productionRequested: true,
+        requiredScenarioIds: ["provider_rate_limited"],
+      }),
+    /deploy identity/,
+  );
+});
+
+test("hosted monitor evidence checks every passed run's deploy ids against the selected target, not only required-scenario runs", () => {
+  assert.throws(
+    () =>
+      matrixResultsFromHostedMonitorEvidence(
+        hostedManifest({
+          runs: [
+            hostedRun("happy_path", {
+              hosted_e2e: {
+                deploy_ids: { web: "wrong-web", agent: "agent-1" },
+                failure_class: null,
+                terminal_reason: "completed",
+                recap_success: true,
+              },
+            }),
+            hostedRun("provider_rate_limited"),
+          ],
+        }),
+        {
+          env: productionDeployEnv(),
+          now,
+          productionRequested: true,
+          // "happy_path" is deliberately NOT a required recovery scenario,
+          // yet its wrong deploy id must still be caught.
+          requiredScenarioIds: ["provider_rate_limited"],
+        },
+      ),
+    /hosted monitor deploy identity mismatch for happy_path/,
+  );
+});
+
 test("provider failure observations are required for production release checks", async () => {
   const root = await tempRoot();
   try {

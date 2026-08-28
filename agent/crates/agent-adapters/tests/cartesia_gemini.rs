@@ -457,7 +457,7 @@ async fn fake_runtime_is_selectable_realtime_brain_without_live_keys() {
     // `concept_statuses` value below was made in Plan 09's `data` crate. The
     // original sentence above is untouched and still true; only the store-shape
     // count moved, arbitrated by the untouched `store_snapshot` block of both
-    // frozen v5 evidence packs. Revert recipe if the sanction is refused: restore
+    // frozen v5 evidence packs. Reversal steps if the sanction is refused: restore
     // `assert!(snapshot.concept_statuses.is_empty())` here and in
     // `fake_runtime_open_barge_in_cancels_old_response_and_accepts_new_turn`.
     let snapshot = store.snapshot();

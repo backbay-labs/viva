@@ -1,11 +1,13 @@
-import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
-  type: "json",
-};
+import { RELEASE_LEARNER_LOOP_CONTRACT as learnerLoopContract } from "./release-contract-validation.mjs";
 import { FAILURE_CONTROL_SCENARIOS } from "./failure-control-harness.mjs";
 
 export const HOSTED_E2E_MATRIX_SCHEMA = "viva.hosted_e2e_matrix.v1";
 export const HOSTED_E2E_RESULT_SCHEMA = "viva.hosted_e2e_result.v1";
 export const HOSTED_E2E_MONITOR_POLICY_SCHEMA = "viva.hosted_monitor_policy.v1";
+export const HOSTED_LIVE_MONITOR_STATE_SCHEMA = "viva.hosted_live_monitor_state.v1";
+export const HOSTED_LIVE_MONITOR_STATE_OBJECT_KEY =
+  "viva-hosted-monitor/state/live-monitor-state.v1.json";
+export const HOSTED_LIVE_MONITOR_STATE_PROBE_KEY = "viva-hosted-monitor/state/.cas-probe.v1.json";
 export const HOSTED_MAX_SUBMITTED_ANSWER_RESOLUTION_MS =
   learnerLoopContract.max_submitted_answer_resolution_ms;
 const SUPPORTED_MATRIX_PROFILES = new Set(["contract", "full", "pr", "scheduled"]);
@@ -19,7 +21,7 @@ export const HOSTED_E2E_REQUIRED_EVIDENCE_FIELDS = Object.freeze([
   "control_mode",
   "postgres_durability",
   ...learnerLoopContract.evidence_fields,
-  "screenshots",
+  "local_screenshots",
   "traces",
   "log_correlation",
   "redaction_audit",
@@ -70,11 +72,7 @@ const BASELINE_SCENARIOS = Object.freeze([
     stage: "client",
     terminal_reason: "completed",
     recap_success_expected: true,
-    coverage: [
-      "back_forward_recovery",
-      "refresh_recovery",
-      "visible_url_canonicalized",
-    ],
+    coverage: ["back_forward_recovery", "refresh_recovery", "visible_url_canonicalized"],
   }),
   scenario({
     id: "deterministic_partial_recap",
@@ -353,7 +351,12 @@ export function buildHostedBrowserEvidence({
     cost_usd: null,
     token_refresh_outcome: tokenRefreshOutcome,
     recap_success: recapSuccess === true,
-    screenshots: Array.isArray(screenshots) ? screenshots : [],
+    // RELEASE-018/025: named `local_screenshots` -- these are local-disk PNG
+    // filenames captured by the browser harness, never a durable S3 object
+    // reference. `publishableHostedFiles` (hosted-monitor-runner.mjs) never
+    // uploads PNGs, so this list must not be read as a set of fetchable
+    // object keys.
+    local_screenshots: Array.isArray(screenshots) ? screenshots : [],
     traces: trace ? "local_only_not_published" : "none",
     log_correlation: {
       hosted_run_id: runId,
@@ -423,7 +426,7 @@ export function summarizeHostedE2eResult(result) {
     cost_usd: evidence.cost_usd,
     recap_success: evidence.recap_success === true,
     token_refresh_outcome: evidence.token_refresh_outcome,
-    screenshots: evidence.screenshots,
+    local_screenshots: evidence.local_screenshots,
     traces: evidence.traces,
     redaction_audit: evidence.redaction_audit,
     deploy_ids: evidence.deploy_ids,

@@ -192,7 +192,7 @@ test("per-PR redaction check permits learner question prompt caption projection 
 test("per-PR redaction check permits release bundle signing-secret proof only", () => {
   assert.equal(
     addedLineViolatesRedactionAudit(
-      '  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);',
+      "  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);",
       {
         file: "scripts/production-release-gate.mjs",
       },
@@ -210,7 +210,29 @@ test("per-PR redaction check permits release bundle signing-secret proof only", 
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
-      '  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);',
+      "  const signingSecret = stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET);",
+      {
+        file: "scripts/release-check.mjs",
+      },
+    ),
+    true,
+  );
+  // RELEASE-004 Task 11's downstream requireHmac guard reads the secret
+  // inline (never binding it to the local `signingSecret` name), so this is
+  // a third, independent literal-line occurrence of the same marker and
+  // needs its own allowlist entry rather than reusing the two above.
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "    if (stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET) === null) {",
+      {
+        file: "scripts/production-release-gate.mjs",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "    if (stringOrNull(env.VIVA_RELEASE_BUNDLE_SIGNING_SECRET) === null) {",
       {
         file: "scripts/release-check.mjs",
       },
@@ -459,7 +481,7 @@ test("per-PR redaction check permits required auth source identifiers only in so
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
-      "      VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession,",
+      "      VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession(claims, secret),",
       {
         file: "scripts/hosted-monitor-runner.mjs",
       },
@@ -468,7 +490,7 @@ test("per-PR redaction check permits required auth source identifiers only in so
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
-      "        ? { VIVA_LIVE_SMOKE_SESSION_TOKEN: liveConfig.session.signedSession }",
+      '  const secret = requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET");',
       {
         file: "scripts/hosted-monitor-runner.mjs",
       },
@@ -501,7 +523,7 @@ test("per-PR redaction check permits required auth source identifiers only in so
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
-      '      secret: requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET"),',
+      '  const secret = requiredValue(env, "VIVA_VOICE_SESSION_TOKEN_SECRET");',
       {
         file: "scripts/hosted-monitor-runner.mjs",
       },
@@ -510,7 +532,7 @@ test("per-PR redaction check permits required auth source identifiers only in so
   );
   assert.equal(
     addedLineViolatesRedactionAudit(
-      "function signedLiveMonitorSession({ secret, sessionId, studySetId, userId }) {",
+      "      VIVA_LIVE_SMOKE_SESSION_TOKEN: signHostedLiveSmokeSession(claims, secret),",
       {
         file: "scripts/hosted-monitor-runner.mjs",
       },
@@ -533,9 +555,12 @@ test("per-PR redaction check permits required auth source identifiers only in so
     false,
   );
   assert.equal(
-    addedLineViolatesRedactionAudit("  evidence.session_token = liveConfig.session.signedSession;", {
-      file: "scripts/hosted-monitor-runner.mjs",
-    }),
+    addedLineViolatesRedactionAudit(
+      "  evidence.session_token = liveConfig.session.signedSession;",
+      {
+        file: "scripts/hosted-monitor-runner.mjs",
+      },
+    ),
     true,
   );
   assert.equal(
@@ -549,6 +574,23 @@ test("per-PR redaction check permits required auth source identifiers only in so
       file: "scripts/e2e-browser.mjs",
     }),
     true,
+  );
+  // RELEASE-018/025: `hosted-monitor-state.mjs`'s own SigV4 signer builds the
+  // identical `authorization` header as `hosted-monitor-runner.mjs`'s -- the
+  // scheme/credential-scope literal, never a live key/signature value -- and
+  // needs its own allowlist entry rather than inheriting the sibling file's.
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "          authorization: `AWS4-HMAC-SHA256 Credential=$" +
+        "{store.accessKeyId}/$" +
+        "{scope}, SignedHeaders=$" +
+        "{signedHeaders}, Signature=$" +
+        "{signature}`,",
+      {
+        file: "scripts/hosted-monitor-state.mjs",
+      },
+    ),
+    false,
   );
   assert.throws(
     () =>
@@ -720,5 +762,75 @@ test("per-PR redaction check fails when the configured base cannot be diffed", (
   assert.match(
     result.stderr,
     /Unable to compute redaction diff from refs\/heads\/definitely-missing-redaction-base/,
+  );
+});
+
+// W-07: the local browser story's signed-start configuration is sanctioned in
+// the source audit as parameter passing and constructed loopback literals. This
+// proves the sanction is NARROW: each allowed line is allowed only in its exact
+// form, and every dangerous neighbour of it is still refused.
+test("per-PR redaction check permits the local signed-start configuration only in its exact form", () => {
+  const file = "scripts/e2e-browser.mjs";
+  const allowed = [
+    'const LOCAL_STORY_SESSION_TOKEN_SECRET = "viva-local-e2e-session-token-material-0000";',
+    'const LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET = "viva-local-e2e-bootstrap-token-material-0";',
+    'const LOCAL_STORY_AGENT_SCOPED_BEARER = "viva-local-e2e-agent-scoped-read-material0";',
+    "          VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: localSignedSessionMode",
+    "            ? LOCAL_STORY_AGENT_SCOPED_BEARER",
+    "              ? LOCAL_STORY_SESSION_TOKEN_SECRET",
+    "      VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,",
+    "      VIVA_AGENT_REST_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,",
+    "      VIVA_AGENT_SESSION_MINT_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,",
+    "      VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: LOCAL_STORY_BOOTSTRAP_TOKEN_SECRET,",
+    "      VIVA_VOICE_SESSION_TOKEN_SECRET: failureControlPlan.enabled",
+    "        ? failureControlEnv.VIVA_VOICE_SESSION_TOKEN_SECRET",
+    "        : LOCAL_STORY_SESSION_TOKEN_SECRET,",
+    " * in one place: free text (`question.prompt`, `evaluation.answer_text`,",
+  ];
+  for (const line of allowed) {
+    assert.equal(
+      addedLineViolatesRedactionAudit(line, { file }),
+      false,
+      `sanctioned line must be permitted: ${line}`,
+    );
+  }
+
+  const refused = [
+    // Logging any of the constants.
+    "  console.log(LOCAL_STORY_SESSION_TOKEN_SECRET);",
+    "  console.log(`bearer ${LOCAL_STORY_AGENT_SCOPED_BEARER}`);",
+    // Copying a credential by name out of the ambient parent environment
+    // instead of constructing it -- the exact thing RELEASE-029 removed.
+    "      VIVA_AGENT_REST_BEARER_TOKEN: process.env.VIVA_AGENT_REST_BEARER_TOKEN,",
+    "      VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET: process.env.VIVA_SESSION_BOOTSTRAP_TOKEN_SECRET,",
+    // A credential put into evidence rather than into a child environment.
+    "      session_token: LOCAL_STORY_SESSION_TOKEN_SECRET,",
+    "    result.session_token = LOCAL_STORY_SESSION_TOKEN_SECRET;",
+    // A derived or concatenated form of a sanctioned line.
+    "        : `${LOCAL_STORY_SESSION_TOKEN_SECRET}-derived`,",
+    // The same env key carrying a real-looking value inline. The value is
+    // fragment-assembled so this source file never contains a contiguous
+    // key-shaped literal (the static-release token precedent): hosting
+    // push-protection scanners pattern-match the assembled form.
+    `      VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN: "${["sk", "live", "abcdefghijklmnopqrstuvwxyz"].join("_")}",`,
+    // Prose is sanctioned only as the exact enumeration line; an answer_text
+    // read is not.
+    "      answerText: event.evaluation.answer_text,",
+  ];
+  for (const line of refused) {
+    assert.equal(
+      addedLineViolatesRedactionAudit(line, { file }),
+      true,
+      `dangerous neighbour must still be refused: ${line}`,
+    );
+  }
+
+  // The sanction is file-scoped: the same lines are refused elsewhere.
+  assert.equal(
+    addedLineViolatesRedactionAudit(
+      "      VIVA_AGENT_REST_BEARER_TOKEN: LOCAL_STORY_AGENT_SCOPED_BEARER,",
+      { file: "scripts/hosted-monitor-runner.mjs" },
+    ),
+    true,
   );
 });

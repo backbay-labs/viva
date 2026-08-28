@@ -2977,7 +2977,7 @@ mod tests {
         assert_eq!(snapshot.answer_attempts.len(), 1);
         // CROSS-LANE FALLOUT — AWAITING COORDINATOR SANCTION (A-07/A-08/A-17
         // category). This file is Plan 05/08's; the `A-22` store change that forces
-        // this value was made in Plan 09's `data` crate. Revert recipe if the
+        // this value was made in Plan 09's `data` crate. Reversal steps if the
         // sanction is refused: restore `assert!(snapshot.concept_statuses.is_empty())`
         // here and in the fake-Cartesia twin below, and both tests go red until the
         // owning lane re-pins them.

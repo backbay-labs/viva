@@ -87,6 +87,28 @@ export VIVA_VOICE_WS_MAX_AUDIO_BYTES_PER_MINUTE="1440000"
 export VIVA_VOICE_WS_MAX_SESSION_COST_USD="0.75"
 ```
 
+`VIVA_VOICE_WS_MAX_IP_SESSIONS` keys its per-IP cap off the raw socket peer
+address by default, so a direct deployment needs no forwarding proxy header
+at all. Set `VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS` to a comma-separated CIDR
+list only when a real proxy terminates in front of the agent and its address
+is worth naming as trusted:
+
+```sh
+export VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS="10.0.0.0/8"
+```
+
+When the connecting peer does not match a configured CIDR -- including the
+default case of no CIDRs configured at all -- `X-Forwarded-For` is ignored
+outright and the socket peer address is the session key, so a spoofed header
+from a direct client can never open a second per-IP bucket. Only when the
+peer itself is a trusted proxy does the service consult `X-Forwarded-For`: it
+scans the comma-separated chain right to left, skips any hop that is itself a
+trusted proxy, and takes the first untrusted hop as the client address.
+`X-Real-IP` is never consulted. A trusted peer that omits the header, sends a
+malformed or oversized (over 32 hops) chain, or names only trusted hops is
+rejected before a session slot or IP lease is acquired -- there is no
+unattributed fallback to the peer address in that case.
+
 The live Cartesia/Gemini provider remains opt-in Act 3 work. Do not set
 `VIVA_AGENT_PROVIDER=cartesia_gemini` for default beta validation. The
 `fake_cartesia_gemini` provider is a deterministic no-key provider-shaped smoke
@@ -241,6 +263,22 @@ but it is not a credential. Do not expose the REST bearer through any
 `NEXT_PUBLIC_*` variable. The same-origin endpoints reject cross-origin callers,
 rate-limit minting by client IP plus session identity, and return only
 `session`, `session_token`, `token_refresh_outcome`, and `failure_class`.
+
+When `/api/viva-session/start` mints a signed start token, the web service
+records the voice session at the agent in the same operation (the signed-start
+deadlock fix, `A-32`), presenting a dedicated agent credential:
+
+```sh
+VIVA_AGENT_SESSION_MINT_BEARER_TOKEN="<from the web service secret store>"
+```
+
+The agent requires this credential whenever it binds beyond loopback. Its value
+is 32–512 bytes, must be byte-distinct from every other configured bearer (the
+agent fails closed at startup on any collision), and requires
+`VIVA_VOICE_SESSION_TOKEN_SECRET` to be configured alongside it. The agent
+accepts it for the mint/record operation only, and only for the agent's own
+trusted user: it carries no general library-read, delete, or cross-user
+authority (`A-36`).
 Refresh validates the HMAC signature locally, treats expired signed material as
 recoverable by minting a fresh resume token through the agent, and leaves nonce
 replay authority with `/ws`. Refresh outcomes such as `expired_refreshed`,
@@ -331,16 +369,14 @@ flaky real outages. Do not set `VIVA_RELEASE_CHECK_SKIP_BROWSER=1` for release
 evidence; a browser-skipped result cannot certify production readiness.
 
 Opt-in live smoke is separate. Only run it after Act 3 makes `/ready` selectable
-for `cartesia_gemini` and after budget/time caps are set. The minimum proof is:
+for `cartesia_gemini` and after budget/time caps are set. Confirm the agent
+deployment itself (never this shell) sets `VIVA_AGENT_PROVIDER=cartesia_gemini`,
+`VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1`, `CARTESIA_API_KEY`, `GEMINI_API_KEY`,
+`CARTESIA_ZERO_DATA_RETENTION_ENABLED=1`, and `GEMINI_ZERO_DATA_RETENTION_APPROVED=1`
+before continuing:
 
 ```sh
 AGENT_ORIGIN="https://agent.viva.example.com"
-export VIVA_AGENT_PROVIDER="cartesia_gemini"
-export VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1
-export CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
-export GEMINI_ZERO_DATA_RETENTION_APPROVED=1
-: "${CARTESIA_API_KEY:?set CARTESIA_API_KEY in the secret store before live smoke}"
-: "${GEMINI_API_KEY:?set GEMINI_API_KEY in the secret store before live smoke}"
 curl -fsS "$AGENT_ORIGIN/ready" | jq '.brain.provider, .brain.selectable, .brain.live_runtime'
 ```
 
@@ -349,10 +385,17 @@ and `live_runtime: true`, and an opt-in `/ws` session reaches a sanitized
 `recap_ready` event through the real provider cascade. The harness is disabled
 unless `VIVA_LIVE_PROVIDER_SMOKE=1` is present, reads spoken PCM input only from
 an explicit local file, and writes sanitized counters to
-`artifacts/live-provider-smoke/evidence.json`:
+`artifacts/live-provider-smoke/evidence.json`.
+RELEASE-016/021: `bun run live:smoke` never reads `CARTESIA_API_KEY`,
+`GEMINI_API_KEY`, `CARTESIA_ZERO_DATA_RETENTION_ENABLED`, or
+`GEMINI_ZERO_DATA_RETENTION_APPROVED` directly -- the agent deployment above
+is the only component that holds them. Set
+`VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED=1` instead, once the `/ready` check
+above has confirmed they are configured there:
 
 ```sh
 export VIVA_LIVE_PROVIDER_SMOKE=1
+export VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED=1
 export VIVA_LIVE_SMOKE_AGENT_HTTP_URL="$AGENT_ORIGIN"
 export VIVA_LIVE_SMOKE_ORIGIN="https://app.viva.example.com"
 export VIVA_LIVE_SMOKE_AUDIO_FILE="$PWD/artifacts/live-smoke/answer.pcm"
@@ -486,7 +529,6 @@ VIVA_HOSTED_FAKE_PROVIDER_AGENT_HTTP_URL="https://viva-fake-agent.example.com"
 VIVA_HOSTED_FAKE_PROVIDER_AGENT_WS_URL="wss://viva-fake-agent.example.com/ws"
 VIVA_HOSTED_SYNTHETIC_USER_ID="synthetic-monitor-user"
 VIVA_HOSTED_SYNTHETIC_STUDY_SET_ID="biology-midterm"
-VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store>"
 VIVA_FAILURE_CONTROL_SECRET="<from the hosted agent secret store for PR mode>"
 VIVA_HOSTED_ARTIFACT_BUCKET="<Railway object bucket name>"
 VIVA_HOSTED_ARTIFACT_ENDPOINT="<Railway object bucket endpoint>"
@@ -525,25 +567,102 @@ The legacy generic
 allowed only when `VIVA_HOSTED_PR_FAILURE_CONTROL_SCENARIOS` names exactly one
 scenario.
 
-When `VIVA_HOSTED_LIVE_MONITOR_ENABLED=1`, also provide the live provider
-secrets, zero-retention confirmations, a pre-provisioned synthetic live-session
-identity, plus persisted scheduler state and a dedicated
-live-provider target whose deployed agent reports the same remote cost cap on
-`/ready` and `/health/brain`. The monitor image creates
-`/app/evidence/live-smoke-answer.pcm` at build time; override
-`VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE` only when replacing it with another
-sanitized spoken PCM fixture. The scheduled runner derives a fresh UUID voice
-session id from `VIVA_HOSTED_LIVE_MONITOR_SESSION_ID`, `VIVA_HOSTED_RUN_ID`, and
-a per-invocation nonce, signs a fresh single-use session capability with
-`VIVA_VOICE_SESSION_TOKEN_SECRET`, maps these hosted variables into
-`VIVA_LIVE_SMOKE_*`, and must not let `bun run live:smoke` bootstrap durable
-study text through `/study-sets/paste`.
+When `VIVA_HOSTED_LIVE_MONITOR_ENABLED=1`, also provide
+`VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED=1`, `VIVA_VOICE_SESSION_TOKEN_SECRET`, a
+pre-provisioned synthetic live-session identity, and a dedicated live-provider
+target whose deployed agent reports the same remote cost cap on `/ready` and
+`/health/brain`. RELEASE-016/021: the monitor's own environment never holds
+`CARTESIA_API_KEY`, `GEMINI_API_KEY`,
+`CARTESIA_ZERO_DATA_RETENTION_ENABLED`, or
+`GEMINI_ZERO_DATA_RETENTION_APPROVED` -- the agent deployment above is the
+only component that holds them; `VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED=1`
+attests they are already configured and zero-retention-approved there. The
+monitor image creates `/app/evidence/live-smoke-answer.pcm` at build time;
+override `VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE` only when replacing it with
+another sanitized spoken PCM fixture. The scheduled runner derives a fresh
+UUID voice session id from `VIVA_HOSTED_LIVE_MONITOR_SESSION_ID`,
+`VIVA_HOSTED_RUN_ID`, and a per-invocation nonce, and mints a fresh
+single-use session capability signed with `VIVA_VOICE_SESSION_TOKEN_SECRET`
+immediately before spawning `scheduled_hosted_live_smoke` -- never earlier,
+and never persisted in the plan or the hosted summary. `buildHostedMonitorPlan`
+validates that secret's presence synchronously, at plan-construction time, so
+a misconfigured live monitor fails fast before any durable-state reservation
+or a preceding leg runs, but discards the value immediately -- the check
+never retains it on the plan. The capability's signed claims carry exactly
+what the deployed agent's `SessionTokenClaims`
+(`agent/crates/agent-service/src/config.rs`) accepts: the synthetic
+`user_id`, `study_set_id`, and `session_id`, an `expires_at`, and a nonce.
+That struct derives `#[serde(deny_unknown_fields)]`, so it cannot also carry
+a run id, deploy SHA, agent deploy id, or provider mode -- an unrecognized
+claim makes the deployed server reject the whole token as malformed before
+any provider work. The run id, deploy SHA, agent deploy id, and provider mode
+still travel with the run for audit, on the sanitized run record and hosted
+summary outside the signed envelope; binding them cryptographically into the
+verified token itself would require extending that struct (the way
+`failure_control` is already nested there), which remains a deferred
+capability-lane change, not something this runner can do on its own. The
+token's expiry covers the run's own timeout plus an additional 60-second
+safety margin -- the run's own timeout already folds in the runner's
+30-second flush grace -- measured from the moment of minting, so an earlier,
+slower leg in the same invocation can never eat into its validity window. The
+runner maps these hosted variables into `VIVA_LIVE_SMOKE_*`, and must not let
+`bun run live:smoke` bootstrap durable study text through `/study-sets/paste`.
+
+### Durable live-monitor state (BAC-527)
+
+The scheduled-run authority for cadence, daily budget, consecutive failures,
+and self-quarantine is no longer operator-set environment state. `bun run
+hosted:monitor` reads and reserves one run-independent, schema-versioned
+object at `viva-hosted-monitor/state/live-monitor-state.v1.json` in the same
+durable artifact store as the evidence bundle, keyed by the current UTC date
+(`date_utc`) with `runs_today`, `tokens_today`, `cost_usd_today`,
+`consecutive_failures`, `last_failure_at`, `last_run_at`,
+`quarantined_until`, `active_reservation`, and `last_applied_run_id`. The
+state object never carries a learner/provider payload or a secret value; a
+schema violation or an unexpected key fails the read closed.
+
+At startup the runner probes conditional-write support against the
+configured endpoint using a dedicated probe key
+(`viva-hosted-monitor/state/.cas-probe.v1.json`), never the live state
+object: a PUT with a deliberately stale `If-Match` must be rejected with a
+precondition failure. A store that accepts the stale precondition, or errors
+on the header, is `state_unavailable` and fails the live leg closed before
+any reservation is attempted. Hosted CAS behavior (an object version/ETag
+transition observed across two real runs against the deployed store) is
+verified only by Plan 15 handoff item 4; the local injected-fetch tests in
+`scripts/hosted-monitor-state.test.mjs` prove the reservation, staleness, and
+idempotency contracts, not that the deployed store itself honors
+conditional-write preconditions.
+
+Before spawning the live child, the runner reserves the maximum per-run
+token and cost caps under compare-and-swap: it reads the object with its
+ETag, computes cadence/quarantine/budget eligibility from the durable
+fields, and writes the incremented reservation with `If-Match` (or
+`If-None-Match: *` on the very first run of all time). A precondition
+conflict re-reads and retries a bounded number of times, because a
+concurrent invocation may have consumed the remaining budget; exhausting
+those retries — like any read, auth, or schema failure — is
+`state_unavailable` and fails the live leg closed rather than guessing. A
+reservation is charged before the live child ever starts, and a crash after
+reservation stays conservatively charged until the UTC date rolls over; it
+is never refunded from unverifiable partial evidence. After the live leg
+finishes, the runner finalizes the same object under CAS, updating
+`consecutive_failures`, `last_failure_at`, and `quarantined_until` from the
+observed outcome and clearing `active_reservation`. Both reservation and
+finalization are idempotent on `last_applied_run_id`: retrying the exact
+same run ID (a re-invocation of the same cron execution) neither
+double-charges the budget nor double-increments the failure count. A state
+finalization failure is classified `publish_failed` and cannot yield a
+committed manifest — the runner uploads audited run objects, finalizes the
+durable state, and uploads the run manifest last, as the commit marker.
+
+The child process never sees the durable object or its credentials; the
+runner translates the resolved decision once into the smoke's public
+contract — `VIVA_LIVE_MONITOR_CONSECUTIVE_FAILURES` (the exact variable
+`bun run live:smoke` reads) and `VIVA_LIVE_SMOKE_RUN_ID` — with no
+`VIVA_HOSTED_*` state leaking into the child environment.
 
 ```sh
-VIVA_HOSTED_LIVE_MONITOR_STATE_DATE="2026-06-26"
-VIVA_HOSTED_LIVE_MONITOR_RUNS_TODAY=0
-VIVA_HOSTED_LIVE_MONITOR_LAST_RUN_AT="2026-06-26T00:00:00.000Z"
-VIVA_HOSTED_LIVE_MONITOR_QUARANTINED_UNTIL=""
 VIVA_HOSTED_LIVE_MONITOR_WEB_URL="https://viva-live-monitor-web.example.com"
 VIVA_HOSTED_LIVE_MONITOR_AGENT_HTTP_URL="https://viva-live-monitor-agent.example.com"
 VIVA_HOSTED_LIVE_MONITOR_AGENT_WS_URL="wss://viva-live-monitor-agent.example.com/ws"
@@ -553,11 +672,10 @@ VIVA_HOSTED_LIVE_MONITOR_AUDIO_FILE="/app/evidence/live-smoke-answer.pcm"
 VIVA_HOSTED_LIVE_MONITOR_USER_ID="synthetic-live-monitor-user"
 VIVA_HOSTED_LIVE_MONITOR_STUDY_SET_ID="live-monitor-study-set"
 VIVA_HOSTED_LIVE_MONITOR_SESSION_ID="live-monitor-session-1"
+VIVA_HOSTED_LIVE_MONITOR_AGENT_DEPLOY_ID="<optional; recorded on the sanitized run record and hosted summary for audit, outside the signed session capability>"
 VIVA_AGENT_PROVIDER="cartesia_gemini"
-CARTESIA_ZERO_DATA_RETENTION_ENABLED=1
-GEMINI_ZERO_DATA_RETENTION_APPROVED=1
-CARTESIA_API_KEY="<from provider secret store>"
-GEMINI_API_KEY="<from provider secret store>"
+VIVA_VOICE_SESSION_TOKEN_SECRET="<from the hosted agent secret store; must match the live-monitor target>"
+VIVA_LIVE_PROVIDER_SECRETS_CONFIRMED=1
 ```
 
 The hosted agent URL must point at a synthetic or fake monitor deployment whose
@@ -565,9 +683,11 @@ provider matches `VIVA_E2E_AGENT_PROVIDER`; do not aim the scheduled synthetic
 monitor at a live learner tutor endpoint. The live-monitor URL must point at a
 separate `cartesia_gemini` deployment configured with
 `VIVA_VOICE_WS_MAX_SESSION_COST_USD=0.25` or lower; `bun run live:smoke` rejects
-the target if readiness omits that cap or reports a higher cap. The control
-secret and session signing secret must come from the deployment secret store and
-must match the hosted agent variables. The PR failure-control leg must use its
+the target if readiness omits that cap or reports a higher cap. The
+`VIVA_VOICE_SESSION_TOKEN_SECRET` above must come from the deployment secret
+store and must match what the live-monitor target agent itself trusts, which
+may differ from the baseline scheduled-synthetic agent's secret. The PR
+failure-control leg must use its
 own hosted web and agent target that is preconfigured with matching
 `VIVA_FAILURE_CONTROL_*` gates; the normal synthetic leg, live-monitor leg, and
 failure-control leg must not share one hosted agent origin. The runner identity
@@ -646,8 +766,10 @@ of application rollback.
 
 Before any production release, the sanitized release evidence must include:
 
+- `VIVA_RELEASE_RUN_ID`
 - `VIVA_RELEASE_WEB_DEPLOY_ID`
 - `VIVA_RELEASE_AGENT_DEPLOY_ID`
+- `VIVA_RELEASE_DEPLOY_SHA`
 - `VIVA_LIVE_WEB_DEPLOY_ID`
 - `VIVA_LIVE_AGENT_DEPLOY_ID`
 - `VIVA_RELEASE_WEB_ORIGIN`
@@ -663,6 +785,8 @@ Before any production release, the sanitized release evidence must include:
 - `VIVA_GEMINI_QUOTA_RPM_LIMIT`
 - `VIVA_GEMINI_QUOTA_TPM_LIMIT`
 - `VIVA_RELEASE_BUNDLE_SIGNING_SECRET`
+- `VIVA_RELEASE_AGENT_IMAGE_DIGEST`
+- `VIVA_RELEASE_MONITOR_IMAGE_DIGEST`
 - `VIVA_RELEASE_OWNER`
 - `VIVA_RELEASE_OWNER_DECISION=proceed`
 - `VIVA_RELEASE_OWNER_DECIDED_AT_UTC`
@@ -673,11 +797,172 @@ ids, currently-live deploy ids, hosted browser deploy ids, redacted config and
 secret snapshot hashes, provider mode/model, durable Postgres state,
 budget-capped live smoke evidence, submitted-answer recovery matrix,
 provider-failure recovery proof, BAC-528 harness-disabled state, BAC-531
-consent/deletion proof, BAC-529 Gemini quota sufficiency, release bundle
+consent/deletion proof, BAC-529 Gemini quota sufficiency, pinned container
+build inputs and matching agent/monitor output-image digests, release bundle
 signature, and the owner proceed decision are present. The gate rejects stale
 evidence over 24 hours old, deploy-id mismatches, missing hosted browser
 evidence, browser-skipped evidence, and any ephemeral durability mode while
 BAC-520/BAC-521/BAC-522 durable-state proof is claimed.
+
+### Exact run and deploy binding (RELEASE-003/007/008)
+
+Fresh, sanitized, and schema-valid evidence is not by itself proof that a
+piece of evidence came from *this* release's own run and deploy. Every import
+this gate trusts is bound to the exact release identity, not merely dated and
+well-formed:
+
+- **Hosted monitor manifest resolution requires `VIVA_RELEASE_RUN_ID` before
+  resolving any production path** — even when an explicit
+  `VIVA_RELEASE_HOSTED_MONITOR_MANIFEST_PATH` is supplied. A production
+  import can never fall back to the lexicographically latest run directory
+  under `artifacts/hosted-monitor/<mode>/`; that convenience fallback exists
+  for non-production local/PR runs only, and even there the resulting gate's
+  `allowed` can never become `true` because `VIVA_PRODUCTION_RELEASE` is
+  unset. Once resolved, the manifest's own `run_id` must equal
+  `VIVA_RELEASE_RUN_ID` exactly — a one-character difference is rejected —
+  and `sanitized` must be strictly `true`; missing or `null` no longer passes
+  silently the way only an explicit `false` once did.
+- **Every passed hosted browser run's `deploy_ids.web`/`.agent` is checked
+  against the release's own `VIVA_RELEASE_WEB_DEPLOY_ID`/
+  `VIVA_RELEASE_AGENT_DEPLOY_ID`** in production — not only the runs a
+  required recovery scenario names. A production import without both
+  expected deploy ids configured is rejected outright rather than silently
+  skipping the comparison; the target a run actually exercised must be
+  mapped explicitly, never left to whatever the evidence happened to carry.
+- **Live smoke evidence (`live_smoke.run_id`/`.agent_deploy_id`/
+  `.deploy_sha`) must equal `VIVA_RELEASE_RUN_ID`/`VIVA_RELEASE_AGENT_DEPLOY_ID`/
+  `VIVA_RELEASE_DEPLOY_SHA`** in production. All three are the release's own
+  primary identity keys and are all always required — a missing expected
+  value (including an unset `VIVA_RELEASE_DEPLOY_SHA`, or live smoke
+  evidence that omits its own `deploy_sha`) is a verification failure, not
+  a skip, exactly like a real mismatch. Each of the three binds to its own
+  distinct missing-evidence id (`live_smoke_run_id_match`,
+  `live_smoke_agent_deploy_match`, `live_smoke_deploy_sha_match`) so a
+  binding failure is diagnosable on its own, separate from
+  `budget_capped_live_smoke`. `live-provider-smoke.mjs` writes `run_id`,
+  `agent_deploy_id`, and `deploy_sha` both at the top level of its own
+  evidence and inside the monitor correlation summary; set
+  `VIVA_LIVE_SMOKE_AGENT_DEPLOY_ID` alongside the existing
+  `VIVA_LIVE_SMOKE_RUN_ID` when invoking it directly.
+
+### Downstream bundle verification (RELEASE-004)
+
+Signing a bundle at generation time only proves it was self-consistent for
+whatever algorithm and environment produced it. It does not prove a *later*
+reader, in a *different* environment, should trust it: storage could be
+overwritten with a bundle relabeled `sha256-self`, or an old, honestly
+correctly-signed bundle could simply be reused for a different run or
+deploy than the one actually being verified right now. A separate,
+downstream command re-verifies a stored bundle from a fresh environment,
+after generation and storage:
+
+```sh
+VIVA_RELEASE_BUNDLE_SIGNING_SECRET="$VIVA_RELEASE_BUNDLE_SIGNING_SECRET" \
+  bun run release:verify -- artifacts/release-check/evidence.json
+```
+
+`scripts/verify-release-bundle.mjs` accepts exactly one evidence path and,
+whenever the stored bundle's own `production_release_gate.production_requested`
+is `true`:
+
+- requires a non-empty `VIVA_RELEASE_BUNDLE_SIGNING_SECRET` in its own
+  environment, requires the stored bundle's own `signature_algorithm` to be
+  exactly `hmac-sha256`, and requires `signature_key_present` to be `true`,
+  all before any signature is even compared. A verifying environment with no
+  secret is rejected outright, never silently downgraded into comparing the
+  bundle's own claimed `sha256-self` value against itself;
+- recomputes the HMAC over the stored payload with its own secret and
+  rejects a mismatch (a wrong secret, or any tamper to the bundle after it
+  was written);
+- separately requires `VIVA_RELEASE_RUN_ID`, `VIVA_RELEASE_DEPLOY_SHA`,
+  `VIVA_RELEASE_WEB_DEPLOY_ID`, and `VIVA_RELEASE_AGENT_DEPLOY_ID` from its
+  own environment and rejects a bundle whose bound identity
+  (`live_smoke.run_id`/`.deploy_sha`, `deploy_identity.release_deploy_ids.web`/
+  `.agent`) differs from any one of them, so a stale bundle valid for a
+  different run or deploy is rejected exactly like a tampered one. A missing
+  expected value is a verification failure, never a silently skipped check;
+- runs the same `assertProductionReleaseGate` check `release-check.mjs`
+  itself runs, so a validly signed but incomplete bundle is still rejected.
+
+On success it prints one sanitized JSON line — `schema`, `verified`,
+`run_id`, `deploy_sha`, `web_deploy_id`, `agent_deploy_id`, and
+`payload_sha256` only, never a secret or raw evidence field — and exits `0`;
+any failure exits non-zero. Outside a production-requested bundle this same
+command stays diagnosable but that bundle's own `production_release_gate`
+can never itself become `allowed: true`. Plan 15 supplies the real secret
+and runs this command in the authorized deployment/release environment; it
+is not executed against a live production target from this repository's own
+scripts.
+
+### Container supply chain (RELEASE-026)
+
+`agent/Dockerfile` and `Dockerfile.monitor` pin every `FROM` to an immutable
+`sha256:` index digest, not a mutable tag — the reviewed indexes as of
+2026-08-23:
+
+- `rust:1.94.1-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2`
+  (agent build stage)
+- `debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241`
+  (agent runtime stage)
+- `mcr.microsoft.com/playwright:v1.61.0-noble@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a`
+  (monitor image — the tag's own Playwright version is kept equal to
+  `bun.lock`'s resolved `playwright` package version, since a mismatch
+  between the npm package and the image's bundled browsers breaks the
+  browser story)
+
+`Dockerfile.monitor` installs Bun 1.3.3 from verified release bytes instead
+of piping `curl` into a shell: it downloads the exact `bun-v1.3.3` release
+archive selected by `TARGETARCH`, checks it with `sha256sum -c` against the
+pinned checksum for that architecture, rejects an unrecognized architecture,
+and deletes the downloaded archive and its extraction directory in the same
+`RUN` layer that created them:
+
+```text
+linux/amd64 bun-linux-x64.zip     f5c546736f955141459de231167b6fdf7b01418e8be3609f2cde9dfe46a93a3d
+linux/arm64 bun-linux-aarch64.zip 41b9f4f25256db897c2c135320e4f96c373e20ae6f06d8015187dac83591efc8
+```
+
+Both runtime images drop root before `CMD`: the agent image runs as fixed
+uid/gid `10001:10001`, and the monitor image runs as the Playwright base
+image's own `pwuser`, with `/app/evidence` explicitly owned by `pwuser` so
+the live-smoke fixture and evidence directory stay writable non-root. All
+`apt-get`/`espeak-ng`/`ffmpeg` build-time work happens before the `USER`
+switch; neither image re-enters root afterward.
+
+Sanitized release evidence records `container_provenance` with two distinct
+parts. `build_inputs` — the three base-image digests above, both Bun archive
+checksums, and the Bun version — is always knowable locally, straight from
+the committed Dockerfiles, so it is present in every run including
+non-production ones. `deployment_outputs` is knowable only from the actual
+selected deployment and is never inferred from a `FROM` line: outside a
+production release it always reports `status: "not_proven"` with both
+digest fields `null`. Production evidence additionally requires:
+
+- `VIVA_RELEASE_AGENT_IMAGE_DIGEST`
+- `VIVA_RELEASE_MONITOR_IMAGE_DIGEST`
+
+Each must be an exact `sha256:` digest — a mutable tag, a malformed value, a
+missing value, or the two values swapped between agent and monitor all fail
+the gate the same way a missing value does. `assertProductionReleaseGate`
+compares the *stored* evidence's `deployment_outputs` digests against the
+*verifying* environment's own `VIVA_RELEASE_AGENT_IMAGE_DIGEST`/
+`VIVA_RELEASE_MONITOR_IMAGE_DIGEST` — the same binding pattern as
+[Exact run and deploy binding](#exact-run-and-deploy-binding-release-003007008)
+above — so a stale or tampered digest is rejected exactly like a real
+mismatch, and a base-image `build_inputs` digest can never masquerade as
+deployed provenance because the gate never reads `build_inputs` when
+checking `deployment_outputs`.
+
+Local image/runtime verification (not hosted or deployed proof):
+
+```sh
+docker build -f agent/Dockerfile agent -t viva-agent-supply-chain-test
+docker run --rm --entrypoint sh viva-agent-supply-chain-test \
+  -c 'test "$(id -u)" = 10001 && test "$(id -g)" = 10001'
+docker build -f Dockerfile.monitor . -t viva-monitor-supply-chain-test
+docker run --rm --entrypoint sh viva-monitor-supply-chain-test \
+  -c 'test "$(id -u)" != 0 && test "$(bun --version)" = 1.3.3 && test -r /app/evidence/live-smoke-answer.pcm && test -w /app/evidence'
+```
 
 ## Logs And Evidence Redaction
 

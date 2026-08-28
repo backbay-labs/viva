@@ -12,6 +12,10 @@ import {
   providerFailureObservabilityEvidence,
 } from "./provider-failure-observability.mjs";
 import {
+  RELEASE_LEARNER_LOOP_CONTRACT,
+  validatedLearnerLoopForRelease,
+} from "./release-contract-validation.mjs";
+import {
   REQUIRED_ROLLBACK_TRIGGER_IDS,
   ROLLBACK_TRIGGER_THRESHOLDS,
 } from "./rollback-drain-criteria.mjs";
@@ -319,7 +323,13 @@ test("provider failure dashboard links the actual release evidence artifact path
 });
 
 test("release check exposes stale-evidence inputs without storing write-time age", async () => {
+  // RELEASE-005/006/009/010/011: buildReleaseGateEvidence/releaseDeploySha
+  // are now scripts/release-check-core.mjs's own extracted, independently
+  // behavior-tested primitives (see scripts/release-check.test.mjs and
+  // scripts/release-check-core.mjs's own docblocks) -- release-check.mjs
+  // itself keeps only the wiring: which inputs it passes to the call.
   const releaseCheck = await readFile("scripts/release-check.mjs", "utf8");
+  const releaseCheckCore = await readFile("scripts/release-check-core.mjs", "utf8");
 
   assert.match(releaseCheck, /release_gate: buildReleaseGateEvidence/);
   assert.match(
@@ -328,21 +338,22 @@ test("release check exposes stale-evidence inputs without storing write-time age
   );
   assert.match(
     releaseCheck,
-    /buildReleaseGateEvidence\(\{ browserResult, browserSkipShortcut, generatedAt \}\)/,
+    /buildReleaseGateEvidence\(\{\s*browserResult,\s*browserSkipShortcut,\s*env: process\.env,\s*generatedAt,?\s*\}\)/,
   );
-  assert.match(releaseCheck, /browserSkipShortcut \|\| browserResult\?\.skipped === true/);
-  assert.match(releaseCheck, /deploy_sha: releaseDeploySha\(\)/);
+  assert.match(releaseCheckCore, /browserSkipShortcut \|\| browserResult\?\.skipped === true/);
+  assert.match(releaseCheckCore, /deploy_sha: releaseDeploySha\(env\)/);
   for (const name of [
     "RAILWAY_GIT_COMMIT_SHA",
     "VERCEL_GIT_COMMIT_SHA",
     "GITHUB_SHA",
     "SOURCE_VERSION",
   ]) {
-    assert.match(releaseCheck, new RegExp(name));
+    assert.match(releaseCheckCore, new RegExp(name));
   }
-  assert.match(releaseCheck, /max_age_seconds/);
+  assert.match(releaseCheckCore, /max_age_seconds/);
   assert.doesNotMatch(releaseCheck, /evidence_age_seconds/);
-  assert.match(releaseCheck, /browser_skip_shortcut/);
+  assert.doesNotMatch(releaseCheckCore, /evidence_age_seconds/);
+  assert.match(releaseCheckCore, /browser_skip_shortcut/);
 });
 
 test("runtime emitters expose BAC-510 startup and refresh auth failure classes", async () => {
@@ -560,5 +571,44 @@ test("provider failure observability rejects forbidden raw payload markers", () 
   assert.throws(
     () => assertProviderFailureObservabilityEvidence(bearerSubprotocolLeak),
     /forbidden payload marker: bearer\./,
+  );
+});
+
+// RELEASE-028: the dashboard's learner-loop-derived rows read the validated
+// singleton; an unknown state or evidence field cannot reach an operator panel.
+test("provider failure classes are derived from the validated learner-loop contract", () => {
+  const contractClasses = new Set(
+    RELEASE_LEARNER_LOOP_CONTRACT.states
+      .map((state) => state.failure_class)
+      .filter((value) => typeof value === "string"),
+  );
+  const derived = learnerLoopFailureClasses();
+
+  assert.ok(derived.length > 0);
+  assert.deepEqual(derived, [...contractClasses].sort());
+  assert.equal(Object.isFrozen(RELEASE_LEARNER_LOOP_CONTRACT.states), true);
+  assert.throws(() => {
+    RELEASE_LEARNER_LOOP_CONTRACT.states[0].failure_class = "rewritten";
+  }, TypeError);
+});
+
+
+// RELEASE-028 bypass control: this consumer's own hostile variant. If the
+// published validator ever stopped rejecting unknown keys, this test fails
+// here rather than letting an unchecked state reach the gate.
+test("the observability dashboards refuses a learner-loop variant carrying an unknown nested field", () => {
+  const hostile = JSON.parse(JSON.stringify(RELEASE_LEARNER_LOOP_CONTRACT));
+  hostile.states[0].viva_hostile_unknown_key = "viva-hostile-sentinel-value-9f2a";
+
+  assert.throws(
+    () => validatedLearnerLoopForRelease(hostile),
+    (error) => {
+      assert.equal(error.code, "learner_loop_contract_invalid");
+      assert.equal(
+        `${error.message}${error.stack}`.includes("viva-hostile-sentinel-value-9f2a"),
+        false,
+      );
+      return true;
+    },
   );
 });

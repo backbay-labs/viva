@@ -1,6 +1,4 @@
-import learnerLoopContract from "../packages/core/src/learner-loop-contract.json" with {
-  type: "json",
-};
+import { RELEASE_LEARNER_LOOP_CONTRACT as learnerLoopContract } from "./release-contract-validation.mjs";
 
 const MATRIX_SCHEMA = "viva.live_provider_failure_matrix.v1";
 

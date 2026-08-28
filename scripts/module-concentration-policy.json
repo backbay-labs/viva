@@ -1,0 +1,336 @@
+{
+  "schema_version": 1,
+  "policy": "RELEASE-030 — executable module concentration ratchet",
+  "reviewed_baseline_sha": "4d5d8276f03635ca74c04f4d500d13ce62198dd0",
+  "frozen_baseline_sha": "4297878671b430b52063060cff674528536f6bef",
+  "frozen_baseline_note": "Every `frozen_lines` value below is the newline count measured on the merged integration tree at `frozen_baseline_sha`, after the capability lanes' own extractions (nodes 07, 08, 09, 13A) landed. The plan's table recorded pre-remediation `reviewed_lines` at `reviewed_baseline_sha`; those are retained per entry so the drift stays auditable, but the ratchet is computed from the frozen post-extraction size. A ceiling may only ever move DOWNWARD from here, with one recorded exception: two entries were re-frozen upward at the combined 12B admission by coordinator ruling (`A-37`), because their freezes predated the adversarially reviewed A-31.4 and A-32/A-34 appendix admissions whose content the merged tree now includes — stale baseline, not unreviewed growth. Every other movement remains downward-only.",
+  "ratchet_multiplier": 1.05,
+  "entrypoint_ceiling": 1200,
+  "extracted_module_ceiling": 600,
+  "unbudgeted_file_ceiling": 1200,
+  "watched_roots": ["scripts"],
+  "watched_extensions": [".mjs"],
+  "budgets": [
+    {
+      "path": "agent/crates/agent-service/tests/voice_ws.rs",
+      "reviewed_lines": 11421,
+      "frozen_lines": 20594,
+      "frozen_at": "node 08; re-frozen at the combined 12B admission (A-37: the A-32/A-34 appendix test growth landed after the 12b-a-era freeze)",
+      "ceiling": 21624,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "auth/lease, audio-turn, durability, and failure-control integration modules with shared real-WS fixtures"
+    },
+    {
+      "path": "agent/crates/agent-service/src/ws.rs",
+      "reviewed_lines": 5467,
+      "frozen_lines": 882,
+      "frozen_at": "node 08",
+      "ceiling": 927,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "preflight/admission, active-turn runtime, provider forwarding, and terminal/error evidence"
+    },
+    {
+      "path": "agent/crates/agent-service/src/ws/admission.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1586,
+      "frozen_at": "node 08",
+      "ceiling": 1666,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "preflight/admission authority extracted from ws.rs",
+      "derived_from": "agent/crates/agent-service/src/ws.rs"
+    },
+    {
+      "path": "agent/crates/agent-service/src/ws/turn.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1307,
+      "frozen_at": "node 08",
+      "ceiling": 1373,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "active-turn runtime authority extracted from ws.rs",
+      "derived_from": "agent/crates/agent-service/src/ws.rs"
+    },
+    {
+      "path": "agent/crates/agent-service/src/ws/terminal.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1222,
+      "frozen_at": "node 08",
+      "ceiling": 1284,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "terminal/error evidence authority extracted from ws.rs",
+      "derived_from": "agent/crates/agent-service/src/ws.rs"
+    },
+    {
+      "path": "agent/crates/agent-service/src/ws/tests.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 4611,
+      "frozen_at": "node 08",
+      "ceiling": 4842,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "in-crate unit suite for the extracted ws modules",
+      "derived_from": "agent/crates/agent-service/src/ws.rs"
+    },
+    {
+      "path": "agent/crates/data/src/memory.rs",
+      "reviewed_lines": 5145,
+      "frozen_lines": 6314,
+      "frozen_at": "node 09 (including the A-22/A-24 appendix)",
+      "ceiling": 6630,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "shared store conformance plus bounded memory backend repositories"
+    },
+    {
+      "path": "agent/crates/data/src/memory/store_conformance.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 2269,
+      "frozen_at": "node 09",
+      "ceiling": 2383,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "the one shared memory/Postgres characterization suite",
+      "derived_from": "agent/crates/data/src/memory.rs"
+    },
+    {
+      "path": "agent/crates/data/src/memory/learning.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1506,
+      "frozen_at": "node 09",
+      "ceiling": 1582,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "learning: canonical outcomes, challenges, progression, the selected D-01 schedule, and both canonical reads built from them",
+      "derived_from": "agent/crates/data/src/memory.rs"
+    },
+    {
+      "path": "agent/crates/data/src/memory/ingestion.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1235,
+      "frozen_at": "node 09",
+      "ceiling": 1297,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "ingestion: classification, decoding, and generation owned in one place",
+      "derived_from": "agent/crates/data/src/memory.rs"
+    },
+    {
+      "path": "agent/crates/data/src/postgres.rs",
+      "reviewed_lines": 2480,
+      "frozen_lines": 2005,
+      "frozen_at": "node 09 (including the A-22/A-24 appendix)",
+      "ceiling": 2106,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "shared conformance plus Postgres repositories aligned with memory boundaries"
+    },
+    {
+      "path": "agent/crates/data/src/postgres/learning.rs",
+      "reviewed_lines": null,
+      "frozen_lines": 1564,
+      "frozen_at": "node 09",
+      "ceiling": 1643,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 09",
+      "boundary": "Postgres learning repository aligned with the memory learning boundary",
+      "derived_from": "agent/crates/data/src/postgres.rs"
+    },
+    {
+      "path": "apps/web/app/globals.css",
+      "reviewed_lines": 4864,
+      "frozen_lines": 10,
+      "frozen_at": "node 13A (FRONTEND-001)",
+      "ceiling": 11,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 13",
+      "boundary": "ordered imports only: the token authority once, then this app's owned surface sheets; no selector is declared here"
+    },
+    {
+      "path": "apps/web/app/styles/session.css",
+      "reviewed_lines": null,
+      "frozen_lines": 2311,
+      "frozen_at": "node 13A (FRONTEND-001)",
+      "ceiling": 2427,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 13",
+      "boundary": "session layer plus the accessibility/motion and print layers, with preserved cascade tests",
+      "derived_from": "apps/web/app/globals.css"
+    },
+    {
+      "path": "apps/web/app/styles/landing.css",
+      "reviewed_lines": null,
+      "frozen_lines": 1431,
+      "frozen_at": "node 13A (FRONTEND-001)",
+      "ceiling": 1503,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 13",
+      "boundary": "landing layer, with preserved cascade tests",
+      "derived_from": "apps/web/app/globals.css"
+    },
+    {
+      "path": "agent/crates/agent-adapters/src/cartesia_gemini/runner.rs",
+      "reviewed_lines": 3175,
+      "frozen_lines": 5135,
+      "frozen_at": "node 07",
+      "ceiling": 5392,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 07",
+      "boundary": "session orchestration, stream event reduction, cancellation, and tool lifecycle"
+    },
+    {
+      "path": "agent/crates/agent-adapters/src/cartesia_gemini/llm.rs",
+      "reviewed_lines": 3028,
+      "frozen_lines": 4591,
+      "frozen_at": "node 07",
+      "ceiling": 4821,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 07",
+      "boundary": "request construction, incremental decoder, retry/deadline policy, and sanitized provider errors"
+    },
+    {
+      "path": "agent/crates/agent-service/src/app.rs",
+      "reviewed_lines": 2395,
+      "frozen_lines": 721,
+      "frozen_at": "node 08",
+      "ceiling": 758,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 08",
+      "boundary": "health/readiness, library/ingestion, operational evidence, and route composition"
+    },
+    {
+      "path": "scripts/e2e-browser.mjs",
+      "reviewed_lines": 1855,
+      "frozen_lines": 2881,
+      "frozen_at": "node 12B unit 12b-a (pre-extraction)",
+      "ceiling": 3026,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "pure plan/config, managed runtime, browser story, and thin entrypoint",
+      "pending_extraction": "RELEASE-030-E2E-EXTRACTION"
+    },
+    {
+      "path": "scripts/e2e-browser-audio.mjs",
+      "reviewed_lines": null,
+      "frozen_lines": 628,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 1200,
+      "ceiling_basis": "entrypoint",
+      "owner": "Plan 12",
+      "boundary": "audio harness plus oversized-single-chunk negative control"
+    },
+    {
+      "path": "scripts/live-provider-smoke.test.mjs",
+      "reviewed_lines": 1494,
+      "frozen_lines": 2320,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 2436,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "config/deadline, protocol classification, termination, and evidence test modules with shared fixtures"
+    },
+    {
+      "path": "scripts/live-provider-smoke.mjs",
+      "reviewed_lines": 1263,
+      "frozen_lines": 1498,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 1573,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "config/deadline, strict voice protocol, proof collection, and sanitized evidence finalization"
+    },
+    {
+      "path": "scripts/hosted-monitor-runner.mjs",
+      "reviewed_lines": 1240,
+      "frozen_lines": 1390,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 1460,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "pure run plan, managed execution, durable-state adapter, publication, and manifest commit"
+    },
+    {
+      "path": "scripts/hosted-monitor-runner.test.mjs",
+      "reviewed_lines": null,
+      "frozen_lines": 1982,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 2082,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "run-plan, managed-execution, durable-state, publication, and manifest-commit test modules with shared fixtures"
+    },
+    {
+      "path": "scripts/redaction-control.mjs",
+      "reviewed_lines": null,
+      "frozen_lines": 3195,
+      "frozen_at": "node 12B unit 12b-a",
+      "ceiling": 3355,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 12",
+      "boundary": "forbidden evidence markers, source-audit detection, and the coordinator-ratified sanction inventory"
+    },
+    {
+      "path": "scripts/frontend-accessibility.mjs",
+      "reviewed_lines": null,
+      "frozen_lines": 2929,
+      "frozen_at": "node 13B; re-frozen at the combined 12B admission (A-37: the A-31.4 closure additions landed after the 12b-a-era freeze)",
+      "ceiling": 3076,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 13",
+      "boundary": "mounted accessibility harness: owned-surface, session-handoff, and disclosure-scope stories"
+    },
+    {
+      "path": "scripts/frontend-quality.test.mjs",
+      "reviewed_lines": null,
+      "frozen_lines": 1956,
+      "frozen_at": "node 13B",
+      "ceiling": 2054,
+      "ceiling_basis": "ratchet",
+      "owner": "Plan 13",
+      "boundary": "token contrast, accessibility check, and performance check unit suite for the frontend harnesses"
+    }
+  ],
+  "accepted_debt": [
+    {
+      "id": "DATA-015-DEFERRED-MEMORY-FACADE",
+      "path": "agent/crates/data/src/memory.rs",
+      "owner": "Plan 09",
+      "authority": "Plan 09 Task 13 Step 8 — `docs/superpowers/plans/2026-08-23-persistence-postgres-privacy.md`",
+      "remaining": "22 public persistence record/type declarations plus their 7 `From` conversions (lines 89-608, 520 lines), and the single 36-method `impl StudyMemoryStore for InMemoryStudyStore` block (lines 1089-2084, 996 lines). The four mandatory ingestion/learning/authorization/privacy extractions are complete and none of their SQL or state-mutation implementations remain on the facade.",
+      "remaining_lines": 1516,
+      "invariant_reason": "The record/type declarations are the crate's published persistence surface — `data::memory::StudySetRecord` and its 21 siblings are named by the observe, service, and migration crates — so relocating them changes the public export path for export-stability reasons the extraction was explicitly forbidden to disturb. The trait facade is one `impl` block because Rust permits exactly one `impl StudyMemoryStore for InMemoryStudyStore`; splitting it is impossible without a semantic change to the port boundary.",
+      "blocking_dependency": "Both are consumed by the shared conformance suite through the facade's own module path; moving either in a no-semantic-change task would require simultaneous re-export shims that the task forbids.",
+      "follow_up": "Plan 09 (`DATA-015`); Plan 15's completeness sweep re-measures.",
+      "acceptance_command": "cargo test --manifest-path agent/Cargo.toml -p data memory_store_conformance_ -- --nocapture"
+    },
+    {
+      "id": "DATA-015-DEFERRED-POSTGRES-FACADE",
+      "path": "agent/crates/data/src/postgres.rs",
+      "owner": "Plan 09",
+      "authority": "Plan 09 Task 13 Step 8 — `docs/superpowers/plans/2026-08-23-persistence-postgres-privacy.md`",
+      "remaining": "The single transaction-owning `impl StudyMemoryStore for PostgresStudyStore` block (lines 358-1793, 1,436 lines, 36 methods). The four mandatory subsystem extractions each own their SQL in `postgres/{ingestion,learning,authorization,privacy}.rs`; the facade methods that remain are the transaction-owning port boundary and its typed row/error helpers.",
+      "remaining_lines": 1436,
+      "invariant_reason": "Rust requires one trait impl block per (trait, type) pair, and every method in it either opens or joins the transaction that carries the store's atomicity invariants; splitting the block is not expressible without changing where transactions begin.",
+      "blocking_dependency": "The advisory-lock and single-transaction write invariants proven by the required-Postgres conformance suite are anchored on this block; any split would move a transaction boundary, which the no-semantic-change task forbids.",
+      "follow_up": "Plan 09 (`DATA-015`); Plan 15's completeness sweep re-measures.",
+      "acceptance_command": "DATA_POSTGRES_REQUIRED=1 cargo test --manifest-path agent/Cargo.toml -p data postgres_store_conformance_ -- --ignored --test-threads=1 --nocapture"
+    },
+    {
+      "id": "RELEASE-030-E2E-EXTRACTION",
+      "path": "scripts/e2e-browser.mjs",
+      "owner": "Plan 12",
+      "authority": "Plan 12 Task 16 Step 3 — `docs/superpowers/plans/2026-08-23-release-monitor-ci-supply-chain.md`",
+      "remaining": "The whole 2,881-line entrypoint. Plan 12 Task 16 Step 3 requires moving provider/mode/env/URL/run-plan construction into `e2e-browser-plan.mjs`, Playwright/local-service lifecycle plus explicit child environments, port retry, signal cleanup and managed teardown into `e2e-browser-runtime.mjs`, and page actions, required frames, D-09 classification, voice-matrix execution and normalized evidence assembly into `e2e-browser-story.mjs`, leaving argument/env parsing, composition, top-level quarantine and exit-code handling behind.",
+      "remaining_lines": 2881,
+      "target_ceiling": 1200,
+      "target_extracted_module_ceiling": 600,
+      "invariant_reason": "The extraction is a behaviour-preserving move that must be compared against the frozen characterization before and after each commit; it is not expressible as a line-range split and is scoped to its own unit so an unreviewed tail edit cannot change harness behaviour.",
+      "blocking_dependency": "Unit `12b-a` was dispatched with the ratchet script/config as its file boundary; `scripts/e2e-browser*.mjs` belongs to a separate Plan 12B unit so two parallel worktrees cannot collide on the same harness files at the combined admission.",
+      "follow_up": "Plan 12 Task 16 Step 3 (E2E extraction unit), before Plan 15 Level 3.",
+      "acceptance_command": "bun run module:concentration && env -u VIVA_ALLOW_LOOPBACK_TEST_SKIP VIVA_E2E_AGENT_PROVIDER=synthetic VIVA_E2E_REQUIRE_POST_ANSWER_SOURCE_FOLIO=1 VIVA_E2E_REQUIRE_VOICE_TRANSPORT_MATRIX=1 VIVA_E2E_DEPLOY_SHA=\"$(git rev-parse HEAD)\" VIVA_E2E_ARTIFACT_DIR=artifacts/ci/browser-voice-matrix/synthetic bun run e2e:browser"
+    }
+  ]
+}

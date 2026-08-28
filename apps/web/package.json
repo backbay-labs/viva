@@ -14,7 +14,7 @@
     "@viva/core": "workspace:*",
     "@viva/tokens": "workspace:*",
     "@viva/ui-web": "workspace:*",
-    "next": "16.2.6",
+    "next": "16.3.2",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

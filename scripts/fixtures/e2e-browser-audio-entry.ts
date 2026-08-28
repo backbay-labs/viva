@@ -38,6 +38,12 @@ type HarnessConfig = {
   negativeControlSeconds: number;
   streamedTurnSeconds: number[];
   stepTimeoutMs: number;
+  /**
+   * RELEASE-023: the device capture rate the matrix cell is claiming. Omitted,
+   * the browser picks its own default and only one of the two required rates
+   * can ever be proven.
+   */
+  sourceSampleRateHz?: number;
 };
 
 type HarnessOutcome =
@@ -413,6 +419,7 @@ async function runStreamedTurns(config: HarnessConfig): Promise<StreamedTurnsRes
   const source = await createBrowserVivaAudioCaptureSource({
     AudioContextCtor: AudioContext,
     mediaDevices: navigator.mediaDevices,
+    ...(config.sourceSampleRateHz ? { sampleRateHz: config.sourceSampleRateHz } : {}),
   });
   const capture = startVivaPcm16StreamingCapture({
     onEnded: (reason) => {

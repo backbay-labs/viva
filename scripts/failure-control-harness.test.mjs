@@ -92,7 +92,7 @@ test("failure-control plan is hard-off unless every control gate is present", ()
   );
 });
 
-test("failure-control evidence is sanitized and records production-disabled state", () => {
+test("failure-control evidence is sanitized and truthfully reports the enabled harness state", () => {
   const plan = buildFailureControlPlan({
     env: {
       VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: "https://viva.example",
@@ -114,17 +114,45 @@ test("failure-control evidence is sanitized and records production-disabled stat
   const serialized = JSON.stringify(evidence);
 
   assert.equal(evidence.schema, "viva.failure_control_harness.v1");
-  assert.equal(evidence.enabled_for_release, false);
+  // BAC-528: an enabled plan must produce evidence that truthfully says so.
+  // The production release gate's `bac_528_harness_disabled` proof
+  // (scripts/production-release-gate.mjs) trusts this field literally; a
+  // hardcoded `false` here makes that gate attest nothing.
+  assert.equal(evidence.enabled_for_release, true);
   assert.equal(evidence.selected_scenario, "provider_rate_limited");
   assert.equal(evidence.controls.control_secret_required, true);
   assert.equal(evidence.controls.synthetic_identity_only, true);
   assert.equal(evidence.controls.per_identity_cap, 1);
+  assert.equal(evidence.controls.release_gate_must_fail_if_enabled, true);
   assert.doesNotMatch(serialized, /control-secret/);
   assert.doesNotMatch(serialized, /session_token/);
   assert.doesNotMatch(serialized, /answer_text/);
   assert.doesNotMatch(serialized, /transcript_final/);
   assert.doesNotMatch(serialized, /pcm16_base64/);
   assert.doesNotMatch(serialized, /Bearer /);
+});
+
+test("failure-control harness evidence's enabled_for_release exactly mirrors the plan's true enabled state", () => {
+  // Literal target shape from the plan (RELEASE-002/RELEASE-020, BAC-528):
+  // disabled and enabled plans must produce opposite evidence, and a
+  // missing/null plan must never be mislabeled enabled.
+  assert.equal(failureControlHarnessEvidence({ enabled: false }).enabled_for_release, false);
+  assert.equal(failureControlHarnessEvidence(null).enabled_for_release, false);
+  assert.equal(failureControlHarnessEvidence(undefined).enabled_for_release, false);
+  assert.equal(failureControlHarnessEvidence({}).enabled_for_release, false);
+
+  const enabledPlan = buildFailureControlPlan({
+    env: {
+      VIVA_FAILURE_CONTROL_ALLOWED_ORIGINS: "https://viva.example",
+      VIVA_FAILURE_CONTROL_ENABLED: "1",
+      VIVA_FAILURE_CONTROL_MAX_SESSIONS_PER_IDENTITY: "1",
+      VIVA_FAILURE_CONTROL_SCENARIO: "provider_rate_limited",
+      VIVA_FAILURE_CONTROL_SECRET: "control-secret",
+      VIVA_FAILURE_CONTROL_SYNTHETIC_USER_IDS: "synthetic-user",
+      VIVA_FAILURE_CONTROL_STUDY_SET_IDS: "biology-midterm",
+    },
+  });
+  assert.equal(failureControlHarnessEvidence(enabledPlan).enabled_for_release, true);
 });
 
 test("failure-control plan exposes configured first synthetic start identity", () => {
