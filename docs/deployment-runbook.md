@@ -27,18 +27,24 @@ export NEXT_PUBLIC_VIVA_AGENT_WS_URL="wss://agent.viva.example.com/ws"
 unless the edge explicitly rewrites the REST paths below from the web origin to
 the agent.
 
-The edge/router must forward:
+The edge/router must forward exactly the routes the service registers, and no others:
 
 - `https://agent.viva.example.com/health`
 - `https://agent.viva.example.com/live`
 - `https://agent.viva.example.com/ready`
 - `https://agent.viva.example.com/health/brain`
 - `https://agent.viva.example.com/study-sets/paste`
+- `https://agent.viva.example.com/study-sets/files`
+- `https://agent.viva.example.com/study-sets/{study_set_id}/files/retry`
 - `https://agent.viva.example.com/study-sets/library`
 - `https://agent.viva.example.com/study-sets/export`
+- `https://agent.viva.example.com/v1/study-sets/{study_set_id}/projection`
 - `https://agent.viva.example.com/study-sets/{study_set_id}`
 - `https://agent.viva.example.com/study-sets/{study_set_id}/sessions/{voice_session_id}`
 - `wss://agent.viva.example.com/ws`
+
+There is no restore route. `D-04 CONFIRM_DELETE` is the recorded branch, so both `DELETE` routes
+above are permanent, and the service registers no undo endpoint to forward.
 
 Keep the browser origin stable. A public or non-loopback agent bind fails closed
 unless authentication and allowed origins are configured.
@@ -139,8 +145,34 @@ curl -fsS https://agent.viva.example.com/ready | jq '.store.backend, .store.dura
 ```
 
 Expected durable output is `postgres` and `true`. Expected default output is
-`in_memory` and `false`. Default CI and `bun run validate` must not require
-Postgres.
+`in_memory` and `false`. `bun run validate` must not require Postgres.
+
+### Migration, restart, and multi-instance proof
+
+The continuous half of this is already automated: the required CI job
+`Durable Postgres proof` runs `scripts/ci-durable-postgres.sh` against a real
+PostgreSQL 16 service container on every pull request and every push to `main`.
+Release-grade durability adds one disposable-database pass against the deployed
+schema, and it is not satisfied by a developer's own database:
+
+1. **Migrate from empty.** Point a fresh, empty database at the service and boot
+   it. All 18 migrations in `agent/migrations` apply in order.
+2. **Replay.** Boot a second time against the same database. Migrations are
+   idempotent, so the second boot applies nothing and `/ready` still reports
+   `postgres` / `true`.
+3. **Restart.** Write a session, a recap, a review-schedule decision, and an
+   answer envelope; restart the process; confirm every row is still readable and
+   that the replay guards refuse a duplicate application of the same turn.
+4. **Two instances.** Run two service instances against one database and confirm
+   identity, nonce replay protection, and deletion all resolve in the store
+   rather than in process memory.
+5. **Delete and do not resurrect.** Delete a study set, confirm the
+   `hard_purge_text` purge removed the learner text, then re-run the fixture seed
+   and confirm it does not recreate material behind the content-free tombstone.
+
+Record the database identity, the migration list applied, and the exact SHA under
+test with the run. Do not delete managed data to "reset" between steps of a
+release proof; use a fresh disposable database.
 
 ## Secrets And Origins
 
@@ -993,3 +1025,43 @@ node -e 'const e=require("./artifacts/release-check/evidence.json"); if (e.artif
 If forbidden hits are nonzero, do not publish the bundle. Delete the generated
 artifact directory, fix the leak, rerun the release smoke, and attach only the
 new sanitized bundle.
+
+## External Gates And `BLOCKED_EXTERNAL`
+
+Everything above this heading is something the repository, its workflow, or an
+operator running these commands can prove. Six things are not, and each has a
+named accountable owner rather than a command: hosted exact-SHA validation
+(`OPS-01`), enforced branch protection (`OPS-02`), an exact deployment
+(`OPS-03`), live provider and zero-retention attestation (`OPS-04`), real device,
+browser, and screen-reader behavior (`OPS-05`), and the release owner's decision
+(`OPS-06`).
+
+`BLOCKED_EXTERNAL` is the only legal way to record one of those six as
+outstanding, and it is legal for those six alone. Recording it requires the whole
+reason object, not a note:
+
+| Field | What it must carry |
+| --- | --- |
+| `code` | The fixed reason code for that gate |
+| `owner` | The accountable role, not a person's convenience |
+| `blocked_at` | A UTC instant |
+| `attempted` | The exact command or URL that was actually attempted |
+| `last_observed_state` | The exact externally observed state, for example `project access denied` |
+| `required_action` | What the accountable owner must do |
+| `required_evidence` | The identities that will prove it, bound to the frozen SHA |
+| `next_check_at` | A UTC instant |
+| `applies_to_frozen_sha` | The exact SHA the block applies to |
+
+Two rules keep that honest:
+
+1. **Only external gates may be blocked.** A missing executable, an absent
+   database, a skipped test, a cache-only result, or a local test failure is a
+   plain failure. Reclassifying one of those as `BLOCKED_EXTERNAL` is the
+   specific misuse this section exists to forbid.
+2. **A gate that never ran is a failure, not a block.** Pending status is earned
+   by recording the reason object above; it is never granted by omission, and it
+   is never inherited from a green local or hosted run.
+
+The status vocabulary those gates feed, and the rule that no local proof ever
+promotes an external gate, are defined in
+[release-readiness.md](release-readiness.md).
