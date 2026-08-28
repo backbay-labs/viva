@@ -18,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { deployBindingFixture } from "./integration-readiness-fixtures.mjs";
 import {
   BLOCKED_EXTERNAL_REASON_CODES,
   EXTERNAL_GATE_IDS,
@@ -201,17 +202,8 @@ const mandatoryComplete = (externalGates, overrides = {}) =>
     ...overrides,
   });
 
-const deployBinding = () => ({
-  frozen_sha: FROZEN_SHA,
-  run_id: RUN_ID,
-  services: ["web", "agent", "monitor"].map((name) => ({
-    name,
-    deployment_id: `deploy-${name}`,
-    image_digest: `sha256:${hex(64, `image-${name}`)}`,
-    origin: `https://${name}.example.invalid`,
-    in_band_sha: FROZEN_SHA,
-  })),
-});
+/** INTEGRATION-010's typed binding; its exhaustive rules live in the reconcile suite. */
+const deployBinding = deployBindingFixture;
 
 const releaseOwner = (decision) => ({
   owner: "named-release-owner",
@@ -519,26 +511,16 @@ test("a mandatory gate may never be recorded as BLOCKED_EXTERNAL", () => {
   rejects({ "levels.level_2.status": "SKIPPED" }, /status must be/);
 });
 
-test("a recorded terminal_status must be legal and equal to the derived classification", () => {
-  const ready = releaseReady();
-  rejects(
-    { terminal_status: "CODE_REMEDIATION_COMPLETE" },
-    /terminal_status does not match the derived classification/,
-    ready,
-  );
-  rejects({ terminal_status: "SHIP_IT" }, /terminal_status must be one of/, ready);
-});
-
 test("RELEASE_READY requires the bound deploy identity and a release owner `proceed`", () => {
   const ready = releaseReady();
   assert.equal(validateIntegrationEvidence(ready, options()).terminal_status, "RELEASE_READY");
+  // INTEGRATION-010 owns the typed binding's own rules; these are the document-level ones.
   const table = [
     [{ release_owner: releaseOwner("hold") }, /RELEASE_READY requires release owner decision/],
     [{ release_owner: null }, /RELEASE_READY requires release owner decision/],
     [{ deploy_binding: null }, /RELEASE_READY requires a deploy binding/],
-    [{ "deploy_binding.services.0.in_band_sha": sha("wrong") }, /deploy_binding/],
-    [{ "deploy_binding.services.0.name": "worker" }, /deploy_binding/],
-    [{ "deploy_binding.run_id": "20260823T180000Z-ffffffffffff" }, /deploy_binding/],
+    [{ "deploy_binding.web.deploy_sha": sha("wrong") }, /deploy_binding/],
+    [{ "deploy_binding.release.run_id": "20260823T180000Z-ffffffffffff" }, /deploy_binding/],
     [{ "release_owner.decision": "maybe" }, /release_owner/],
   ];
   for (const [changes, expected] of table) rejects(changes, expected, ready);

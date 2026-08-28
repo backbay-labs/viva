@@ -20,27 +20,29 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { EVIDENCE_LEVEL_COMMANDS } from "./integration-readiness-levels.mjs";
+// INTEGRATION-010's typed deploy/run binding, PR/ledger reconciliation, terminal refusals,
+// and the two run-directory verbs. It never imports this module, so no cycle can form.
+import {
+  assertTerminalStatus, finalizeCommand, renderDeployBindingSection, validateDeployBinding,
+  validateRunCommand,
+} from "./integration-readiness-reconcile.mjs";
 // The primitives below live in the sibling module A-39.3 granted this namespace, so the
 // entrypoint stays thin and every file stays inside the unbudgeted 1,200-line ceiling.
 import {
-  EXTERNAL_GATE_IDS, LANES, LANE_BRANCH_PATTERN, MANDATORY_STATUSES, NAMESPACES, NODE_BY_ID,
-  PROGRAM_NODES, RUN_ID, check, csv, exactKeys, flag, git, gitIsAncestor, isRecord, keys,
-  parseFlags, readJson, readLines, requireArray, requireEvidencePath, requireHex64, requireInstant,
-  requireSha, requireStatus, requireText, sha256, shape, validateShape, writeJson,
-  isGuardedEnvironmentKey,
+  EXTERNAL_GATE_IDS, INTEGRATION_EVIDENCE_SCHEMA, LANES, LANE_BRANCH_PATTERN, MAIN_RECONCILIATION_SCHEMA,
+  MANDATORY_STATUSES, NAMESPACES, NODE_BY_ID, PROGRAM_NODES, RUN_ID, check, csv,
+  exactKeys, flag, git, gitIsAncestor, isRecord, keys, parseFlags, readJson, readLines, requireArray,
+  requireEvidencePath, requireHex64, requireInstant, requireSha, requireStatus, requireText, sha256,
+  shape, validateShape, writeJson, isGuardedEnvironmentKey,
 } from "./integration-readiness-shared.mjs";
 import { REDACTED_VALUE } from "./redaction-control.mjs";
 
 export {
-  EXTERNAL_GATE_IDS, PROGRAM_NODES, IntegrationEvidenceError,
+  EXTERNAL_GATE_IDS, INTEGRATION_EVIDENCE_SCHEMA, MAIN_RECONCILIATION_SCHEMA, PROGRAM_NODES,
+  TERMINAL_STATUSES, IntegrationEvidenceError,
 } from "./integration-readiness-shared.mjs";
 
-export const INTEGRATION_EVIDENCE_SCHEMA = "viva.integration_readiness.v1";
-export const MAIN_RECONCILIATION_SCHEMA = "viva.main_reconciliation.v1";
 export const INTEGRATION_HANDOFF_SCHEMA = "viva.integration_handoff.v1";
-export const TERMINAL_STATUSES = Object.freeze(
-  "CODE_REMEDIATION_COMPLETE CODE_COMPLETE_EXTERNAL_GATES_PENDING RELEASE_READY".split(" "),
-);
 /** One reason code per external gate, in `EXTERNAL_GATE_IDS` order. */
 export const BLOCKED_EXTERNAL_REASON_CODES = Object.freeze(
   `GITHUB_ACTIONS_BILLING_UNAVAILABLE GITHUB_RULE_ADMIN_ACCESS_REQUIRED
@@ -78,8 +80,6 @@ const LANE_INPUT_SPEC = shape(`node_id:text topological_rank:any namespace:any s
   integration_merge_sha:sha merge_parent_shas:array predecessor_node_ids:array decision_branch:array
   included_in_frozen_sha:isTrue finding_ids:array proof_artifacts:array
   owner_acknowledged_handoff:isTrue`);
-const SERVICE_SPEC = shape(`name:text deployment_id:text image_digest:text origin:text
-  in_band_sha:sha`);
 const COVERAGE_KEYS = keys(`component_finding_instances_expected
   component_finding_instances_reconciled unresolved_rows ledger_sha256`);
 const TOP_LEVEL_KEYS = keys(`schema run_id generated_at identity lane_inputs main_reconciliation
@@ -543,13 +543,7 @@ export function validateIntegrationEvidence(document, options = {}) {
       check(gateIds.includes(id), `required external gate is missing: ${id}`);
     }
   }
-  if (Object.hasOwn(document, "terminal_status")) {
-    const legal = TERMINAL_STATUSES.includes(document.terminal_status);
-    check(legal, `terminal_status must be one of ${TERMINAL_STATUSES.join(", ")}`);
-    check(complete, "terminal_status is forbidden while a mandatory gate is non-PASS");
-    const derived = document.terminal_status === deriveTerminalStatus(document);
-    check(derived, "terminal_status does not match the derived classification");
-  }
+  assertTerminalStatus(document, { complete, derived: deriveTerminalStatus(document) });
   validateDeployAndOwner(document);
   return document;
 }
@@ -561,20 +555,8 @@ function validateDeployAndOwner(document) {
   if (binding === null) {
     check(!ready, "RELEASE_READY requires a deploy binding for web, agent, and monitor");
   } else {
-    exactKeys(binding, keys("frozen_sha run_id services"), "deploy_binding");
-    const bound = binding.frozen_sha === frozenSha && binding.run_id === document.run_id;
-    check(bound, "deploy_binding must bind to the frozen SHA and run ID");
-    const services = requireArray(binding.services, "deploy_binding.services");
-    const names = services.map((service) => service?.name);
-    for (const required of ["web", "agent", "monitor"]) {
-      check(names.includes(required), `deploy_binding is missing the ${required} identity`);
-    }
-    for (const service of services) {
-      validateShape(service, SERVICE_SPEC, "deploy_binding.services");
-      const digest = /^sha256:[0-9a-f]{64}$/.test(service.image_digest);
-      check(digest, "deploy_binding.services image_digest must be a sha256 digest");
-      check(service.in_band_sha === frozenSha, "deploy_binding.services in_band_sha is unbound");
-    }
+    // INTEGRATION-010 owns every typed rule inside the binding.
+    validateDeployBinding(binding, { frozenSha, runId: document.run_id, ready });
   }
   const owner = document.release_owner;
   if (owner !== null) {
@@ -779,18 +761,7 @@ export function renderIntegrationMarkdown(document) {
     const gate = gates.get(gateId);
     p(gate ? externalGateRow(gate, frozen) : row(gateId, null, null, null, null, null));
   }
-  p("", "## Deploy/run binding", "");
-  if (!bind) {
-    p(bullet("Deploy binding", null), "");
-  } else {
-    p(bullet("Deploy binding frozen SHA", bind.frozen_sha));
-    p(bullet("Deploy binding run ID", bind.run_id), "");
-    p("| Service | Deployment ID | Image digest | Origin | In-band SHA |");
-    p("| --- | --- | --- | --- | --- |");
-    const line = (s) =>
-      `| ${s.name} | ${s.deployment_id} | ${s.image_digest} | ${s.origin} | ${s.in_band_sha} |`;
-    p(...bind.services.map(line), "");
-  }
+  p("", "## Deploy/run binding", "", ...renderDeployBindingSection(bind));
   p("## Release decision", "", bullet("Release owner", own?.owner ?? null));
   p(bullet("Decision", own?.decision ?? null), bullet("Decided at", own?.decided_at ?? null), "");
   p("## Superseded evidence", "", bullet("Supersedes run ID", document.supersedes_run_id ?? null));
@@ -997,6 +968,14 @@ function recordHandoff(flags) {
   });
 }
 
+/** The entrypoint-owned operations INTEGRATION-010's run-directory verbs are built from. */
+const RECONCILE_IO = Object.freeze({
+  assertGeneratedMarkdown,
+  finalizeIntegrationEvidence,
+  renderIntegrationMarkdown,
+  validateIntegrationEvidence,
+});
+
 const CLI_COMMANDS = new Map([
   ["capture-program-input", captureProgramInput],
   ["verify-program-dag", verifyProgramDag],
@@ -1004,6 +983,8 @@ const CLI_COMMANDS = new Map([
   ["main-reconciliation-not-required", mainReconciliationNotRequired],
   ["main-reconciliation-request", mainReconciliationRequest],
   ["record-handoff", recordHandoff],
+  ["finalize", (flags) => finalizeCommand(flags, RECONCILE_IO)],
+  ["validate", (flags) => validateRunCommand(flags, RECONCILE_IO)],
   ...EVIDENCE_LEVEL_COMMANDS,
 ]);
 
