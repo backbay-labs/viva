@@ -1763,6 +1763,8 @@ const SOURCE_AUDIT_SAFE_MARKER_OCCURRENCES = Object.freeze([
       /^\s*session_token:\ Some\(session_token\),\s*$/,
       /^\s*signed_session_token_for\(\s*$/,
       /^\s*if\ state\.ws_access\.required_bearer\.is_none\(\)\ \&\&\ state\.ws_access\.session_token_secret\.is_none\(\)\ \{\s*$/,
+      // A-38.2/RESUME-MINT admission: prose naming the withheld field, never a value.
+      /^\s*\/\/\ \ \ a\ `session_token`,\ which\ is\ exactly\ what\ `A\-38\.1`\ withholds\ from\ this\s*$/,
       // A-36/LIB-READ admission: the token-withholding seam — field name in
       // prose/doc/function-name/call-site position only, never a value.
       /^\s*\/\/\ mutation\ token\ and\ no\ export\.\ The\ fourth\ is\ `session_token`,\ and\ it\ needs\ the\s*$/,
