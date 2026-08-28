@@ -4,7 +4,6 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-
 import {
   buildDocsContractEvidence,
   buildPublicContract,
@@ -17,6 +16,7 @@ import {
   PUBLIC_CONTRACT_SCHEMA,
   renderPublicContract,
 } from "./public-contract.mjs";
+import { libraryControlAuthority, libraryControlDrift } from "./public-contract-authority.mjs";
 
 /**
  * `INTEGRATION-007`: the public contract is derived from executable sources, and
@@ -152,6 +152,80 @@ test("the contract is derived from the shipped sources, not from README prose", 
   assert.equal(contract.privacy.data_retention_policy, "hard_purge_text");
   assert.equal(contract.privacy.tombstone_title, "[deleted]");
   assert.equal(contract.privacy.disclosure_scope, "all_live_provider_content");
+
+  // Ledger row 689 (Security component R5): which configuration makes export and
+  // deletion available, read out of the shipped gate rather than out of prose.
+  const authority = contract.privacy.library_control_authority;
+  assert.deepEqual(authority.control_gate_operations, [
+    "library_export",
+    "session_delete",
+    "study_set_delete",
+  ]);
+  assert.deepEqual(authority.control_gate_refusal_codes, [
+    "library_export_auth_failed",
+    "library_export_auth_required",
+    "library_snapshot_auth_failed",
+    "library_snapshot_auth_required",
+    "session_delete_auth_failed",
+    "session_delete_auth_required",
+    "study_set_delete_auth_failed",
+    "study_set_delete_auth_required",
+  ]);
+  // The gate consults exactly two configuration keys. The four other credentials
+  // a public bind REQUIRES are never read by it, so no document may claim one of
+  // them enables an export or a delete.
+  assert.deepEqual(authority.control_gate_credential_keys, [
+    "VIVA_VOICE_SESSION_TOKEN_SECRET",
+    "VIVA_VOICE_WS_BEARER_TOKEN",
+  ]);
+  assert.deepEqual(authority.control_gate_unconsulted_keys, [
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+  ]);
+  // A document can credit a credential by the configuration field it binds
+  // rather than by its environment key, so the field names are derived too and
+  // the false-authority rule matches either spelling.
+  assert.deepEqual(authority.control_gate_unconsulted_fields, [
+    "library_delete_bearer",
+    "library_read_bearer",
+    "operator_access",
+    "session_mint_credential",
+  ]);
+  assert.deepEqual(authority.public_bind_required_keys, [
+    "VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN",
+    "VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN",
+    "VIVA_AGENT_OPERATOR_BEARER_TOKEN",
+    "VIVA_AGENT_SESSION_MINT_BEARER_TOKEN",
+    "VIVA_VOICE_SESSION_TOKEN_SECRET",
+  ]);
+  assert.deepEqual(authority.public_bind_auth_alternatives, [
+    "VIVA_VOICE_SESSION_TOKEN_SECRET",
+    "VIVA_VOICE_WS_BEARER_TOKEN",
+  ]);
+  assert.deepEqual(authority.session_mint_selectors, ["mint_resume_for", "record_start_for"]);
+  assert.deepEqual(authority.startup_refusals, [
+    "CredentialCollision",
+    "CredentialLengthOutOfRange",
+    "FailureControlMisconfigured",
+    "LibraryBearerRequiresSessionTokenSecret",
+    "PublicBindMissingAllowedOrigins",
+    "PublicBindMissingAuth",
+    "PublicBindMissingCredential",
+  ]);
+  assert.equal(authority.control_capability_header, "x-viva-library-control-token");
+  assert.equal(authority.control_capability_subject, "__library_control__");
+  assert.equal(authority.mutation_unavailable_reason, "mutation_auth_required");
+  assert.equal(
+    authority.no_credential_refusal_message,
+    "library export and deletion controls require authenticated REST access",
+  );
+  assert.equal(authority.matrix_heading, "## Configuration Matrix");
+  assert.ok(
+    CHECKED_SOURCE_PATHS.includes("agent/crates/agent-service/src/http/library.rs"),
+    "the route module the gate lives in must be a hashed contract source",
+  );
 
   // Durability and validation.
   assert.deepEqual(contract.durability.store_backends, ["in_memory", "postgres"]);
@@ -368,6 +442,14 @@ test("a reviewed false or stale claim in any owned document fails --check", () =
         documents["docs/release-readiness.md"] += "\n- Terminal status: RELEASE_READY\n";
       },
     },
+    {
+      id: "library_control_authority",
+      why: "the runbook credits an export/delete authority the shipped gate never reads",
+      mutate: (documents) => {
+        documents["docs/deployment-runbook.md"] +=
+          "\n`VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` authorizes the delete routes.\n";
+      },
+    },
   ];
 
   for (const mutation of mutations) {
@@ -382,6 +464,216 @@ test("a reviewed false or stale claim in any owned document fails --check", () =
   for (const id of checkPublicContract().known_drift_ids) {
     assert.ok(raised.has(id), `drift id \`${id}\` has no mutation control`);
   }
+});
+
+/**
+ * Ledger row 689 (Security component `R5`, `INTEGRATION-007` follow-up).
+ *
+ * The runbook's Secrets sections describe the credentials; they never stated
+ * which operations each credential makes available, or what the service does
+ * when a required one is absent. The configuration matrix states both, and every
+ * claim below is compared against the shipped gate rather than against itself:
+ * the operation ids, the refusal codes, the required keys, and the startup
+ * refusals are all read out of `config.rs` and `http/library.rs` at check time,
+ * so renaming any of them in the service turns the matrix red.
+ */
+test("row 689: the configuration matrix is pinned to the shipped availability gate", () => {
+  const heading = "## Configuration Matrix";
+
+  const withinMatrix = (documents, replace) => {
+    const runbook = documents["docs/deployment-runbook.md"];
+    const start = runbook.indexOf(`${heading}\n`);
+    assert.notEqual(start, -1, "the runbook must carry the configuration matrix section");
+    const rest = runbook.slice(start + heading.length + 1);
+    const next = rest.search(/^## /m);
+    const section = next === -1 ? rest : rest.slice(0, next);
+    documents["docs/deployment-runbook.md"] =
+      runbook.slice(0, start + heading.length + 1) +
+      replace(section) +
+      (next === -1 ? "" : rest.slice(next));
+  };
+
+  const mutations = [
+    {
+      why: "the matrix section is gone entirely",
+      mutate: (documents) => {
+        documents["docs/deployment-runbook.md"] = documents["docs/deployment-runbook.md"].replace(
+          heading,
+          "## Configuration Notes",
+        );
+      },
+    },
+    {
+      why: "the matrix stops enumerating one of the three gated operations",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) => section.replaceAll("study_set_delete", "removal"));
+      },
+    },
+    {
+      why: "the matrix drops a refusal code the routes actually return",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) =>
+          section.replaceAll("session_delete_auth_required", "a refusal"),
+        );
+      },
+    },
+    {
+      why: "the matrix stops naming a startup refusal the service raises",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) =>
+          section.replaceAll("CredentialCollision", "a duplicate-value error"),
+        );
+      },
+    },
+    {
+      why: "the matrix stops naming a credential a public bind requires",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) =>
+          section.replaceAll("VIVA_AGENT_SESSION_MINT_BEARER_TOKEN", "the mint credential"),
+        );
+      },
+    },
+    {
+      why: "the matrix omits the fail-closed refusal for a bind with no REST authority",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) =>
+          section.replaceAll(
+            "library export and deletion controls require authenticated REST access",
+            "the controls are unavailable",
+          ),
+        );
+      },
+    },
+    {
+      why: "the matrix stops naming the mint selectors the snapshot route accepts",
+      mutate: (documents) => {
+        withinMatrix(documents, (section) => section.replaceAll("mint_resume_for", "the selector"));
+      },
+    },
+  ];
+
+  for (const mutation of mutations) {
+    const result = checkWith(mutation.mutate);
+    assertDrift(result, "library_control_authority");
+  }
+
+  // Every line below is FALSE against the shipped gate, which reads exactly
+  // `VIVA_VOICE_WS_BEARER_TOKEN` and `VIVA_VOICE_SESSION_TOKEN_SECRET`.
+  //
+  // The first two are the shapes the rule caught from the start. All the rest
+  // are the same lie written the way a real editor would write it -- naming the
+  // operation by its real id, naming the credential by the configuration field
+  // behind its environment key, or carrying an incidental negation belonging to
+  // a neighbouring clause -- and every one of them escaped the first cut of this
+  // rule. Two controls inside one narrow phrasing band confirm the band, not the
+  // rule, so the band is what the list below deliberately leaves.
+  for (const claim of [
+    "Library export requires `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` on a public bind.",
+    "`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` permits the delete controls.",
+    "Set `VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` to enable delete; without it the controls stay closed.",
+    "Without a valid capability, set `VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` to enable the export.",
+    "Operators can't skip this: `VIVA_AGENT_OPERATOR_BEARER_TOKEN` authorizes `library_export`.",
+    "`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` enables `study_set_delete` on a public bind.",
+    "On a public bind `library_export` requires `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN`.",
+    "`session_delete` needs `VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` to be configured.",
+    "`study_set_delete` is presented with `VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN`.",
+    "| `library_export` | requires `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` | yes |",
+    "`library_delete_bearer` authorizes the delete routes.",
+    "`session_mint_credential` unlocks `session_delete`.",
+    "`operator_access` grants `library_export` to operator tooling.",
+  ]) {
+    const result = checkWith((documents) => {
+      documents["docs/deployment-runbook.md"] += `\n${claim}\n`;
+    });
+    assert.ok(
+      result.drift.some((entry) => entry.id === "library_control_authority"),
+      `a false authority claim must be drift: ${claim} -> ${JSON.stringify(driftIds(result))}`,
+    );
+  }
+
+  // The rule must not swallow the truthful sentences the matrix is made of: a
+  // denial names the same credential next to the same operation, and it stays
+  // writable in every position English puts the negation -- on the verb, on the
+  // credential, on the object, and as the subject's own determiner.
+  for (const denial of [
+    "`VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` never enables the delete routes by itself.",
+    "`VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` does not enable `study_set_delete`.",
+    "It is not `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` that authorizes `library_export`.",
+    "No configuration of `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` permits `session_delete`.",
+    "Neither `library_read_bearer` nor `library_delete_bearer` unlocks the export route.",
+    "Neither `VIVA_AGENT_OPERATOR_BEARER_TOKEN` nor `operator_access` authorizes the export route.",
+    "`library_export` requires no part of `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN`.",
+    "`session_mint_credential` never unlocks `session_delete`.",
+  ]) {
+    const result = checkWith((documents) => {
+      documents["docs/deployment-runbook.md"] += `\n${denial}\n`;
+    });
+    assert.deepEqual(
+      result.drift,
+      [],
+      `a truthful denial must not be drift: ${denial} -> ${JSON.stringify(result.drift)}`,
+    );
+  }
+});
+
+/**
+ * Ledger row 689 -- the false-authority rule's vocabulary is derived, not typed.
+ *
+ * The rule has to name the operations and the credentials to catch a lie phrased
+ * with one, and a hardcoded list of names would go quietly stale the day the
+ * service renamed something -- which is the failure the whole oracle exists to
+ * prevent. Rename a gated operation, and the credential field behind an
+ * environment key, in a copy of the shipped source: the rule must start catching
+ * lies written with the new names and must never have known them before.
+ */
+test("row 689: the false-authority rule's vocabulary follows the shipped source", () => {
+  const rustConfig = readFileSync("agent/crates/agent-service/src/config.rs", "utf8");
+  const libraryRoutes = readFileSync("agent/crates/agent-service/src/http/library.rs", "utf8");
+  const runbook = readFileSync("docs/deployment-runbook.md", "utf8");
+  const { privacy } = buildPublicContract();
+
+  const credits = (authority, document) =>
+    libraryControlDrift({ ...privacy, library_control_authority: authority }, document).filter(
+      (detail) => detail.startsWith("credits an export or delete authority"),
+    );
+  // One more false-authority hit than the same document without the line.
+  const catches = (authority, line) =>
+    credits(authority, `${runbook}\n${line}\n`).length === credits(authority, runbook).length + 1;
+
+  const shipped = libraryControlAuthority(rustConfig, libraryRoutes);
+  assert.deepEqual(shipped.control_gate_operations, [
+    "library_export",
+    "session_delete",
+    "study_set_delete",
+  ]);
+
+  const operationRenamed = libraryControlAuthority(
+    rustConfig,
+    libraryRoutes.replaceAll("study_set_delete", "study_set_remove"),
+  );
+  assert.deepEqual(operationRenamed.control_gate_operations, [
+    "library_export",
+    "session_delete",
+    "study_set_remove",
+  ]);
+  const renamedLie = "`VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` enables `study_set_remove` here.";
+  assert.ok(catches(operationRenamed, renamedLie), "the rule must catch the renamed operation id");
+  assert.ok(
+    !catches(shipped, renamedLie),
+    "the rule must not recognise an operation id the service does not ship",
+  );
+
+  const fieldRenamed = libraryControlAuthority(
+    rustConfig.replaceAll("library_delete_bearer", "library_delete_secret"),
+    libraryRoutes,
+  );
+  assert.ok(fieldRenamed.control_gate_unconsulted_fields.includes("library_delete_secret"));
+  const fieldLie = "`library_delete_secret` authorizes the delete routes.";
+  assert.ok(catches(fieldRenamed, fieldLie), "the rule must catch the renamed credential field");
+  assert.ok(
+    !catches(shipped, fieldLie),
+    "the rule must not recognise a credential field the service does not bind",
+  );
 });
 
 test("a stale tracked contract is drift, not a silent overwrite", () => {

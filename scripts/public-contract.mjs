@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
+import { libraryControlAuthority, libraryControlDrift } from "./public-contract-authority.mjs";
 
 /**
  * `INTEGRATION-007` — the public contract, derived from executable sources.
@@ -59,6 +60,7 @@ export const CHECKED_SOURCE_PATHS = Object.freeze([
   "agent/crates/agent-domain/src/review_schedule.rs",
   "agent/crates/agent-domain/src/tools.rs",
   "agent/crates/agent-service/src/config.rs",
+  "agent/crates/agent-service/src/http/library.rs",
   "agent/crates/agent-service/src/protocol.rs",
   "agent/crates/data/src/memory/ingestion.rs",
   "agent/crates/data/src/memory/privacy.rs",
@@ -124,6 +126,7 @@ export const KNOWN_DRIFT_IDS = Object.freeze([
   "domain_purity_scope",
   "durable_postgres_continuity",
   "learner_loop_contract_fields",
+  "library_control_authority",
   "protocol_version",
   "public_contract_stale",
   "readme_pdf_ingestion",
@@ -224,6 +227,7 @@ export function buildPublicContract({ root = REPOSITORY_ROOT } = {}) {
   const rustIngestion = readSource(root, "agent/crates/data/src/memory/ingestion.rs");
   const rustPrivacy = readSource(root, "agent/crates/data/src/memory/privacy.rs");
   const rustConfig = readSource(root, "agent/crates/agent-service/src/config.rs");
+  const libraryRoutes = readSource(root, "agent/crates/agent-service/src/http/library.rs");
   const learnerLoop = JSON.parse(readSource(root, "packages/core/src/learner-loop-contract.json"));
   const sessionPage = readSource(root, "apps/web/components/session/LiveSessionPage.tsx");
   const webProxy = readSource(root, "apps/web/proxy.ts");
@@ -464,6 +468,7 @@ export function buildPublicContract({ root = REPOSITORY_ROOT } = {}) {
       /\nUSER (\S+)\s*\n/.exec(agentImage)?.[1],
       /\nUSER (\S+)\s*\n/.exec(monitorImage)?.[1],
     ].filter(Boolean),
+    library_control_authority: libraryControlAuthority(rustConfig, libraryRoutes),
   };
   if (privacy.trusted_proxy_variable === null) {
     throw new Error("the trusted-proxy client-address model could not be read from the config");
@@ -1041,7 +1046,12 @@ export function checkPublicContract({
     }
   }
 
-  // 18. The tracked generated contract is current.
+  // 18. Ledger row 689: availability as a function of configuration.
+  for (const detail of libraryControlDrift(contract.privacy, runbook)) {
+    flag("library_control_authority", "docs/deployment-runbook.md", detail);
+  }
+
+  // 19. The tracked generated contract is current.
   //
   // Compared as parsed content, not as bytes: a formatter run over the tracked
   // file must not be able to fail this gate, and re-indentation is not drift.

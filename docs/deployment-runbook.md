@@ -322,6 +322,103 @@ The `/session` page sends the signed session token as both the first
 accepts that signed token at preflight when session-token signing is configured,
 so the browser never needs the REST bearer.
 
+## Configuration Matrix
+
+Which library and session operations a deployment can actually run, as a function
+of what it configures, and exactly how the service refuses when a required value
+is absent. Every key, operation id, and refusal named below is read out of the
+shipped service -- `ServiceConfig::validate` in
+`agent/crates/agent-service/src/config.rs` and the access gate in
+`agent/crates/agent-service/src/http/library.rs` -- by
+`node scripts/public-contract.mjs --check`. A rename or a scope change in the
+service turns this section red rather than leaving it quietly wrong.
+
+Two bind shapes decide every row:
+
+- **Loopback bind.** `VIVA_AGENT_BIND_ADDR` resolves to a loopback address; the
+  `bun run dev:agent` default is `127.0.0.1:4318`. Startup validates with no
+  credential configured at all, and the library snapshot answers the trusted user
+  with no `Authorization` header.
+- **Non-loopback bind.** Every other address, `0.0.0.0` included. Startup fails
+  closed unless the whole credential set below is configured.
+
+### Credentials the agent reads
+
+| Environment key | Presented by | Non-loopback | What it makes available |
+| --- | --- | --- | --- |
+| `VIVA_VOICE_SESSION_TOKEN_SECRET` | nothing presents it; it signs and verifies | required | signed `/ws` admission, both session mints, and the control capability below |
+| `VIVA_VOICE_WS_BEARER_TOKEN` | a trusted server, an operator tool, or an authenticated proxy | optional | `/ws` preflight, the library snapshot, and all three gated controls |
+| `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` | the web BFF's read-only library proxy | required | the read-only snapshot and the authenticated projection, and nothing else |
+| `VIVA_AGENT_LIBRARY_DELETE_BEARER_TOKEN` | the web BFF's destructive proxy leg | required | nothing: no agent route reads this value |
+| `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN` | the server-side mint behind `/api/viva-session/start` and `/api/viva-session/refresh` | required | the two mint selectors, trusted user only |
+| `VIVA_AGENT_OPERATOR_BEARER_TOKEN` | operator tooling | required | `/ready` and `/health/brain` |
+
+Every configured credential is 32-512 bytes and byte-distinct from every other
+one, and a non-loopback bind additionally requires
+`VIVA_VOICE_WS_ALLOWED_ORIGINS` plus at least one of
+`VIVA_VOICE_WS_BEARER_TOKEN` or `VIVA_VOICE_SESSION_TOKEN_SECRET`.
+
+Four of those keys never carry export or deletion authority. The gate that guards
+`library_export`, `study_set_delete`, and `session_delete` reads exactly two
+configuration values -- `VIVA_VOICE_WS_BEARER_TOKEN` and
+`VIVA_VOICE_SESSION_TOKEN_SECRET` -- and no other. It is not the read credential,
+not the destructive proxy leg's credential, not the mint credential, and not the
+operator credential that opens those routes.
+
+### Operation availability
+
+| Operation | Route or selector | Loopback, nothing configured | With `VIVA_VOICE_WS_BEARER_TOKEN` presented | Public bind, browser leg through the same-origin proxy |
+| --- | --- | --- | --- | --- |
+| library snapshot read | `GET /study-sets/library` | available for the trusted user, unauthenticated | available | available with `VIVA_AGENT_LIBRARY_READ_BEARER_TOKEN` from a canonical origin, with the start/resume actions served minus their signed session material |
+| `library_export` | `GET /study-sets/export` | refused, `403 library_export_auth_required` | available | refused, `401 library_export_auth_failed` |
+| `study_set_delete` | `DELETE /study-sets/{study_set_id}` | refused, `403 study_set_delete_auth_required` | available | refused, `401 study_set_delete_auth_failed` |
+| `session_delete` | `DELETE /study-sets/{study_set_id}/sessions/{voice_session_id}` | refused, `403 session_delete_auth_required` | available | refused, `401 session_delete_auth_failed` |
+| start mint | `record_start_for={study_set_id}` on the snapshot route | selector ignored; the snapshot is still answered and nothing is recorded | ignored unless the mint credential is the one presented | available with `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`, trusted user only, and it records the `voice_sessions` row |
+| resume mint | `mint_resume_for={study_set_id}` on the snapshot route | selector ignored; the snapshot is still answered | ignored unless the mint credential is the one presented | available with `VIVA_AGENT_SESSION_MINT_BEARER_TOKEN`, trusted user only, and it records nothing |
+| session refresh | web `POST /api/viva-session/refresh` | local signature check only | local signature check only | the web service verifies the existing signature with its own copy of `VIVA_VOICE_SESSION_TOKEN_SECRET`, then mints through the resume selector above |
+
+Naming both mint selectors on one request names no single operation and is
+refused rather than resolved in either direction.
+
+### How the control capability is obtained
+
+`x-viva-library-control-token` is a short-lived capability the agent signs with
+`VIVA_VOICE_SESSION_TOKEN_SECRET` under the reserved subject
+`__library_control__`. The agent mints it into a snapshot only for a caller the
+same gate would already admit, so in practice a snapshot fetched with
+`VIVA_VOICE_WS_BEARER_TOKEN` is the only way to obtain one. A snapshot admitted
+by the read credential alone is minted no capability: its `actions.delete` and
+its `privacy.export` come back unavailable with reason `mutation_auth_required`.
+
+The operational consequence is the load-bearing half of this section. Export and
+both deletes are available if and only if `VIVA_VOICE_WS_BEARER_TOKEN` is
+configured and either presented directly or used to mint the capability the
+caller then presents. A non-loopback deployment that leaves it unset serves a
+library that reads and starts sessions but refuses every export and every delete,
+and the same-origin proxy's own destructive leg is refused there too, because the
+credential it presents is not one the gate reads. Configure
+`VIVA_VOICE_WS_BEARER_TOKEN` and drive those controls from a trusted server or
+operator tool, or accept that they are unavailable.
+
+### Fail-closed behavior when a required value is absent
+
+| Missing or invalid | Detected | Result |
+| --- | --- | --- |
+| `VIVA_VOICE_WS_ALLOWED_ORIGINS`, non-loopback bind | startup | `PublicBindMissingAllowedOrigins`; the process never listens |
+| both `VIVA_VOICE_WS_BEARER_TOKEN` and `VIVA_VOICE_SESSION_TOKEN_SECRET`, non-loopback bind | startup | `PublicBindMissingAuth` |
+| any one required key, non-loopback bind | startup | `PublicBindMissingCredential`, naming the exact key |
+| a credential outside 32-512 bytes | startup, either bind | `CredentialLengthOutOfRange`, naming the key |
+| two configured credentials sharing one value | startup, either bind | `CredentialCollision`, naming both keys |
+| `VIVA_VOICE_SESSION_TOKEN_SECRET` alongside a library or mint credential | startup, either bind | `LibraryBearerRequiresSessionTokenSecret`, naming the credential that needs it |
+| `VIVA_VOICE_SESSION_TOKEN_SECRET` under `VIVA_FAILURE_CONTROL_ENABLED=1` | startup, either bind | `FailureControlMisconfigured` |
+| any REST authority at all, on the controls | request | `403`, `library export and deletion controls require authenticated REST access` |
+| the presented bearer or capability, on the controls | request | `401`, one of `library_export_auth_failed`, `study_set_delete_auth_failed`, `session_delete_auth_failed` |
+| the presented credential, on the snapshot | request | `403 library_snapshot_auth_required` when no upgrade bearer is configured, `401 library_snapshot_auth_failed` when one is |
+
+None of these is a soft state. A misconfigured deployment fails at startup before
+it accepts a connection, and a request that clears startup but presents nothing
+the gate reads is refused before the store is touched.
+
 ## Health Checks
 
 Use `/live` for process liveness and `/ready` for routing readiness.
