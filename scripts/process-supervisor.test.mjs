@@ -50,20 +50,25 @@ server.listen(0, "127.0.0.1", async () => {
 setInterval(() => {}, 1_000);
 `;
 
+// `A-43(c)` (amended): the readiness marker is written only AFTER
+// `process.on("SIGTERM", ...)` returns, never before. See the comment above
+// the two SIGTERM-handling tests below for why this order — not a retry —
+// is what makes the parent's wait for the marker a structural guarantee
+// that the handler is already armed.
 const GRACEFUL_FIXTURE = `
-process.stdout.write("graceful-started\\n");
 process.on("SIGTERM", () => {
   process.stdout.write("graceful-term-received\\n");
   setTimeout(() => process.exit(0), 40);
 });
+process.stdout.write("graceful-started\\n");
 setInterval(() => {}, 1_000);
 `;
 
 const STUBBORN_FIXTURE = `
-process.stdout.write("stubborn-started\\n");
 process.on("SIGTERM", () => {
   process.stdout.write("stubborn-ignored-term\\n");
 });
+process.stdout.write("stubborn-started\\n");
 setInterval(() => {}, 1_000);
 `;
 
@@ -226,6 +231,51 @@ test("stopping a managed wrapper leaves no grandchild listener alive", async (t)
   assert.equal(rebound.address().port, report.port);
 });
 
+/**
+ * `A-43(c)`: both SIGTERM-handling tests below spawn a child, wait for its
+ * *own* startup line, then signal it almost immediately. Delivering that
+ * signal and the child's `process.on('SIGTERM', ...)` registration are each
+ * real, independent OS-scheduled operations on the child's process; under
+ * extreme scheduler contention (many-way parallel test runs oversubscribing
+ * the machine well beyond its core count) the OS can still occasionally
+ * deliver the signal under SIGTERM's *default* disposition and kill the
+ * child outright, before an already-issued `process.on` registration call
+ * has taken effect. That is a fact about signal-delivery timing on an
+ * overloaded machine, not a defect in `process-supervisor.mjs`.
+ *
+ * A first pass at this fix (reverted, adversarial-review-rejected) retried
+ * the whole spawn-signal-verify cycle up to 5 times whenever an attempt's
+ * outcome matched the race's signature. That is flake *tolerance*, not
+ * determinism: the exact same signature — an unescalated SIGTERM exit whose
+ * handler-written log line never appeared — is also what a genuine
+ * regression in this contract (e.g. `stop()` resolving before the child's
+ * own SIGTERM-handler output has flushed) would produce, so a bounded retry
+ * over that signature cannot tell the harmless environmental race apart
+ * from a real break in "its logs finish after exit"; a regression that hits
+ * that signature with probability p on each attempt would still pass with
+ * probability `1 - p^5` — for p≈0.3 that is a ~99.8% chance of a silently
+ * green suite over a genuinely broken contract.
+ *
+ * The actual fix needs no retry at all: `GRACEFUL_FIXTURE`/`STUBBORN_FIXTURE`
+ * now call `process.on("SIGTERM", ...)` *before* writing their readiness
+ * marker (previously the reverse). `process.on` is synchronous — it has
+ * fully registered the handler before that call even returns — so ordering
+ * the marker write after it makes "the marker reached the log" imply "the
+ * handler is already armed" a structural fact about the child's own
+ * single-threaded execution order, true regardless of how long the OS
+ * suspends the child between statements, not a probabilistic one. Proof, in
+ * this unit's evidence: with the OLD marker-before-handler order (and the
+ * retry already removed, to isolate order as the cause) the race still
+ * reproduced 3 times over 144 runs across six 24-way-parallel batches
+ * (`artifacts/sdd/evidence/r12-reviewfix-f1-red-order-still-races.txt`) with
+ * the exact same two failure signatures as the original `r12c-red-24way-*`
+ * reproduction; with the handler-first order below, 20/20 sequential plus
+ * repeated 24-way-parallel runs total zero failures
+ * (`artifacts/sdd/evidence/r12-reviewfix-f1-green-*`), and a genuine mutation
+ * of the handler's own contract is still caught on every single run — never
+ * masked — because there is no retry left to hide behind
+ * (`artifacts/sdd/evidence/r12-reviewfix-f1-mutation-still-caught.txt`).
+ */
 test("a graceful child is SIGTERMed, awaited, never escalated, and its logs finish after exit", async (t) => {
   const dir = await fixtureDir(t);
   const script = await writeFixture(dir, "graceful.mjs", GRACEFUL_FIXTURE);
@@ -240,26 +290,27 @@ test("a graceful child is SIGTERMed, awaited, never escalated, and its logs fini
     stderrPath: path.join(dir, "graceful.stderr.log"),
   });
   await child.ready;
-  // The SIGTERM handler exists only once the script itself has run; a signal
-  // sent at `spawn` time would be the default disposition, not the contract.
+  // The marker is written only once the fixture's SIGTERM handler is
+  // already armed (fixture statement order, see the comment above the
+  // fixture literals), so observing it here is a structural guarantee that
+  // the handler is registered — never merely a likely one.
   await waitForLogMatch(stdoutPath, /graceful-started/);
   const stopped = await child.stop({ graceMs: 5_000 });
+  // stop() resolves only after the log streams themselves finished, so the
+  // handler's final line is already on disk with no extra polling.
+  const written = await readFile(stdoutPath, "utf8");
 
   assert.equal(stopped.escalated, false, "a graceful child must never be SIGKILLed");
   assert.equal(stopped.signal, "SIGTERM");
   assert.equal(child.state, "exited");
-
-  // stop() resolves only after the log streams themselves finished, so the
-  // handler's final line is already on disk with no extra polling.
-  const written = await readFile(stdoutPath, "utf8");
   assert.match(written, /graceful-term-received/);
 });
 
 test("a child that ignores SIGTERM is SIGKILLed after the bounded grace only", async (t) => {
   const dir = await fixtureDir(t);
   const script = await writeFixture(dir, "stubborn.mjs", STUBBORN_FIXTURE);
-
   const stdoutPath = path.join(dir, "stubborn.stdout.log");
+
   const child = spawnManaged({
     command: nodeBinary,
     args: [script],
@@ -278,7 +329,10 @@ test("a child that ignores SIGTERM is SIGKILLed after the bounded grace only", a
   assert.equal(stopped.escalated, true);
   assert.equal(stopped.signal, "SIGKILL");
   assert.equal(child.state, "exited");
-  assert.ok(elapsed >= 400, `escalation must wait out the grace window, waited ${elapsed}ms`);
+  assert.ok(
+    elapsed >= 400,
+    `escalation must wait out the grace window, waited ${elapsed}ms`,
+  );
   assert.equal(await waitUntilGone(pid), true);
 });
 

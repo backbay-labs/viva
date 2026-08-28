@@ -53,6 +53,48 @@ const RESERVED_TOKENS = Object.freeze([
 ]);
 
 /**
+ * `A-43(e)` ADJUDICATION — DECLINED: the scan does not learn a hyphenated
+ * `static-export`/`static export` shape, on the merits, not by omission.
+ *
+ * A hyphenated form was never a real identifier this feature used: every
+ * operational symbol above is an env var (`BUILD_FLAG` and its
+ * `PUBLIC_BUILD_FLAG` twin), and POSIX environment variable names cannot
+ * contain a hyphen at all — there is no valid hyphenated spelling of the
+ * flag this mode was ever gated by. The one genuinely hyphenated identifier the
+ * feature's OWN plan text ever named, the `--static-export` CLI flag
+ * `docs/superpowers/plans/2026-08-23-frontend-accessibility-performance.md`
+ * Task 8 specified for the Branch-A retain path, was never implemented:
+ * `scripts/frontend-accessibility.mjs` only carries a comment disclosing
+ * that fact (verified: `process.argv` there parses no such flag anywhere,
+ * and no other scanned surface does either), so there is no live code left
+ * to catch.
+ *
+ * What DOES exist, repository-wide, is prose: this file's own header
+ * comment, `validate-workflow.test.mjs`'s sibling comment and test name,
+ * this file's own `RETAINED_PROOF_FILES` filename and ledger-row test
+ * fixtures, and `docs/superpowers/plans/**`'s narrative history all say
+ * "static-export" or "static export" as plain English, describing the
+ * scan itself or the decision's own history. A bare hyphen/space token
+ * would flag every one of those on first run — exactly the
+ * "an exclusion would make the control meaningless" trap this file's own
+ * header already names for the tokens above, now hitting the scan's own
+ * source before it hits anything else.
+ *
+ * The concern the finding is really naming — a document CLAIMING the
+ * deleted build mode in ordinary prose — already has a correctly-scoped,
+ * already-shipped gate: `scripts/public-contract.mjs`'s
+ * `deletedBuildModePattern` (`/(static export|next export|output:\s*"export")/i`)
+ * scans public documentation for exactly this claim shape. `RESERVED_TOKENS`
+ * here scans a DIFFERENT surface (shipped `.github`/`apps`/`packages`/
+ * `scripts`/manifest CODE) for exact operational identifiers, on purpose;
+ * duplicating the doc-prose pattern onto the code surface would not close a
+ * gap the doc-scoped gate leaves open; it would only manufacture false
+ * positives against this scan's own describing comments. Verified with a
+ * full-tree search over every `RESIDUE_SCAN_SURFACES` root: see this unit's
+ * evidence (`artifacts/sdd/evidence/r12e-*`).
+ */
+
+/**
  * Task 18 Step 4B ends with a repository-wide residue scan over exactly these
  * surfaces, and calls any hit RED. The scan is executed here rather than left as
  * a command in a plan step, because a scan nobody runs is the same dead gate
