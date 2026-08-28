@@ -1,0 +1,264 @@
+{
+  "schema": "viva.public_contract.v1",
+  "source_manifest_sha256": "5bcf4c87efa5f3a56fe722a783d3d28fbe296f6c42022968e220737a912cecc9",
+  "protocol": {
+    "version": 5,
+    "supported_versions": [
+      5
+    ],
+    "sample_rate_hz": 24000,
+    "channels": 1,
+    "bytes_per_sample": 2,
+    "input_encoding": "pcm_s16le",
+    "max_text_frame_bytes": 65536,
+    "browser_client_frame_types": [
+      "session_config",
+      "session_refresh",
+      "audio_chunk",
+      "audio_end",
+      "turn_intent",
+      "cancel",
+      "stop"
+    ],
+    "transport": "one WebSocket at /ws"
+  },
+  "voice_transport": {
+    "max_turn_seconds": 45,
+    "max_chunk_samples": 4096,
+    "max_chunk_bytes": 8192,
+    "max_chunk_base64_chars": 10924,
+    "max_turn_samples": 1080000,
+    "max_turn_bytes": 2160000,
+    "barge_in_frame": "cancel"
+  },
+  "study_modes": [
+    "quiz"
+  ],
+  "ingestion": {
+    "pdf_supported": false,
+    "pdf_refusal_id": "unsupported_pdf",
+    "pdf_refusal_reason": "PDF ingestion requires page-aware extraction",
+    "supported_upload_kinds": [
+      "paste_ingestion",
+      "utf8_text_upload"
+    ],
+    "invalid_utf8_refusal_id": "invalid_utf8_file",
+    "ingestion_statuses": [
+      "pending",
+      "processing",
+      "ready",
+      "failed",
+      "retry"
+    ]
+  },
+  "evaluation": {
+    "tools": [
+      "build_session_recap",
+      "challenge_correction",
+      "evaluate_spoken_answer",
+      "retrieve_source_reference",
+      "select_next_question"
+    ],
+    "retired_tools": [
+      "mark_concept_status",
+      "schedule_review_item"
+    ],
+    "concept_statuses": [
+      "strong",
+      "shaky",
+      "missed",
+      "review"
+    ],
+    "source_citation_confidences": [
+      "high",
+      "medium",
+      "low"
+    ],
+    "max_submitted_answer_resolution_ms": 45000,
+    "learner_loop_schema": "viva.learner_loop_contract.v1",
+    "learner_loop_state_count": 32,
+    "learner_loop_evidence_fields": [
+      "terminal_reason",
+      "failure_class",
+      "stage",
+      "provider",
+      "model",
+      "deploy_sha",
+      "latency_ms",
+      "retry_after_ms",
+      "retry_after_source",
+      "reset_hint",
+      "budget_state",
+      "usage",
+      "cost_usd",
+      "token_refresh_outcome",
+      "recap_success"
+    ]
+  },
+  "scheduling": {
+    "authority": "server_persisted_fsrs",
+    "policy_id": "viva.fsrs6-default.1",
+    "schema_version": 1,
+    "exam_margin_seconds": 86400,
+    "desired_retention": 0.9,
+    "max_interval_days": 36500,
+    "persisted_writer_path": "agent/crates/agent-domain/src/review_schedule.rs",
+    "browser_reader_path": "packages/core/src/scheduling.ts",
+    "cap_reasons": [
+      "exam_margin",
+      "past_exam"
+    ]
+  },
+  "study_projection": {
+    "contract": "AuthenticatedStudyProjectionV1",
+    "version": 1,
+    "modes": [
+      "quiz"
+    ],
+    "review_schedule_authorities": [
+      "server_persisted_fsrs"
+    ],
+    "browser_derives_schedule": false
+  },
+  "durability": {
+    "store_backends": [
+      "in_memory",
+      "postgres"
+    ],
+    "default_backend": "in_memory",
+    "durable_opt_in_variables": [
+      "VIVA_AGENT_DATABASE_URL",
+      "DATABASE_URL"
+    ],
+    "migrations": [
+      "0001_init.sql",
+      "0002_session_indexes.sql",
+      "0003_voice_telemetry.sql",
+      "0004_session_recaps.sql",
+      "0005_public_ids_and_bounded_sources.sql",
+      "0006_usage_cost_estimate.sql",
+      "0007_voice_session_terminal_reason.sql",
+      "0008_ingestion_status_and_generated_questions.sql",
+      "0009_review_items_voice_session.sql",
+      "0010_voice_session_token_nonces.sql",
+      "0011_answer_attempt_envelopes.sql",
+      "0012_review_items_atomic_replay_guard.sql",
+      "0013_recap_and_concept_status_atomic_replay_guard.sql",
+      "0014_session_recaps_one_row_per_session.sql",
+      "0015_review_schedule_decisions_v1.sql",
+      "0016_durable_event_authorization_digests.sql",
+      "0017_privacy_tombstone_and_schema_cleanup.sql",
+      "0018_learning_turn_outcomes.sql"
+    ],
+    "migration_count": 18,
+    "migrations_run_on_boot": true
+  },
+  "privacy": {
+    "data_retention_policy": "hard_purge_text",
+    "tombstone_title": "[deleted]",
+    "tombstone_row_constant": "deleted",
+    "deletion_ux": "CONFIRM_DELETE",
+    "disclosure_scope": "all_live_provider_content",
+    "redaction_gate": "scripts/redaction-control-check.mjs",
+    "scoped_advisory_ignores": [
+      "RUSTSEC-2023-0071"
+    ],
+    "defense_headers": [
+      "content-security-policy",
+      "cross-origin-opener-policy",
+      "cross-origin-resource-policy",
+      "permissions-policy",
+      "referrer-policy",
+      "strict-transport-security",
+      "x-content-type-options",
+      "x-frame-options"
+    ],
+    "trusted_proxy_variable": "VIVA_VOICE_WS_TRUSTED_PROXY_CIDRS",
+    "credential_length_bounds": {
+      "min_bytes": 32,
+      "max_bytes": 512
+    },
+    "container_runtime_users": [
+      "10001:10001",
+      "pwuser"
+    ]
+  },
+  "provider_modes": [
+    {
+      "id": "synthetic",
+      "default": true,
+      "reaches_a_provider_network": false,
+      "required_gates": []
+    },
+    {
+      "id": "fake_cartesia_gemini",
+      "default": false,
+      "reaches_a_provider_network": false,
+      "required_gates": []
+    },
+    {
+      "id": "cartesia_gemini",
+      "default": false,
+      "reaches_a_provider_network": true,
+      "required_gates": [
+        "VIVA_CARTESIA_GEMINI_LIVE_RUNTIME=1",
+        "CARTESIA_ZERO_DATA_RETENTION_ENABLED=1",
+        "GEMINI_ZERO_DATA_RETENTION_APPROVED=1"
+      ]
+    }
+  ],
+  "validation": {
+    "workflow": ".github/workflows/validate.yml",
+    "workflow_name": "Validate",
+    "required_job_names": [
+      "Durable Postgres proof",
+      "Loopback and browser proofs",
+      "Quality and audit",
+      "Required validation"
+    ],
+    "required_aggregate_job": "Required validation",
+    "required_aggregate_needs": [
+      "durable-postgres",
+      "loopback-and-browser",
+      "quality-and-audit"
+    ],
+    "default_local_gate": "bun run validate",
+    "default_gate_expansion": [
+      "bun run typecheck && bun run lint && bun run test && bun run build",
+      "bun run agent:fmt && bun run agent:clippy && bun run agent:test && bun run agent:build && bun run agent:purity && bun run agent:residue",
+      "sh scripts/check-generated-artifact-hygiene.sh",
+      "node --test scripts/module-concentration-policy.test.mjs",
+      "bun run audit:js && bun run audit:rust"
+    ],
+    "domain_boundary_gate": {
+      "script": "bun run agent:purity",
+      "proves": "the agent-domain direct normal-dependency allowlist and its forbidden module imports",
+      "does_not_prove": "adapter purity, runtime I/O behavior, or live provider behavior"
+    },
+    "domain_residue_gate": {
+      "script": "bun run agent:residue",
+      "proves": "the removed legacy domain vocabulary is absent from agent, packages, and apps"
+    },
+    "durable_postgres_is_continuous": true,
+    "default_gate_requires_provider_credentials": false,
+    "default_gate_requires_local_postgres": false
+  },
+  "release_evidence": {
+    "schema": "viva.release_evidence.v1",
+    "generator": "bun run release:check",
+    "downstream_verifier": "bun run release:verify",
+    "bundle_signature_algorithm": "hmac-sha256",
+    "unsigned_self_hash_label": "sha256-self",
+    "structured_preview_certifies_product": false,
+    "structured_preview_reported_separately": true
+  },
+  "external_evidence_required": [
+    "OPS-01",
+    "OPS-02",
+    "OPS-03",
+    "OPS-04",
+    "OPS-05",
+    "OPS-06"
+  ],
+  "sanitized": true
+}

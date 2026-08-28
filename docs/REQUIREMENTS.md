@@ -1,5 +1,23 @@
 # Viva PR Doc
 
+> **Status: product vision, not shipped behavior.** Everything below is the product intent this
+> repository is built toward — the press release, the personas, the screens, the modes, the pricing
+> hypotheses, and the P0/P1/P2 backlog. It is deliberately preserved unedited as the north star, and
+> it is deliberately **not** a description of what runs today.
+>
+> For what actually ships, read [`docs/public-contract.json`](public-contract.json), which is
+> generated from the code by `node scripts/public-contract.mjs --write` and gated by `--check`.
+> Where this vision document and that contract disagree, the contract is the truth and this document
+> is the plan.
+>
+> Three differences are worth naming up front, because they are the ones most likely to mislead:
+>
+> | This document envisions | The shipped contract today |
+> | --- | --- |
+> | Four study modes (Quiz Me, Teach Me, Mock Viva, Cram) | Exactly one mode, `quiz`. The other three named engines that were never built and the server now rejects them. |
+> | PDF upload, slide upload, image OCR | Pasted text and UTF-8 text uploads. Any PDF shape is refused fail-closed with `unsupported_pdf`; there is no page-aware extraction and no OCR. |
+> | A tool surface that includes marking mastery and scheduling review | Five proposable tools. Concept status and the next review date are derived from server state inside a persisted turn outcome, never proposed by a model. |
+
 **Version:** 0.1
 **Product:** Viva
 **Category:** Voice-first AI study companion
